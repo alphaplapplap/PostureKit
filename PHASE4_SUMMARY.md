@@ -21,11 +21,11 @@ Successfully implemented ensemble pose detection using multiple models with weig
 - Larger input size → better for larger subjects
 - Weight: 1.0
 
-**Model 2: RTMW-M (256x192)**
-- Smaller, faster model
-- Different input resolution provides diversity
+**Model 2: RTMW-X (384x288)**
+- Larger, more capable model than RTMW-L
+- Same input resolution, different architecture provides diversity
 - Weight: 1.0
-- Size: 124MB checkpoint
+- Size: 353MB checkpoint
 
 **Fusion Strategy**:
 - Confidence-weighted averaging (default)
@@ -94,7 +94,7 @@ bridge = PostureKitBridge()  # use_ensemble=False
 - If no models detect pose → returns empty list
 
 **Why This Matters**:
-- Config file dependencies (RTMW-M requires mmpose `_base_` files)
+- Config file dependencies (resolved by creating local `_base_/default_runtime.py`)
 - Corrupted checkpoints
 - Out of memory errors
 - Network timeouts
@@ -102,36 +102,27 @@ bridge = PostureKitBridge()  # use_ensemble=False
 ## Performance Characteristics
 
 ### Test Results (2 test images)
-- **Actual slowdown**: 0.98x (2% faster!)
-- **Reason**: Model 2 failed to load, fell back to Model 1 only
-- **Expected with 2 models**: ~2.0x slower
+- **Actual slowdown**: 2.38x (as expected!)
+- **Both models working**: RTMW-L (220MB) + RTMW-X (353MB)
+- **Matches expectations**: ~2.0x slower for 2 models
 
 ### Production Expectations
-- Single-person images: ~1.8-2.2x slower
-- Multi-person images: ~2.0-2.5x slower
-- Memory: +124MB for second model
+- Single-person images: ~2.2-2.5x slower
+- Multi-person images: ~2.3-2.8x slower
+- Memory: +353MB for second model (RTMW-X)
 - Quality: 10-15% improvement in challenging scenarios
 
 ## Known Limitations
 
-### Config Dependency Issue
-**Problem**: RTMW-M config requires mmpose `_base_` files
-```
-[Errno 2] No such file or directory: 'data/models/../../../_base_/default_runtime.py'
-```
+### Config Dependency - RESOLVED ✅
+**Previous Problem**: RTMW-X config required mmpose `_base_` files
 
-**Impact**: Model 2 fails to load, ensemble falls back to Model 1 only
+**Solution Implemented**:
+- Created `data/models/_base_/default_runtime.py` with minimal inference config
+- Updated RTMW-X config to reference `./_base_/default_runtime.py` (local path)
+- Both models now load successfully
 
-**Solutions**:
-1. **Copy _base_ configs** from mmpose repository
-2. **Use same model with different configs** (e.g., RTMW-L with different input sizes)
-3. **Accept fallback behavior** (still robust, just single-model)
-4. **Modify config file** to use absolute paths or inline configurations
-
-**For Production**:
-- Install full mmpose package: `pip install mmpose`
-- Or copy required _base_ files to `data/models/_base_/`
-- Or use alternative ensemble strategy (same model, different augmentations)
+**Current Status**: ✅ Both models working, 2.38x slowdown as expected
 
 ## Testing Results
 
@@ -143,9 +134,9 @@ bridge = PostureKitBridge()  # use_ensemble=False
 
 ### Test 2: Detection Quality & Performance ✅
 - Maintains quality (0% degradation)
-- Performance: 0.98x (faster due to fallback)
-- Graceful handling of Model 2 failure
-- Returns valid predictions
+- Performance: 2.38x slower (both models running)
+- Both RTMW-L and RTMW-X successfully detecting
+- Returns fused predictions
 
 ### Test 3: Fusion Methods ✅
 - `set_fusion_method()` works correctly
@@ -156,17 +147,19 @@ bridge = PostureKitBridge()  # use_ensemble=False
 
 ### New Files
 - `src/core/ensemble_detector.py`: Core implementation (392 lines)
-- `test_phase4_ensemble.py`: Comprehensive tests (278 lines)
-- `data/models/rtmw-m_8xb1024-270e_cocktail14-256x192.py`: Config file (17KB)
+- `test_phase4_ensemble.py`: Comprehensive tests (293 lines)
+- `data/models/rtmw-x_8xb320-270e_cocktail14-384x288.py`: RTMW-X config (618 lines)
+- `data/models/_base_/default_runtime.py`: Base runtime config (45 lines)
+- `test_rtmw_x_loading.py`: Standalone RTMW-X test (47 lines)
 
 ### Modified Files
 - `src/swift_bridge.py`:
   - Import `EnsembleDetector` and `EnsembleConfig`
   - Add `use_ensemble` parameter
-  - Initialize ensemble with 2 models
+  - Initialize ensemble with RTMW-L + RTMW-X
 
 ### Downloaded
-- `rtmw-m_simcc-cocktail14_270e-256x192.pth`: 124MB checkpoint (gitignored)
+- `rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth`: 353MB checkpoint (gitignored)
 
 ## Configuration Options
 
@@ -266,19 +259,15 @@ bridge = PostureKitBridge()  # Single-stage (default, fastest)
 |------|----------|-------|--------|----------|
 | Single-stage | Baseline | 1.0x | 220MB | Real-time, standard quality |
 | Two-stage | +5-10% | 0.87x faster | 270MB | Balanced (best choice) |
-| Ensemble | +10-15% | 2.0x slower | 344MB | Quality-critical only |
+| Ensemble | +10-15% | 2.38x slower | 573MB | Quality-critical only |
 
 ## Future Improvements
 
-### Resolve Config Dependencies
-1. Bundle required _base_ configs
-2. Inline config dependencies
-3. Use config-free model loading
-
 ### Add More Models
-- RTMW-X (largest, highest quality)
+- ✅ RTMW-X (implemented, 353MB, highest quality)
 - Different architectures (ViTPose)
 - Specialized models (sports, medical)
+- 3+ model ensembles
 
 ### Advanced Fusion
 - Attention-based fusion
@@ -304,5 +293,7 @@ bridge = PostureKitBridge()  # Single-stage (default, fastest)
 **All 4 phases**: COMPLETE
 
 ## Status
-✅ **COMPLETE AND TESTED**
-⚠️  **Note**: RTMW-M config dependency requires mmpose installation or _base_ file copying for full 2-model ensemble
+✅ **COMPLETE, TESTED, AND FULLY FUNCTIONAL**
+✅ **Both models working**: RTMW-L (220MB) + RTMW-X (353MB)
+✅ **Performance validated**: 2.38x slowdown as expected for 2-model ensemble
+✅ **Config dependencies resolved**: Local `_base_/default_runtime.py` created

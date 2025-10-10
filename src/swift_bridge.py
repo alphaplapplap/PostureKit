@@ -107,26 +107,28 @@ class PostureKitBridge:
         # Initialize detector based on mode
         if use_ensemble:
             # Ensemble mode: Use multiple models with fusion
-            rtmw_m_config = settings.PROJECT_ROOT / "data" / "models" / "rtmw-m_8xb1024-270e_cocktail14-256x192.py"
-            rtmw_m_checkpoint = settings.PROJECT_ROOT / "data" / "models" / "rtmw-m_simcc-cocktail14_270e-256x192.pth"
+            # Model 1: RTMW-L (220MB, 384x288) - good baseline
+            # Model 2: RTMW-X (353MB, 384x288) - larger capacity, better at difficult cases
+            rtmw_x_config = settings.PROJECT_ROOT / "data" / "models" / "rtmw-x_8xb320-270e_cocktail14-384x288.py"
+            rtmw_x_checkpoint = settings.PROJECT_ROOT / "data" / "models" / "rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth"
 
             ensemble_config = EnsembleConfig(
                 models=[
                     {
                         "config": str(config_path),
                         "checkpoint": str(checkpoint_path),
-                        "weight": 1.0,  # RTMW-L (384x288)
+                        "weight": 1.0,  # RTMW-L (384x288, 220MB)
                     },
                     {
-                        "config": str(rtmw_m_config),
-                        "checkpoint": str(rtmw_m_checkpoint),
-                        "weight": 1.0,  # RTMW-M (256x192)
+                        "config": str(rtmw_x_config),
+                        "checkpoint": str(rtmw_x_checkpoint),
+                        "weight": 1.0,  # RTMW-X (384x288, 353MB) - larger model
                     },
                 ],
                 fusion_method="confidence_weighted",  # Weight by per-keypoint confidence
             )
             self.detector = EnsembleDetector(ensemble_config)
-            logger.info("Ensemble detection enabled (2 models)")
+            logger.info("Ensemble detection enabled: RTMW-L + RTMW-X (2 models)")
 
         elif use_two_stage:
             # Two-stage mode: YOLO + pose estimation

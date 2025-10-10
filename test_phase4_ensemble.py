@@ -29,8 +29,8 @@ def test_ensemble_initialization():
         # Model paths
         rtmw_l_config = settings.PROJECT_ROOT / "data/models/rtmw-l_8xb320-270e_cocktail14-384x288.py"
         rtmw_l_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-dw-x-l_simcc-cocktail14_270e-384x288-20231122.pth"
-        rtmw_m_config = settings.PROJECT_ROOT / "data/models/rtmw-m_8xb1024-270e_cocktail14-256x192.py"
-        rtmw_m_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-m_simcc-cocktail14_270e-256x192.pth"
+        rtmw_x_config = settings.PROJECT_ROOT / "data/models/rtmw-x_8xb320-270e_cocktail14-384x288.py"
+        rtmw_x_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth"
 
         # Check files exist
         if not rtmw_l_config.exists():
@@ -39,11 +39,11 @@ def test_ensemble_initialization():
         if not rtmw_l_checkpoint.exists():
             print(f"❌ RTMW-L checkpoint not found: {rtmw_l_checkpoint}")
             return False
-        if not rtmw_m_config.exists():
-            print(f"❌ RTMW-M config not found: {rtmw_m_config}")
+        if not rtmw_x_config.exists():
+            print(f"❌ RTMW-X config not found: {rtmw_x_config}")
             return False
-        if not rtmw_m_checkpoint.exists():
-            print(f"❌ RTMW-M checkpoint not found: {rtmw_m_checkpoint}")
+        if not rtmw_x_checkpoint.exists():
+            print(f"❌ RTMW-X checkpoint not found: {rtmw_x_checkpoint}")
             return False
 
         # Initialize ensemble
@@ -55,8 +55,8 @@ def test_ensemble_initialization():
                     "weight": 1.0,
                 },
                 {
-                    "config": str(rtmw_m_config),
-                    "checkpoint": str(rtmw_m_checkpoint),
+                    "config": str(rtmw_x_config),
+                    "checkpoint": str(rtmw_x_checkpoint),
                     "weight": 1.0,
                 },
             ],
@@ -99,8 +99,8 @@ def test_ensemble_detection():
     # Model paths
     rtmw_l_config = settings.PROJECT_ROOT / "data/models/rtmw-l_8xb320-270e_cocktail14-384x288.py"
     rtmw_l_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-dw-x-l_simcc-cocktail14_270e-384x288-20231122.pth"
-    rtmw_m_config = settings.PROJECT_ROOT / "data/models/rtmw-m_8xb1024-270e_cocktail14-256x192.py"
-    rtmw_m_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-m_simcc-cocktail14_270e-256x192.pth"
+    rtmw_x_config = settings.PROJECT_ROOT / "data/models/rtmw-x_8xb320-270e_cocktail14-384x288.py"
+    rtmw_x_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth"
 
     # Initialize single-stage detector
     single_stage = RTMWCocktail14Detector(
@@ -116,8 +116,8 @@ def test_ensemble_detection():
                 "weight": 1.0,
             },
             {
-                "config": str(rtmw_m_config),
-                "checkpoint": str(rtmw_m_checkpoint),
+                "config": str(rtmw_x_config),
+                "checkpoint": str(rtmw_x_checkpoint),
                 "weight": 1.0,
             },
         ],
@@ -222,8 +222,8 @@ def test_fusion_methods():
         # Model paths
         rtmw_l_config = settings.PROJECT_ROOT / "data/models/rtmw-l_8xb320-270e_cocktail14-384x288.py"
         rtmw_l_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-dw-x-l_simcc-cocktail14_270e-384x288-20231122.pth"
-        rtmw_m_config = settings.PROJECT_ROOT / "data/models/rtmw-m_8xb1024-270e_cocktail14-256x192.py"
-        rtmw_m_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-m_simcc-cocktail14_270e-256x192.pth"
+        rtmw_x_config = settings.PROJECT_ROOT / "data/models/rtmw-x_8xb320-270e_cocktail14-384x288.py"
+        rtmw_x_checkpoint = settings.PROJECT_ROOT / "data/models/rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth"
 
         # Create ensemble
         config = EnsembleConfig(
@@ -234,8 +234,8 @@ def test_fusion_methods():
                     "weight": 1.0,
                 },
                 {
-                    "config": str(rtmw_m_config),
-                    "checkpoint": str(rtmw_m_checkpoint),
+                    "config": str(rtmw_x_config),
+                    "checkpoint": str(rtmw_x_checkpoint),
                     "weight": 1.0,
                 },
             ],
