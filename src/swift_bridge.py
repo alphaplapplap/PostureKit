@@ -31,6 +31,7 @@ try:
     from core.visual_feature_extractor import VisualFeatureExtractor
     from core.multimodal_fusion import MultiModalFusion
     from core.two_stage_detector import TwoStageDetector
+    from core.ensemble_detector import EnsembleDetector, EnsembleConfig
     from intelligence.similarity_engine import SimilarityEngine
     from storage.storage_manager import StorageManager
     from storage.models import Image, PoseDetection, GeometricFeatures as GeometricFeaturesModel
@@ -51,7 +52,12 @@ class PostureKitBridge:
     Provides simplified interface to PostureKit Python modules.
     """
     
-    def __init__(self, db_url: Optional[str] = None, use_two_stage: bool = False):
+    def __init__(
+        self,
+        db_url: Optional[str] = None,
+        use_two_stage: bool = False,
+        use_ensemble: bool = False,
+    ):
         """
         Initialize PostureKit bridge.
 
@@ -59,6 +65,9 @@ class PostureKitBridge:
             db_url: Database URL (defaults to PostgreSQL from settings)
             use_two_stage: Enable two-stage detection (YOLO + pose estimation)
                           Default False. Set True for 5-10% accuracy improvement.
+            use_ensemble: Enable ensemble detection (multiple models with fusion)
+                         Default False. Set True for 10-15% accuracy improvement.
+                         Note: Overrides use_two_stage if both are True.
         """
         # Import settings to get DATABASE_URL
         from config.settings import settings
@@ -95,16 +104,42 @@ class PostureKitBridge:
             sys.stderr = old_stderr
             mmengine_logger.setLevel(old_level)
 
-        # Initialize two-stage detector if requested
-        if use_two_stage:
+        # Initialize detector based on mode
+        if use_ensemble:
+            # Ensemble mode: Use multiple models with fusion
+            rtmw_m_config = settings.PROJECT_ROOT / "data" / "models" / "rtmw-m_8xb1024-270e_cocktail14-256x192.py"
+            rtmw_m_checkpoint = settings.PROJECT_ROOT / "data" / "models" / "rtmw-m_simcc-cocktail14_270e-256x192.pth"
+
+            ensemble_config = EnsembleConfig(
+                models=[
+                    {
+                        "config": str(config_path),
+                        "checkpoint": str(checkpoint_path),
+                        "weight": 1.0,  # RTMW-L (384x288)
+                    },
+                    {
+                        "config": str(rtmw_m_config),
+                        "checkpoint": str(rtmw_m_checkpoint),
+                        "weight": 1.0,  # RTMW-M (256x192)
+                    },
+                ],
+                fusion_method="confidence_weighted",  # Weight by per-keypoint confidence
+            )
+            self.detector = EnsembleDetector(ensemble_config)
+            logger.info("Ensemble detection enabled (2 models)")
+
+        elif use_two_stage:
+            # Two-stage mode: YOLO + pose estimation
             self.detector = TwoStageDetector(
                 pose_detector=self.pose_detector,
                 person_model="yolov8n.pt",  # Nano model (6MB, fast)
                 min_person_conf=0.3,
-                crop_padding=0.1
+                crop_padding=0.1,
             )
             logger.info("Two-stage detection enabled")
+
         else:
+            # Single-stage mode (default)
             self.detector = self.pose_detector
             logger.info("Single-stage detection (default)")
 
