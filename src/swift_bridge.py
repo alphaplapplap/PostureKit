@@ -30,6 +30,7 @@ try:
     from core.geometric_feature_extractor import GeometricFeatureExtractor, GeometricFeatures
     from core.visual_feature_extractor import VisualFeatureExtractor
     from core.multimodal_fusion import MultiModalFusion
+    from core.two_stage_detector import TwoStageDetector
     from intelligence.similarity_engine import SimilarityEngine
     from storage.storage_manager import StorageManager
     from storage.models import Image, PoseDetection, GeometricFeatures as GeometricFeaturesModel
@@ -50,12 +51,14 @@ class PostureKitBridge:
     Provides simplified interface to PostureKit Python modules.
     """
     
-    def __init__(self, db_url: Optional[str] = None):
+    def __init__(self, db_url: Optional[str] = None, use_two_stage: bool = False):
         """
         Initialize PostureKit bridge.
 
         Args:
             db_url: Database URL (defaults to PostgreSQL from settings)
+            use_two_stage: Enable two-stage detection (YOLO + pose estimation)
+                          Default False. Set True for 5-10% accuracy improvement.
         """
         # Import settings to get DATABASE_URL
         from config.settings import settings
@@ -92,6 +95,19 @@ class PostureKitBridge:
             sys.stderr = old_stderr
             mmengine_logger.setLevel(old_level)
 
+        # Initialize two-stage detector if requested
+        if use_two_stage:
+            self.detector = TwoStageDetector(
+                pose_detector=self.pose_detector,
+                person_model="yolov8n.pt",  # Nano model (6MB, fast)
+                min_person_conf=0.3,
+                crop_padding=0.1
+            )
+            logger.info("Two-stage detection enabled")
+        else:
+            self.detector = self.pose_detector
+            logger.info("Single-stage detection (default)")
+
         self.feature_extractor = GeometricFeatureExtractor()
         self.visual_extractor = VisualFeatureExtractor()  # Lazy-loads model on first use
         self.fusion_engine = MultiModalFusion(fusion_method='concatenate')
@@ -116,7 +132,7 @@ class PostureKitBridge:
             Dictionary with pose data or None if no pose detected
         """
         try:
-            poses = self.pose_detector.detect(image_array)
+            poses = self.detector.detect(image_array)
 
             if not poses:
                 return None
@@ -374,7 +390,7 @@ class PostureKitBridge:
                         continue
 
                     # Detect poses
-                    poses = self.pose_detector.detect(image_rgb)
+                    poses = self.detector.detect(image_rgb)
 
                     for pose in poses:
                         if pose.overall_confidence < min_confidence:
