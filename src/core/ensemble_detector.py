@@ -207,7 +207,8 @@ class EnsembleDetector:
             pose = pred["pose"]
             weight = pred["weight"] / total_weight  # Normalize weight
 
-            fused_keypoints += pose.keypoints * weight
+            # Extract only x,y coordinates (keypoints is shape (133, 3) with [x, y, confidence])
+            fused_keypoints += pose.keypoints[:, :2] * weight
             fused_visibility += pose.visibility * weight
 
         # Average confidence across models
@@ -221,9 +222,13 @@ class EnsembleDetector:
             weight = pred["weight"] / total_weight
             fused_bbox += pred["pose"].bbox * weight
 
-        # Create fused result
+        # Create fused result (need to add confidence column for (133, 3) shape)
+        fused_keypoints_with_conf = np.concatenate(
+            [fused_keypoints, fused_visibility[:, np.newaxis]], axis=1
+        )
+
         fused = PoseResult(
-            keypoints=fused_keypoints,
+            keypoints=fused_keypoints_with_conf,
             visibility=fused_visibility,
             bbox=fused_bbox,
             overall_confidence=avg_confidence,
@@ -271,8 +276,8 @@ class EnsembleDetector:
             # Weight by both model weight and per-keypoint visibility
             weights = pose.visibility * model_weight
 
-            # Accumulate weighted keypoints
-            fused_keypoints += pose.keypoints * weights[:, np.newaxis]
+            # Accumulate weighted keypoints (extract only x,y from (133, 3) array)
+            fused_keypoints += pose.keypoints[:, :2] * weights[:, np.newaxis]
             total_confidence += weights
 
         # Normalize by total confidence per keypoint
@@ -283,17 +288,22 @@ class EnsembleDetector:
         total_model_weight = sum(p["weight"] for p in predictions)
         fused_visibility = total_confidence / total_model_weight
 
-        # Overall confidence is mean of fused visibility scores
-        overall_conf = float(np.mean(fused_visibility))
+        # Overall confidence is mean of fused visibility scores (normalized to [0, 1])
+        # Visibility ranges from 0-2, so divide by 2 to get confidence in [0, 1]
+        overall_conf = float(np.mean(fused_visibility) / 2.0)
 
         # Average bbox
         fused_bbox = np.mean([p["pose"].bbox for p in predictions], axis=0).astype(
             np.float32
         )
 
-        # Create fused result
+        # Create fused result (need to add confidence column for (133, 3) shape)
+        fused_keypoints_with_conf = np.concatenate(
+            [fused_keypoints, fused_visibility[:, np.newaxis]], axis=1
+        )
+
         fused = PoseResult(
-            keypoints=fused_keypoints,
+            keypoints=fused_keypoints_with_conf,
             visibility=fused_visibility,
             bbox=fused_bbox,
             overall_confidence=overall_conf,
