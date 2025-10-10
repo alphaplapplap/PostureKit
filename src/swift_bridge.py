@@ -9,7 +9,7 @@ import logging
 import hashlib
 import warnings
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 import numpy as np
 
 # Suppress FutureWarnings from mmpose/PyTorch
@@ -51,12 +51,34 @@ class PostureKitBridge:
     Bridge class for Swift integration.
     Provides simplified interface to PostureKit Python modules.
     """
-    
+
+    # Model registry with configurations
+    AVAILABLE_MODELS = {
+        'rtmw-l': {
+            'name': 'RTMW-L',
+            'config': 'rtmw-l_8xb320-270e_cocktail14-384x288.py',
+            'checkpoint': 'rtmw-dw-x-l_simcc-cocktail14_270e-384x288-20231122.pth',
+            'size_mb': 220,
+            'resolution': (384, 288),
+            'description': 'Baseline model, good general performance'
+        },
+        'rtmw-x': {
+            'name': 'RTMW-X',
+            'config': 'rtmw-x_8xb320-270e_cocktail14-384x288.py',
+            'checkpoint': 'rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth',
+            'size_mb': 353,
+            'resolution': (384, 288),
+            'description': 'Larger model, better for difficult cases'
+        },
+    }
+
     def __init__(
         self,
         db_url: Optional[str] = None,
         use_two_stage: bool = False,
         use_ensemble: bool = False,
+        pose_models: Union[str, List[str]] = None,
+        fusion_method: str = "confidence_weighted",
     ):
         """
         Initialize PostureKit bridge.
@@ -65,9 +87,17 @@ class PostureKitBridge:
             db_url: Database URL (defaults to PostgreSQL from settings)
             use_two_stage: Enable two-stage detection (YOLO + pose estimation)
                           Default False. Set True for 5-10% accuracy improvement.
-            use_ensemble: Enable ensemble detection (multiple models with fusion)
+            use_ensemble: DEPRECATED - Use pose_models instead.
+                         Enable ensemble detection (multiple models with fusion)
                          Default False. Set True for 10-15% accuracy improvement.
-                         Note: Overrides use_two_stage if both are True.
+            pose_models: Which pose model(s) to use. Options:
+                        - 'rtmw-l' (default): RTMW-L only (220MB, fast, good quality)
+                        - 'rtmw-x': RTMW-X only (353MB, slower, best quality)
+                        - ['rtmw-l', 'rtmw-x']: Ensemble with both (2.5x slower, 10-15% better)
+                        - ['rtmw-l']: RTMW-L via ensemble (same as 'rtmw-l')
+                        - ['rtmw-x']: RTMW-X via ensemble (same as 'rtmw-x')
+            fusion_method: Fusion method for ensemble (when pose_models is a list)
+                          Options: 'confidence_weighted' (default) or 'weighted_average'
         """
         # Import settings to get DATABASE_URL
         from config.settings import settings
@@ -76,74 +106,106 @@ class PostureKitBridge:
         if db_url is None:
             db_url = settings.DATABASE_URL
 
-        # Initialize components with model paths
-        # Use settings.PROJECT_ROOT instead of __file__ (which may not be set when running via -c)
-        config_path = settings.PROJECT_ROOT / "data" / "models" / "rtmw-l_8xb320-270e_cocktail14-384x288.py"
-        checkpoint_path = settings.PROJECT_ROOT / "data" / "models" / "rtmw-dw-x-l_simcc-cocktail14_270e-384x288-20231122.pth"
+        # Determine which models to use
+        # Handle backward compatibility with use_ensemble
+        if pose_models is None:
+            if use_ensemble:
+                pose_models = ['rtmw-l', 'rtmw-x']
+            else:
+                pose_models = 'rtmw-l'  # Default single model
 
-        # Suppress mmengine logging and redirect stdout to prevent checkpoint messages
+        # Normalize to list
+        if isinstance(pose_models, str):
+            model_list = [pose_models]
+            use_ensemble_mode = False
+        else:
+            model_list = pose_models
+            use_ensemble_mode = len(model_list) > 1
+
+        # Validate models
+        for model_name in model_list:
+            if model_name not in self.AVAILABLE_MODELS:
+                available = ', '.join(self.AVAILABLE_MODELS.keys())
+                raise ValueError(f"Unknown model '{model_name}'. Available: {available}")
+
+        # Build model specifications
+        model_specs = []
+        for model_name in model_list:
+            model_info = self.AVAILABLE_MODELS[model_name]
+            config_path = settings.PROJECT_ROOT / "data" / "models" / model_info['config']
+            checkpoint_path = settings.PROJECT_ROOT / "data" / "models" / model_info['checkpoint']
+
+            if not config_path.exists():
+                raise FileNotFoundError(f"Model config not found: {config_path}")
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+
+            model_specs.append({
+                'name': model_name,
+                'config': str(config_path),
+                'checkpoint': str(checkpoint_path),
+                'weight': 1.0,
+                'info': model_info
+            })
+
+        # Suppress mmengine logging during model loading
         import logging as py_logging
         mmengine_logger = py_logging.getLogger('mmengine')
         old_level = mmengine_logger.level
-        mmengine_logger.setLevel(py_logging.ERROR)  # Only show errors
+        mmengine_logger.setLevel(py_logging.ERROR)
 
         old_stdout = sys.stdout
         old_stderr = sys.stderr
+
         try:
-            # Redirect both stdout and stderr to suppress all mmpose output during init
+            # Redirect stdout/stderr to suppress mmpose output
             sys.stdout = open(os.devnull, 'w')
             sys.stderr = open(os.devnull, 'w')
-            self.pose_detector = RTMWCocktail14Detector(
-                config_file=str(config_path),
-                checkpoint_file=str(checkpoint_path)
-            )
+
+            # Initialize detector based on mode
+            if use_ensemble_mode:
+                # Ensemble mode: Multiple models with fusion
+                ensemble_config = EnsembleConfig(
+                    models=[{
+                        "config": spec['config'],
+                        "checkpoint": spec['checkpoint'],
+                        "weight": spec['weight'],
+                    } for spec in model_specs],
+                    fusion_method=fusion_method,
+                )
+                self.detector = EnsembleDetector(ensemble_config)
+                model_names = ' + '.join([spec['name'].upper() for spec in model_specs])
+                logger.info(f"Ensemble detection enabled: {model_names} ({len(model_specs)} models, {fusion_method})")
+
+            else:
+                # Single model mode
+                spec = model_specs[0]
+                self.pose_detector = RTMWCocktail14Detector(
+                    config_file=spec['config'],
+                    checkpoint_file=spec['checkpoint']
+                )
+
+                if use_two_stage:
+                    # Two-stage mode: YOLO + pose estimation
+                    self.detector = TwoStageDetector(
+                        pose_detector=self.pose_detector,
+                        person_model="yolov8n.pt",  # Nano model (6MB, fast)
+                        min_person_conf=0.3,
+                        crop_padding=0.1,
+                    )
+                    logger.info(f"Two-stage detection enabled: {spec['name'].upper()}")
+                else:
+                    # Single-stage mode (default)
+                    self.detector = self.pose_detector
+                    logger.info(f"Single-stage detection: {spec['name'].upper()} ({spec['info']['size_mb']}MB)")
+
         finally:
+            # Restore stdout/stderr and logger
             sys.stdout.close()
             sys.stderr.close()
             sys.stdout = old_stdout
             sys.stderr = old_stderr
             mmengine_logger.setLevel(old_level)
-
-        # Initialize detector based on mode
-        if use_ensemble:
-            # Ensemble mode: Use multiple models with fusion
-            # Model 1: RTMW-L (220MB, 384x288) - good baseline
-            # Model 2: RTMW-X (353MB, 384x288) - larger capacity, better at difficult cases
-            rtmw_x_config = settings.PROJECT_ROOT / "data" / "models" / "rtmw-x_8xb320-270e_cocktail14-384x288.py"
-            rtmw_x_checkpoint = settings.PROJECT_ROOT / "data" / "models" / "rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth"
-
-            ensemble_config = EnsembleConfig(
-                models=[
-                    {
-                        "config": str(config_path),
-                        "checkpoint": str(checkpoint_path),
-                        "weight": 1.0,  # RTMW-L (384x288, 220MB)
-                    },
-                    {
-                        "config": str(rtmw_x_config),
-                        "checkpoint": str(rtmw_x_checkpoint),
-                        "weight": 1.0,  # RTMW-X (384x288, 353MB) - larger model
-                    },
-                ],
-                fusion_method="confidence_weighted",  # Weight by per-keypoint confidence
-            )
-            self.detector = EnsembleDetector(ensemble_config)
-            logger.info("Ensemble detection enabled: RTMW-L + RTMW-X (2 models)")
-
-        elif use_two_stage:
-            # Two-stage mode: YOLO + pose estimation
-            self.detector = TwoStageDetector(
-                pose_detector=self.pose_detector,
-                person_model="yolov8n.pt",  # Nano model (6MB, fast)
-                min_person_conf=0.3,
-                crop_padding=0.1,
-            )
-            logger.info("Two-stage detection enabled")
-
-        else:
-            # Single-stage mode (default)
-            self.detector = self.pose_detector
-            logger.info("Single-stage detection (default)")
 
         self.feature_extractor = GeometricFeatureExtractor()
         self.visual_extractor = VisualFeatureExtractor()  # Lazy-loads model on first use
