@@ -12,11 +12,18 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Literal
 from dataclasses import dataclass
+import torch
 
 from src.core.pose_detector import RTMWCocktail14Detector, PoseResult
+from src.core.person_detector import YOLOPersonDetector, PersonDetection
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _has_mps_module() -> bool:
+    """Check if torch.mps module is available (PyTorch 2.1+)."""
+    return hasattr(torch, 'mps')
 
 
 @dataclass
@@ -57,12 +64,13 @@ class EnsembleDetector:
         detectors: List of loaded detector instances with weights
     """
 
-    def __init__(self, config: EnsembleConfig):
+    def __init__(self, config: EnsembleConfig, device: Optional[str] = None):
         """
         Initialize ensemble with multiple models.
 
         Args:
             config: EnsembleConfig with model specifications
+            device: Device to use ('mps', 'cuda', 'cpu'). Defaults to settings.DEVICE
 
         Raises:
             ValueError: If fewer than 2 models specified
@@ -76,7 +84,11 @@ class EnsembleDetector:
         self.config = config
         self.detectors = []
 
-        logger.info(f"Initializing ensemble with {len(config.models)} models...")
+        # Determine device for all child detectors
+        from src.config.settings import settings
+        self.device = device or settings.DEVICE
+
+        logger.info(f"Initializing ensemble with {len(config.models)} models (device={self.device})...")
 
         # Load all models
         for i, model_spec in enumerate(config.models, 1):
@@ -84,6 +96,7 @@ class EnsembleDetector:
                 detector = RTMWCocktail14Detector(
                     config_file=model_spec["config"],
                     checkpoint_file=model_spec["checkpoint"],
+                    device=self.device,  # Explicit device propagation
                 )
                 weight = model_spec.get("weight", 1.0)
 
@@ -97,6 +110,18 @@ class EnsembleDetector:
             except Exception as e:
                 logger.error(f"Failed to load model {i}: {e}")
                 raise
+
+        # Initialize YOLO person detector for multi-person scenarios
+        try:
+            self.person_detector = YOLOPersonDetector(
+                model_name='yolov8n.pt',  # Nano model (6MB, fast)
+                confidence_threshold=0.15,  # Low threshold to catch all people
+                device=self.device
+            )
+            logger.info("YOLO person detector initialized for multi-person ensemble")
+        except Exception as e:
+            logger.warning(f"Failed to initialize person detector: {e}")
+            self.person_detector = None
 
         total_weight = sum(d["weight"] for d in self.detectors)
         logger.info(
@@ -140,6 +165,20 @@ class EnsembleDetector:
                     )
                 else:
                     logger.debug(f"Model {i}: no pose detected")
+
+                # Clear GPU cache between model inferences to prevent accumulation
+                if i < len(self.detectors):  # Don't clear after last detector
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        if _has_mps_module():
+                            try:
+                                torch.mps.empty_cache()
+                            except Exception:
+                                pass
+                        # Else: PyTorch < 2.1, skip MPS cache cleanup
             except Exception as e:
                 logger.warning(f"Model {i} detection failed: {e}")
                 continue
@@ -175,6 +214,135 @@ class EnsembleDetector:
             best = max(all_predictions, key=lambda p: p["pose"].overall_confidence)
             logger.warning(f"Using fallback (best model): confidence={best['pose'].overall_confidence:.3f}")
             return [best["pose"]]
+
+    def detect_multi_person(self, image: np.ndarray) -> List[PoseResult]:
+        """
+        Detect multiple people using ensemble with per-person fusion.
+
+        This method properly handles multi-person scenarios by:
+        1. Detecting all people with YOLO first
+        2. For each person, running all ensemble models on their crop
+        3. Applying ensemble fusion to each person's predictions
+        4. Returning all fused results
+
+        This fixes the bug where ensemble mode only returned the first person.
+
+        Args:
+            image: Input image in RGB format (H, W, 3)
+
+        Returns:
+            List of PoseResult objects, one per detected person with ensemble fusion applied
+        """
+        # Fallback to single-person detection if YOLO not available
+        if self.person_detector is None:
+            logger.warning(
+                "YOLO person detector not available, falling back to single-person detection"
+            )
+            return self.detect(image)
+
+        logger.info("Starting multi-person ensemble detection")
+
+        # Step 1: Detect all people with YOLO
+        try:
+            person_detections = self.person_detector.detect_people(image, return_crops=True)
+        except Exception as e:
+            logger.error(f"YOLO person detection failed: {e}, falling back to whole-image")
+            return self.detect(image)
+
+        if not person_detections:
+            logger.info("No people detected by YOLO")
+            return []
+
+        logger.info(f"YOLO detected {len(person_detections)} people")
+
+        # Step 2: For each person, run ensemble detection and fusion
+        all_fused_results = []
+
+        for person in person_detections:
+            person_id = person.person_id
+            logger.debug(f"Processing person {person_id} with ensemble fusion")
+
+            # Collect predictions from all models for this person
+            person_predictions = []
+
+            for i, det_spec in enumerate(self.detectors, 1):
+                try:
+                    # Run pose detection on person's crop
+                    pose = det_spec["detector"].detect_from_crop(
+                        person.crop,
+                        person.bbox
+                    )
+
+                    if pose is not None:
+                        # Set person ID
+                        pose.person_id = person_id
+
+                        person_predictions.append(
+                            {"pose": pose, "weight": det_spec["weight"], "model_id": i}
+                        )
+                        logger.debug(
+                            f"Model {i} detected person {person_id} with confidence {pose.overall_confidence:.3f}"
+                        )
+                    else:
+                        logger.debug(f"Model {i} failed to detect person {person_id}")
+
+                    # Clear GPU cache between models
+                    if i < len(self.detectors):
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        elif torch.backends.mps.is_available():
+                            if _has_mps_module():
+                                try:
+                                    torch.mps.empty_cache()
+                                except Exception:
+                                    pass
+                            # Else: PyTorch < 2.1, skip MPS cache cleanup
+
+                except Exception as e:
+                    logger.warning(f"Model {i} detection failed for person {person_id}: {e}")
+                    continue
+
+            # Apply fusion if we have predictions for this person
+            if person_predictions:
+                try:
+                    if self.config.fusion_method == "weighted_average":
+                        fused = self._fuse_weighted_average(person_predictions)
+                    elif self.config.fusion_method == "confidence_weighted":
+                        fused = self._fuse_confidence_weighted(person_predictions)
+                    else:
+                        raise ValueError(
+                            f"Unknown fusion method: {self.config.fusion_method}"
+                        )
+
+                    # Ensure person ID is preserved
+                    fused.person_id = person_id
+
+                    all_fused_results.append(fused)
+
+                    logger.info(
+                        f"Fused person {person_id}: confidence={fused.overall_confidence:.3f}, "
+                        f"from {len(person_predictions)} model(s)"
+                    )
+                except Exception as e:
+                    logger.error(f"Fusion failed for person {person_id}: {e}")
+                    # Fallback: use best prediction for this person
+                    if person_predictions:
+                        best = max(person_predictions, key=lambda p: p["pose"].overall_confidence)
+                        best["pose"].person_id = person_id
+                        all_fused_results.append(best["pose"])
+                        logger.warning(
+                            f"Using fallback for person {person_id}: best model confidence={best['pose'].overall_confidence:.3f}"
+                        )
+            else:
+                logger.warning(f"No valid predictions for person {person_id}, skipping")
+
+        logger.info(
+            f"Multi-person ensemble complete: {len(all_fused_results)}/{len(person_detections)} people processed"
+        )
+
+        return all_fused_results
 
     def _fuse_weighted_average(
         self, predictions: List[Dict]
@@ -222,14 +390,18 @@ class EnsembleDetector:
             weight = pred["weight"] / total_weight
             fused_bbox += pred["pose"].bbox * weight
 
-        # Create fused result (need to add confidence column for (133, 3) shape)
-        fused_keypoints_with_conf = np.concatenate(
-            [fused_keypoints, fused_visibility[:, np.newaxis]], axis=1
-        )
+        # CRITICAL: Convert visibility to integers (database expects 0, 1, or 2)
+        # Fused visibility is float average, need to round and clip
+        fused_visibility_int = np.clip(np.round(fused_visibility), 0, 2).astype(np.int32)
+
+        # Create fused result (pre-allocate for performance)
+        fused_keypoints_with_conf = np.empty((num_keypoints, 3), dtype=np.float32)
+        fused_keypoints_with_conf[:, :2] = fused_keypoints
+        fused_keypoints_with_conf[:, 2] = fused_visibility
 
         fused = PoseResult(
             keypoints=fused_keypoints_with_conf,
-            visibility=fused_visibility,
+            visibility=fused_visibility_int,  # Use integer visibility
             bbox=fused_bbox,
             overall_confidence=avg_confidence,
             person_id=base_pose.person_id,
@@ -292,19 +464,23 @@ class EnsembleDetector:
         # Visibility ranges from 0-2, so divide by 2 to get confidence in [0, 1]
         overall_conf = float(np.mean(fused_visibility) / 2.0)
 
+        # CRITICAL: Convert visibility to integers (database expects 0, 1, or 2)
+        # Fused visibility is float, need to round and clip
+        fused_visibility_int = np.clip(np.round(fused_visibility), 0, 2).astype(np.int32)
+
         # Average bbox
         fused_bbox = np.mean([p["pose"].bbox for p in predictions], axis=0).astype(
             np.float32
         )
 
-        # Create fused result (need to add confidence column for (133, 3) shape)
-        fused_keypoints_with_conf = np.concatenate(
-            [fused_keypoints, fused_visibility[:, np.newaxis]], axis=1
-        )
+        # Create fused result (pre-allocate for performance)
+        fused_keypoints_with_conf = np.empty((num_keypoints, 3), dtype=np.float32)
+        fused_keypoints_with_conf[:, :2] = fused_keypoints
+        fused_keypoints_with_conf[:, 2] = fused_visibility
 
         fused = PoseResult(
             keypoints=fused_keypoints_with_conf,
-            visibility=fused_visibility,
+            visibility=fused_visibility_int,  # Use integer visibility
             bbox=fused_bbox,
             overall_confidence=overall_conf,
             person_id=base_pose.person_id,
@@ -345,6 +521,28 @@ class EnsembleDetector:
     def get_total_weight(self) -> float:
         """Get sum of all model weights."""
         return sum(d["weight"] for d in self.detectors)
+
+    def unload_models(self) -> None:
+        """Unload all ensemble models from GPU memory to free resources."""
+        for det_spec in self.detectors:
+            detector = det_spec["detector"]
+            if hasattr(detector, 'unload_model'):
+                detector.unload_model()
+
+        # Clear GPU cache
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            if _has_mps_module():
+                try:
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
+            # Else: PyTorch < 2.1, skip MPS cache cleanup
+
+        logger.info(f"Unloaded {len(self.detectors)} ensemble models from memory")
 
 
 def create_ensemble(

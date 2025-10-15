@@ -214,6 +214,10 @@ class PreferencesDialog(QDialog):
         self.fusion_method_label = QLabel("Fusion method:")
         pose_model_layout.addRow(self.fusion_method_label, self.fusion_method_combo)
 
+        # Initially hide fusion method widgets (shown only for ensemble)
+        self.fusion_method_label.hide()
+        self.fusion_method_combo.hide()
+
         # Two-stage detection
         self.two_stage_check = QCheckBox("Enable two-stage detection (YOLO + pose)")
         self.two_stage_check.setToolTip(
@@ -713,8 +717,12 @@ class PreferencesDialog(QDialog):
         """Handle model selection change - show/hide fusion options."""
         # Show fusion method only for ensemble (index 2)
         is_ensemble = (index == 2)
-        self.fusion_method_label.setVisible(is_ensemble)
-        self.fusion_method_combo.setVisible(is_ensemble)
+        if is_ensemble:
+            self.fusion_method_label.show()
+            self.fusion_method_combo.show()
+        else:
+            self.fusion_method_label.hide()
+            self.fusion_method_combo.hide()
 
         # Update info label
         info_texts = [

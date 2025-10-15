@@ -197,8 +197,8 @@ class ImageIngestor:
                     f"Resized image from {original_width}x{original_height} to {target_size[0]}x{target_size[1]}"
                 )
             else:
-                # Create a copy to avoid modifying the original image
-                resized = image.copy()
+                # Use original image directly (no resize needed)
+                resized = image
 
             # Convert color space if requested
             if convert_to_rgb:
@@ -261,6 +261,7 @@ class ImageIngestor:
 
             # Convert back to BGR
             enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            del lab  # Free LAB array memory
 
             # 2. Denoise to reduce false keypoint detections
             # h=3, hColor=3: Mild denoising (preserves edges)
@@ -273,6 +274,7 @@ class ImageIngestor:
                 templateWindowSize=7,
                 searchWindowSize=21,
             )
+            del enhanced  # Free enhanced array memory
 
             # 3. Upsample small images to improve detection on small subjects
             h, w = denoised.shape[:2]
@@ -287,6 +289,7 @@ class ImageIngestor:
                 upsampled = cv2.resize(
                     denoised, (new_w, new_h), interpolation=cv2.INTER_CUBIC
                 )
+                del denoised  # Free denoised array memory
 
                 logger.debug(
                     f"Upsampled image from {w}x{h} to {new_w}x{new_h} (scale={scale:.2f})"

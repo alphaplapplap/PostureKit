@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 import logging
+import weakref
+import threading
+import gc
 
 # PyTorch patch is handled by core._torch_patch module (imported in swift_bridge.py)
 # No need to patch here - the global patch is already applied
@@ -24,6 +27,12 @@ from src.utils.logging_config import get_logger
 from src.config.settings import settings
 
 logger = get_logger(__name__)
+
+
+def _has_mps_module() -> bool:
+    """Check if torch.mps module is available (PyTorch 2.1+)."""
+    return hasattr(torch, 'mps')
+
 
 # Person detection (optional, for two-stage approach)
 try:
@@ -134,6 +143,12 @@ class RTMWCocktail14Detector:
     DEFAULT_CONFIG = 'rtmpose-l_8xb32-270e_cocktail14-384x288.py'
     DEFAULT_CHECKPOINT = 'rtmpose-l_8xb32-270e_cocktail14-384x288.pth'
 
+    # Class-level model cache with weak references to prevent memory leaks
+    # Shared across all instances to avoid redundant model loading (each model ~500MB)
+    _model_cache = weakref.WeakValueDictionary()
+    _detector_cache = weakref.WeakValueDictionary()
+    _cache_lock = threading.Lock()  # Protect cache access from concurrent loads
+
     def __init__(
         self,
         config_file: Optional[str] = None,
@@ -210,12 +225,12 @@ class RTMWCocktail14Detector:
         """
         try:
             if self.device == 'mps':
-                # MPS causes actual segfaults with RTMPose - must use CPU
-                logger.warning(
-                    "MPS acceleration causes segfaults with RTMPose. Using CPU instead."
-                )
-                self.device = 'cpu'  # Update device string for status reporting
-                return torch.device('cpu')
+                if not torch.backends.mps.is_available():
+                    logger.warning("MPS not available, falling back to CPU")
+                    self.device = 'cpu'
+                    return torch.device('cpu')
+                device_obj = torch.device('mps')
+                logger.info("Using Apple Silicon MPS (Metal Performance Shaders)")
 
             elif self.device == 'cuda':
                 if not torch.cuda.is_available():
@@ -236,7 +251,7 @@ class RTMWCocktail14Detector:
 
     def _load_model(self) -> None:
         """
-        Load Cocktail14 RTMW-L model (lazy loading).
+        Load Cocktail14 RTMW-L model (lazy loading with caching).
 
         Raises:
             ModelInitializationError: If model loading fails
@@ -244,53 +259,98 @@ class RTMWCocktail14Detector:
         if self._model is not None:
             return  # Already loaded
 
-        logger.info("Loading Cocktail14 RTMW-L model...")
+        # Thread-safe cache check with double-check locking
+        cache_key = (str(self.config_file), str(self.checkpoint_file), self.device)
 
-        try:
-            # Validate paths
-            config_path = Path(self.config_file)
-            checkpoint_path = Path(self.checkpoint_file)
-
-            if not checkpoint_path.exists():
-                raise ModelInitializationError(
-                    f"Cocktail14 checkpoint not found at: {checkpoint_path}\n"
-                    f"Download from: https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/"
-                    f"rtmpose-l_simcc-cocktail14_pt-ucoco_270e-384x288-8d0b6c28_20230728.pth"
-                )
-
-            if not config_path.exists():
-                raise ModelInitializationError(
-                    f"Config file not found at: {config_path}\n"
-                    f"Expected Cocktail14 config from MMPose configs"
-                )
-
-            # Initialize device
+        # Fast path: check cache without lock
+        cached_model = self._model_cache.get(cache_key)
+        if cached_model is not None:
+            self._model = cached_model
             self._device_obj = self._initialize_device()
-            device_str = str(self._device_obj)
+            logger.info("Reusing cached Cocktail14 model (memory efficient)")
+            return
 
-            logger.info(f"Loading model on device: {device_str}")
+        # Slow path: load model with lock to prevent duplicate loads
+        with self._cache_lock:
+            # Double-check inside lock
+            cached_model = self._model_cache.get(cache_key)
+            if cached_model is not None:
+                self._model = cached_model
+                self._device_obj = self._initialize_device()
+                logger.info("Reusing cached Cocktail14 model (memory efficient, race avoided)")
+                return
 
-            # Load model with MMPose 1.3.2 API
-            # torch.load is monkey-patched at module level to use weights_only=False
-            self._model = init_model(
-                str(config_path),
-                str(checkpoint_path),
-                device=device_str
-            )
+            logger.info("Loading Cocktail14 RTMW-L model...")
 
-            logger.info(
-                "Cocktail14 model loaded successfully",
-                extra={'extra_data': {
-                    'config': str(config_path),
-                    'weights': str(checkpoint_path),
-                    'device': str(self._device_obj)
-                }}
-            )
+            try:
+                # Validate paths
+                config_path = Path(self.config_file)
+                checkpoint_path = Path(self.checkpoint_file)
 
-        except Exception as e:
-            if isinstance(e, ModelInitializationError):
-                raise
-            raise ModelInitializationError(f"Failed to load Cocktail14 model: {e}") from e
+                if not checkpoint_path.exists():
+                    raise ModelInitializationError(
+                        f"Cocktail14 checkpoint not found at: {checkpoint_path}\n"
+                        f"Download from: https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/"
+                        f"rtmpose-l_simcc-cocktail14_pt-ucoco_270e-384x288-8d0b6c28_20230728.pth"
+                    )
+
+                if not config_path.exists():
+                    raise ModelInitializationError(
+                        f"Config file not found at: {config_path}\n"
+                        f"Expected Cocktail14 config from MMPose configs"
+                    )
+
+                # Initialize device
+                self._device_obj = self._initialize_device()
+                device_str = str(self._device_obj)
+
+                logger.info(f"Loading model on device: {device_str}")
+
+                # Load model with MMPose 1.3.2 API
+                # Suppress mmengine checkpoint loading messages to prevent stdout pollution
+                import sys
+                import os
+                old_stdout = sys.stdout
+                old_stderr = sys.stderr
+                devnull_stdout = open(os.devnull, 'w')
+                devnull_stderr = open(os.devnull, 'w')
+                try:
+                    # Redirect to devnull during model loading
+                    sys.stdout = devnull_stdout
+                    sys.stderr = devnull_stderr
+
+                    # torch.load is monkey-patched at module level to use weights_only=False
+                    self._model = init_model(
+                        str(config_path),
+                        str(checkpoint_path),
+                        device=device_str
+                    )
+                finally:
+                    # Restore stdout/stderr
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+                    devnull_stdout.close()
+                    devnull_stderr.close()
+
+                # Explicitly set to eval mode to ensure inference-only behavior
+                self._model.eval()
+
+                # Store in cache for reuse by other detector instances (still inside lock)
+                self._model_cache[cache_key] = self._model
+
+                logger.info(
+                    "Cocktail14 model loaded successfully",
+                    extra={'extra_data': {
+                        'config': str(config_path),
+                        'weights': str(checkpoint_path),
+                        'device': str(self._device_obj)
+                    }}
+                )
+
+            except Exception as e:
+                if isinstance(e, ModelInitializationError):
+                    raise
+                raise ModelInitializationError(f"Failed to load Cocktail14 model: {e}") from e
 
     def _extract_pose_results(
         self,
@@ -343,11 +403,40 @@ class RTMWCocktail14Detector:
 
                 # Convert to numpy if tensor
                 if torch.is_tensor(keypoints):
-                    keypoints = keypoints.cpu().numpy()
+                    keypoints = keypoints.detach().cpu().numpy()
                 if torch.is_tensor(keypoint_scores):
-                    keypoint_scores = keypoint_scores.cpu().numpy()
+                    keypoint_scores = keypoint_scores.detach().cpu().numpy()
                 if keypoints_visible is not None and torch.is_tensor(keypoints_visible):
-                    keypoints_visible = keypoints_visible.cpu().numpy()
+                    keypoints_visible = keypoints_visible.detach().cpu().numpy()
+
+                # Comprehensive array validation (prevent buffer overflow/corruption)
+                if keypoints.shape != (133, 2):
+                    logger.warning(
+                        f"Invalid keypoint shape: {keypoints.shape}, expected (133, 2). Skipping detection."
+                    )
+                    continue
+
+                if keypoint_scores.shape != (133,):
+                    logger.warning(
+                        f"Invalid keypoint_scores shape: {keypoint_scores.shape}, expected (133,). Skipping detection."
+                    )
+                    continue
+
+                # Validate all values are finite (no inf/nan)
+                if not np.all(np.isfinite(keypoints)):
+                    logger.warning("Keypoints contain inf/nan values. Skipping detection.")
+                    continue
+
+                if not np.all(np.isfinite(keypoint_scores)):
+                    logger.warning("Keypoint scores contain inf/nan values. Skipping detection.")
+                    continue
+
+                # Reasonable bounds check (prevent buffer overflow from corrupt data)
+                if np.max(np.abs(keypoints)) > 100000:
+                    logger.warning(
+                        f"Keypoints outside reasonable bounds: max={np.max(np.abs(keypoints))}. Skipping detection."
+                    )
+                    continue
 
                 # Debug: Log raw keypoint scores to diagnose confidence issue
                 logger.debug(f"Raw keypoint_scores shape: {keypoint_scores.shape}")
@@ -390,18 +479,16 @@ class RTMWCocktail14Detector:
 
                     logger.debug(f"Clipped coordinates to ({img_w}x{img_h})")
 
-                # Combine into (133, 3) array [x, y, confidence]
-                # Clip scores to [0,1] in case MMPose returns logits
-                keypoints_with_conf = np.concatenate([
-                    keypoints,
-                    np.clip(keypoint_scores[:, np.newaxis], 0.0, 1.0)
-                ], axis=1).astype(np.float32)
+                # Combine into (133, 3) array [x, y, confidence] with pre-allocation
+                keypoints_with_conf = np.empty((133, 3), dtype=np.float32)
+                keypoints_with_conf[:, :2] = keypoints
+                keypoints_with_conf[:, 2] = np.clip(keypoint_scores, 0.0, 1.0)
 
                 # Extract bounding box
                 if hasattr(pred_instances, 'bboxes') and len(pred_instances.bboxes) > 0:
                     bbox = pred_instances.bboxes[0]  # (4,) or (5,) [x1, y1, x2, y2, (score)]
                     if torch.is_tensor(bbox):
-                        bbox = bbox.cpu().numpy()
+                        bbox = bbox.detach().cpu().numpy()
 
                     # Convert [x1, y1, x2, y2] to [x, y, w, h]
                     bbox = np.array([
@@ -580,7 +667,7 @@ class RTMWCocktail14Detector:
         return True
 
     def _load_person_detector(self) -> None:
-        """Load YOLOv8 person detector (lazy loading)."""
+        """Load YOLOv8 person detector (lazy loading with caching)."""
         if self._person_detector is not None:
             return  # Already loaded
 
@@ -589,9 +676,17 @@ class RTMWCocktail14Detector:
             self.use_person_detector = False
             return
 
+        # Check cache first
+        detector_key = 'yolov8n.pt'
+        if detector_key in self._detector_cache:
+            self._person_detector = self._detector_cache[detector_key]
+            logger.info("Reusing cached YOLOv8n detector (memory efficient)")
+            return
+
         logger.info("Loading YOLOv8n person detector...")
         try:
             self._person_detector = YOLO('yolov8n.pt')  # Lightweight nano model
+            self._detector_cache[detector_key] = self._person_detector
             logger.info("YOLOv8n person detector loaded")
         except Exception as e:
             logger.error(f"Failed to load person detector: {e}")
@@ -693,6 +788,23 @@ class RTMWCocktail14Detector:
             # Extract results
             results = self._extract_pose_results(data_samples, image.shape[:2])
 
+            # CRITICAL: Delete data_samples to free GPU memory
+            del data_samples
+            import gc
+            gc.collect()
+            if torch.backends.mps.is_available():
+                if _has_mps_module():
+                    try:
+                        torch.mps.synchronize()  # Wait for GPU operations to complete
+                        torch.mps.empty_cache()
+                    except Exception:
+                        # Silently ignore if MPS methods fail
+                        pass
+                # Else: PyTorch < 2.1, skip MPS cache cleanup
+            elif torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
             logger.info(
                 f"Cocktail14 detected {len(results)} pose(s)",
                 extra={'extra_data': {
@@ -708,6 +820,64 @@ class RTMWCocktail14Detector:
             if isinstance(e, (ModelInitializationError, DetectionError)):
                 raise
             raise DetectionError(f"Cocktail14 detection failed: {e}") from e
+
+    def detect_batch(self, images: List[np.ndarray], progress_callback=None) -> List[List[PoseResult]]:
+        """
+        Detect poses in multiple images using batch processing (GPU-optimized).
+
+        Processes images sequentially but keeps GPU memory loaded for efficiency.
+        Significantly faster than cold-starting for each image when using MPS/CUDA.
+
+        Args:
+            images: List of input images as numpy arrays (H, W, 3) in RGB format
+            progress_callback: Optional callback(current, total) for progress updates
+
+        Returns:
+            List of Lists: For each image, a list of PoseResult objects
+
+        Raises:
+            DetectionError: If batch detection fails
+        """
+        if not images:
+            return []
+
+        # Ensure model is loaded
+        if self._model is None:
+            self._load_model()
+
+        logger.info(f"Running batch detection on {len(images)} images (device={self.device})")
+
+        try:
+            all_results = []
+
+            # Process images sequentially with GPU memory staying hot
+            for idx, image in enumerate(images):
+                if progress_callback:
+                    progress_callback(idx + 1, len(images))
+
+                # Use standard detect - GPU stays loaded and warm
+                results = self.detect(image)
+                all_results.append(results)
+
+                # Periodic GPU cache cleanup to prevent accumulation
+                if idx % 10 == 0 and idx > 0:
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        if _has_mps_module():
+                            try:
+                                torch.mps.empty_cache()
+                            except Exception:
+                                pass
+                        # Else: PyTorch < 2.1, skip MPS cache cleanup
+
+            logger.info(f"Batch detection complete: {len(images)} images processed")
+            return all_results
+
+        except Exception as e:
+            raise DetectionError(f"Batch detection failed: {e}") from e
 
     def detect_single(self, image: np.ndarray) -> Optional[PoseResult]:
         """
@@ -774,9 +944,9 @@ class RTMWCocktail14Detector:
 
             # Convert to numpy if tensor
             if torch.is_tensor(keypoints):
-                keypoints = keypoints.cpu().numpy()
+                keypoints = keypoints.detach().cpu().numpy()
             if torch.is_tensor(keypoint_scores):
-                keypoint_scores = keypoint_scores.cpu().numpy()
+                keypoint_scores = keypoint_scores.detach().cpu().numpy()
 
             # Map keypoints back to original image coordinates
             x_offset, y_offset = bbox_in_original[0], bbox_in_original[1]
@@ -784,11 +954,10 @@ class RTMWCocktail14Detector:
             keypoints_original[:, 0] += x_offset
             keypoints_original[:, 1] += y_offset
 
-            # Combine into (133, 3)
-            keypoints_with_conf = np.concatenate([
-                keypoints_original,
-                np.clip(keypoint_scores[:, np.newaxis], 0.0, 1.0)
-            ], axis=1).astype(np.float32)
+            # Combine into (133, 3) with pre-allocation
+            keypoints_with_conf = np.empty((133, 3), dtype=np.float32)
+            keypoints_with_conf[:, :2] = keypoints_original
+            keypoints_with_conf[:, 2] = np.clip(keypoint_scores, 0.0, 1.0)
 
             # Overall confidence
             overall_confidence = float(np.clip(keypoint_scores.mean(), 0.0, 1.0))
@@ -823,19 +992,46 @@ class RTMWCocktail14Detector:
     def unload_model(self) -> None:
         """Unload model from memory to free resources."""
         if self._model is not None:
-            del self._model
+            # Don't delete if model is in cache (shared by other instances)
             self._model = None
             self._device_obj = None
 
         if self._person_detector is not None:
-            del self._person_detector
             self._person_detector = None
 
-        # Clear cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Force garbage collection to release memory
+        gc.collect()
+
+        # Clear GPU cache with retry logic (synchronize BEFORE empty_cache)
+        for attempt in range(3):
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()  # Wait for operations to finish first
+                    torch.cuda.empty_cache()  # Then clear cache
+                elif torch.backends.mps.is_available():
+                    if _has_mps_module():
+                        try:
+                            torch.mps.synchronize()
+                            torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                    # Else: PyTorch < 2.1, skip MPS cache cleanup
+                break
+            except Exception as e:
+                if attempt == 2:
+                    logger.warning(f"Failed to clear GPU cache after {attempt + 1} attempts: {e}")
+                else:
+                    import time
+                    time.sleep(0.1)
 
         logger.info("Models unloaded from memory")
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            self.unload_model()
+        except Exception:
+            pass  # Suppress errors during cleanup
 
 
 # Alias for backward compatibility

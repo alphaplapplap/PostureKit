@@ -2,6 +2,15 @@
 
 When things break (and they will), start here.
 
+## ⚡ Quick Health Check
+
+**Run this first** if the app won't launch:
+```bash
+./check_postgres.sh
+```
+
+This checks PostgreSQL status, database connectivity, and data integrity.
+
 ## Quick Debug Commands
 
 ```python
@@ -18,6 +27,40 @@ quick_test(bridge)
 ```
 
 ## Common Issues
+
+### 0. "Connection refused" / PostgreSQL Not Running ⭐ MOST COMMON
+
+**Error:**
+```
+psycopg2.OperationalError: connection to server at "localhost" (::1), port 5432 failed: Connection refused
+Is the server running on that host and accepting TCP/IP connections?
+```
+
+**Cause:** PostgreSQL service is not running (system reboot, manual stop, or crash).
+
+**Fix:**
+```bash
+# Quick fix
+brew services start postgresql@16
+
+# Verify it worked
+./check_postgres.sh
+
+# Should show:
+# ✅ PostgreSQL running
+# ✅ Database 'posturekit_irl' exists
+# ✅ 50530 images, 50530 poses indexed
+```
+
+**Prevention:** PostgreSQL is now configured for auto-start on boot. If it stops:
+```bash
+# Re-enable auto-start
+brew services restart postgresql@16
+```
+
+**See also:** `POSTGRES_STATUS.md` for detailed recovery procedures.
+
+---
 
 ### 1. "Unknown model 'X'" Error
 

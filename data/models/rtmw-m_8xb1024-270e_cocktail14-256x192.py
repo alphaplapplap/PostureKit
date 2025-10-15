@@ -109,7 +109,6 @@ model = dict(
             use_target_weight=True,
             beta=1.,
             label_softmax=True,
-            label_beta=10.,
             mask=list(range(23, 91)),
             mask_weight=0.5,
         ),

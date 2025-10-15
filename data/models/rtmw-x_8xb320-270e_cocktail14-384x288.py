@@ -51,8 +51,7 @@ codec = dict(
     sigma=(6., 6.93),
     simcc_split_ratio=2.0,
     normalize=False,
-    use_dark=False,
-    decode_visibility=True)
+    use_dark=False)
 
 # model settings
 model = dict(
@@ -111,9 +110,6 @@ model = dict(
             use_target_weight=True,
             beta=1.,
             label_softmax=True,
-            label_beta=10.,
-            mask=list(range(23, 91)),
-            mask_weight=0.5,
         ),
         decoder=codec),
     test_cfg=dict(flip_test=True))

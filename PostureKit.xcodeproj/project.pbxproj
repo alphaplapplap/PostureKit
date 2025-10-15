@@ -1,0 +1,602 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		4B54B2162E9836CD0026D1B6 /* PythonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 4B54B2152E9836CD0026D1B6 /* PythonKit */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		4B54B1EE2E9824300026D1B6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4B54B1D82E98242E0026D1B6 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4B54B1DF2E98242E0026D1B6;
+			remoteInfo = PostureKit;
+		};
+		4B54B1F82E9824300026D1B6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4B54B1D82E98242E0026D1B6 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4B54B1DF2E98242E0026D1B6;
+			remoteInfo = PostureKit;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		4B54B1E02E98242E0026D1B6 /* PostureKit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PostureKit.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4B54B1ED2E9824300026D1B6 /* PostureKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PostureKitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		4B54B1F72E9824300026D1B6 /* PostureKitUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PostureKitUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		4B54B1E22E98242E0026D1B6 /* PostureKit */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = PostureKit;
+			sourceTree = "<group>";
+		};
+		4B54B1F02E9824300026D1B6 /* PostureKitTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = PostureKitTests;
+			sourceTree = "<group>";
+		};
+		4B54B1FA2E9824300026D1B6 /* PostureKitUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = PostureKitUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		4B54B1DD2E98242E0026D1B6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4B54B2162E9836CD0026D1B6 /* PythonKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B54B1EA2E9824300026D1B6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B54B1F42E9824300026D1B6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		4B54B1D72E98242E0026D1B6 = {
+			isa = PBXGroup;
+			children = (
+				4B54B1E22E98242E0026D1B6 /* PostureKit */,
+				4B54B1F02E9824300026D1B6 /* PostureKitTests */,
+				4B54B1FA2E9824300026D1B6 /* PostureKitUITests */,
+				4B54B1E12E98242E0026D1B6 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		4B54B1E12E98242E0026D1B6 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4B54B1E02E98242E0026D1B6 /* PostureKit.app */,
+				4B54B1ED2E9824300026D1B6 /* PostureKitTests.xctest */,
+				4B54B1F72E9824300026D1B6 /* PostureKitUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		4B54B1DF2E98242E0026D1B6 /* PostureKit */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4B54B2012E9824300026D1B6 /* Build configuration list for PBXNativeTarget "PostureKit" */;
+			buildPhases = (
+				4B54B1DC2E98242E0026D1B6 /* Sources */,
+				4B54B1DD2E98242E0026D1B6 /* Frameworks */,
+				4B54B1DE2E98242E0026D1B6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				4B54B1E22E98242E0026D1B6 /* PostureKit */,
+			);
+			name = PostureKit;
+			packageProductDependencies = (
+				4B54B2152E9836CD0026D1B6 /* PythonKit */,
+			);
+			productName = PostureKit;
+			productReference = 4B54B1E02E98242E0026D1B6 /* PostureKit.app */;
+			productType = "com.apple.product-type.application";
+		};
+		4B54B1EC2E9824300026D1B6 /* PostureKitTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4B54B2042E9824300026D1B6 /* Build configuration list for PBXNativeTarget "PostureKitTests" */;
+			buildPhases = (
+				4B54B1E92E9824300026D1B6 /* Sources */,
+				4B54B1EA2E9824300026D1B6 /* Frameworks */,
+				4B54B1EB2E9824300026D1B6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				4B54B1EF2E9824300026D1B6 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				4B54B1F02E9824300026D1B6 /* PostureKitTests */,
+			);
+			name = PostureKitTests;
+			packageProductDependencies = (
+			);
+			productName = PostureKitTests;
+			productReference = 4B54B1ED2E9824300026D1B6 /* PostureKitTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		4B54B1F62E9824300026D1B6 /* PostureKitUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4B54B2072E9824300026D1B6 /* Build configuration list for PBXNativeTarget "PostureKitUITests" */;
+			buildPhases = (
+				4B54B1F32E9824300026D1B6 /* Sources */,
+				4B54B1F42E9824300026D1B6 /* Frameworks */,
+				4B54B1F52E9824300026D1B6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				4B54B1F92E9824300026D1B6 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				4B54B1FA2E9824300026D1B6 /* PostureKitUITests */,
+			);
+			name = PostureKitUITests;
+			packageProductDependencies = (
+			);
+			productName = PostureKitUITests;
+			productReference = 4B54B1F72E9824300026D1B6 /* PostureKitUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		4B54B1D82E98242E0026D1B6 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					4B54B1DF2E98242E0026D1B6 = {
+						CreatedOnToolsVersion = 26.0.1;
+					};
+					4B54B1EC2E9824300026D1B6 = {
+						CreatedOnToolsVersion = 26.0.1;
+						TestTargetID = 4B54B1DF2E98242E0026D1B6;
+					};
+					4B54B1F62E9824300026D1B6 = {
+						CreatedOnToolsVersion = 26.0.1;
+						TestTargetID = 4B54B1DF2E98242E0026D1B6;
+					};
+				};
+			};
+			buildConfigurationList = 4B54B1DB2E98242E0026D1B6 /* Build configuration list for PBXProject "PostureKit" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 4B54B1D72E98242E0026D1B6;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				4B54B2142E9836CD0026D1B6 /* XCRemoteSwiftPackageReference "PythonKit" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 4B54B1E12E98242E0026D1B6 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				4B54B1DF2E98242E0026D1B6 /* PostureKit */,
+				4B54B1EC2E9824300026D1B6 /* PostureKitTests */,
+				4B54B1F62E9824300026D1B6 /* PostureKitUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		4B54B1DE2E98242E0026D1B6 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B54B1EB2E9824300026D1B6 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B54B1F52E9824300026D1B6 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		4B54B1DC2E98242E0026D1B6 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B54B1E92E9824300026D1B6 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B54B1F32E9824300026D1B6 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		4B54B1EF2E9824300026D1B6 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4B54B1DF2E98242E0026D1B6 /* PostureKit */;
+			targetProxy = 4B54B1EE2E9824300026D1B6 /* PBXContainerItemProxy */;
+		};
+		4B54B1F92E9824300026D1B6 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4B54B1DF2E98242E0026D1B6 /* PostureKit */;
+			targetProxy = 4B54B1F82E9824300026D1B6 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		4B54B1FF2E9824300026D1B6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		4B54B2002E9824300026D1B6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		4B54B2022E9824300026D1B6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.PopsicleBook.posesort-ai.PostureKit";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				REGISTER_APP_GROUPS = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		4B54B2032E9824300026D1B6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.PopsicleBook.posesort-ai.PostureKit";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				REGISTER_APP_GROUPS = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		4B54B2052E9824300026D1B6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.PopsicleBook.posesort-ai.PostureKitTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/PostureKit.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/PostureKit";
+			};
+			name = Debug;
+		};
+		4B54B2062E9824300026D1B6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.PopsicleBook.posesort-ai.PostureKitTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/PostureKit.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/PostureKit";
+			};
+			name = Release;
+		};
+		4B54B2082E9824300026D1B6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.PopsicleBook.posesort-ai.PostureKitUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = PostureKit;
+			};
+			name = Debug;
+		};
+		4B54B2092E9824300026D1B6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.PopsicleBook.posesort-ai.PostureKitUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = PostureKit;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4B54B1DB2E98242E0026D1B6 /* Build configuration list for PBXProject "PostureKit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4B54B1FF2E9824300026D1B6 /* Debug */,
+				4B54B2002E9824300026D1B6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4B54B2012E9824300026D1B6 /* Build configuration list for PBXNativeTarget "PostureKit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4B54B2022E9824300026D1B6 /* Debug */,
+				4B54B2032E9824300026D1B6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4B54B2042E9824300026D1B6 /* Build configuration list for PBXNativeTarget "PostureKitTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4B54B2052E9824300026D1B6 /* Debug */,
+				4B54B2062E9824300026D1B6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4B54B2072E9824300026D1B6 /* Build configuration list for PBXNativeTarget "PostureKitUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4B54B2082E9824300026D1B6 /* Debug */,
+				4B54B2092E9824300026D1B6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		4B54B2142E9836CD0026D1B6 /* XCRemoteSwiftPackageReference "PythonKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pvieito/PythonKit.git";
+			requirement = {
+				branch = master;
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		4B54B2152E9836CD0026D1B6 /* PythonKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4B54B2142E9836CD0026D1B6 /* XCRemoteSwiftPackageReference "PythonKit" */;
+			productName = PythonKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 4B54B1D82E98242E0026D1B6 /* Project object */;
+}
