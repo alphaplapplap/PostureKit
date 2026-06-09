@@ -151,9 +151,10 @@ def handle_search(params: Dict[str, Any]) -> Dict[str, Any]:
         min_valid_overlap = params.get('min_valid_overlap', 12)
         required_regions = params.get('required_regions')
         min_region_confidence = params.get('min_region_confidence', 0.3)
+        min_similarity = params.get('min_similarity', 0.0)  # Similarity floor (0-1); 0 = top-k mode
         deduplicate_images = params.get('deduplicate_images', False)  # Default: show all people
 
-        logger.info(f"Searching with k={k}, min_confidence={min_confidence}, deduplicate_images={deduplicate_images}")
+        logger.info(f"Searching with k={k}, min_confidence={min_confidence}, min_similarity={min_similarity}, deduplicate_images={deduplicate_images}")
         logger.info(f"About to call bridge.search_similar()...")
 
         # Perform search
@@ -166,6 +167,7 @@ def handle_search(params: Dict[str, Any]) -> Dict[str, Any]:
             min_valid_overlap=min_valid_overlap,
             required_regions=required_regions,
             min_region_confidence=min_region_confidence,
+            min_similarity=min_similarity,
             deduplicate_images=deduplicate_images
         )
 

@@ -21,12 +21,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 if indexLoaded {
                     print("FAISS index preloaded successfully")
-                    // Post notification so UI can update if needed
-                    NotificationCenter.default.post(name: .indexPreloaded, object: nil)
                 } else {
                     print("No existing FAISS index - will build on first search")
-                    // Index will be built automatically on first search (120s timeout)
                 }
+                // Always post notification so status bar leaves the .loading state.
+                // Empty-index case displays as "Index ready - empty"; index will
+                // build automatically on first search (120s timeout).
+                NotificationCenter.default.post(name: .indexPreloaded, object: nil)
             }
         }
     }
@@ -84,13 +85,13 @@ struct PostureKitApp: App {
         // These are used as fallbacks when keys don't exist yet (first launch)
         // Does NOT overwrite existing user preferences
         UserDefaults.standard.register(defaults: [
-            "useGPU": false,             // Disable MPS by default (PyTorch 2.0.1 MPS slower than CPU)
-            "detectionThreads": 8,       // Use all 8 performance cores on M2 Pro
-            "poseModel": "rtmw-l",       // Default model (fast, good quality)
-            "fusionMethod": "confidence_weighted",  // Best fusion method
-            "useTwoStage": false,        // Single-stage by default (faster)
-            "theme": "auto",             // Follow system appearance
-            "resultsPerPage": 20         // Reasonable pagination
+            "useGPU": true,              // MPS on Apple Silicon (modern PyTorch)
+            "detectionThreads": 16,      // M5 Max: 6 Super + 12 Performance cores
+            "poseModel": "ensemble",     // RTMW-L + RTMW-X for best accuracy
+            "fusionMethod": "confidence_weighted",
+            "useTwoStage": true,         // YOLO → RTMPose for +5–10% accuracy
+            "theme": "auto",
+            "resultsPerPage": 20
         ])
 
         // Set environment variable for Python bridge to read two-stage detection setting

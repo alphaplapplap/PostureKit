@@ -52,7 +52,8 @@ func drawSkeleton(
     keypoints: [[Double]],
     detail: SkeletonDetail,
     alreadyNormalized: Bool = false,
-    isSelected: Bool = true
+    isSelected: Bool = true,
+    originalImageSize: CGSize? = nil  // Original image dimensions for thumbnail offset calculation
 ) {
     // Select connections based on detail level
     let connections: [(Int, Int)]
@@ -68,15 +69,44 @@ func drawSkeleton(
     // Handle coordinate scaling based on input format
     let scaleX: Double
     let scaleY: Double
+    let xOffset: Double
+    let yOffset: Double
 
     if alreadyNormalized {
         // Keypoints already in display coordinates (query image)
         scaleX = 1.0
         scaleY = 1.0
+        xOffset = 0.0
+        yOffset = 0.0
     } else {
-        // Keypoints in 200×200 normalized space (result thumbnails)
-        scaleX = size.width / 200.0
-        scaleY = size.height / 200.0
+        // Keypoints are in ORIGINAL IMAGE coordinates (not 200×200 normalized)
+        // They need to be scaled to fit within the 200×200 thumbnail, then centered, then scaled to display size
+        
+        if let imgSize = originalImageSize {
+            // Step 1: Calculate how the image was scaled to fit within 200×200 (matching loadThumbnail logic)
+            let thumbnailScale = min(200.0 / imgSize.width, 200.0 / imgSize.height)
+            let scaledWidth = imgSize.width * thumbnailScale
+            let scaledHeight = imgSize.height * thumbnailScale
+            
+            // Step 2: Calculate centering offsets within the 200×200 thumbnail space
+            let thumbnailXOffset = (200.0 - scaledWidth) / 2
+            let thumbnailYOffset = (200.0 - scaledHeight) / 2
+            
+            // Step 3: Scale from 200×200 thumbnail space to actual display size
+            let displayScale = size.width / 200.0
+            
+            // Final transform: scale from original image coords to thumbnail coords, then to display coords
+            scaleX = thumbnailScale * displayScale
+            scaleY = thumbnailScale * displayScale
+            xOffset = thumbnailXOffset * displayScale
+            yOffset = thumbnailYOffset * displayScale
+        } else {
+            // Fallback: assume keypoints already in 200×200 space
+            scaleX = size.width / 200.0
+            scaleY = size.height / 200.0
+            xOffset = 0.0
+            yOffset = 0.0
+        }
     }
 
     // Draw skeleton connections (lines)
@@ -91,9 +121,9 @@ func drawSkeleton(
         let endConf = end[2]
         guard startConf > 0.3, endConf > 0.3 else { continue }
 
-        // Scale coordinates
-        let startPoint = CGPoint(x: start[0] * scaleX, y: start[1] * scaleY)
-        let endPoint = CGPoint(x: end[0] * scaleX, y: end[1] * scaleY)
+        // Scale coordinates and apply offset
+        let startPoint = CGPoint(x: start[0] * scaleX + xOffset, y: start[1] * scaleY + yOffset)
+        let endPoint = CGPoint(x: end[0] * scaleX + xOffset, y: end[1] * scaleY + yOffset)
 
         // Color by average confidence and selection state
         let avgConf = (startConf + endConf) / 2.0
@@ -139,7 +169,7 @@ func drawSkeleton(
         let conf = kp[2]
         guard conf > 0.3 else { continue }
 
-        let point = CGPoint(x: kp[0] * scaleX, y: kp[1] * scaleY)
+        let point = CGPoint(x: kp[0] * scaleX + xOffset, y: kp[1] * scaleY + yOffset)
 
         // Color by confidence and selection state
         let dotColor: Color
@@ -245,7 +275,7 @@ struct ContentView: View {
 
                         // Results Grid (shown after search)
                         if !viewModel.searchResults.isEmpty && !viewModel.isSearching {
-                            ResultsGridView(viewModel: viewModel)
+                            ResultsGridView(viewModel: viewModel, availableHeight: geometry.size.height)
                                 .padding(.horizontal, max(24, geometry.size.width * 0.05))
                                 .padding(.bottom, 24)
                         }
@@ -429,12 +459,13 @@ struct DropZoneView: View {
             print("[UI DEBUG] Failed to load NSImage from URL")
             return
         }
-        print("[UI DEBUG] NSImage loaded successfully, size: \(image.size)")
+        let ps = image.pixelSize
+        print("[UI DEBUG] NSImage loaded: size=\(image.size) pixelSize=\(ps)")
 
         // Store image for display
         viewModel.queryImage = image
         viewModel.queryImageName = url.lastPathComponent
-        viewModel.queryImageSize = image.size
+        viewModel.queryImageSize = ps
 
         // Clear previous detection results
         viewModel.poseDetected = false
@@ -738,39 +769,22 @@ struct SearchParametersView: View {
             Text("Search Parameters")
                 .font(.system(size: 14, weight: .semibold))
 
-            // Number of results slider
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Number of results")
-                        .font(.system(size: 13))
-                        .foregroundColor(.gray)
-                    Spacer()
-                    Text("\(viewModel.numberOfResults)")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.blue)
-                        .fontDesign(.monospaced)
-                }
+            // Number-of-results control lives in ResultsGridView's header row (closer to the results themselves).
 
-                Slider(value: $viewModel.numberOfResultsDouble, in: 5...500, step: 5)
-                    .onChange(of: viewModel.numberOfResultsDouble) {
-                        viewModel.numberOfResults = Int(viewModel.numberOfResultsDouble)
-                    }
-            }
-
-            // Min similarity slider
+            // Min similarity slider (floor: show results at or above this value)
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Min similarity")
                         .font(.system(size: 13))
                         .foregroundColor(.gray)
                     Spacer()
-                    Text("\(Int(viewModel.minConfidence * 100))%")
+                    Text("\(Int(viewModel.minSimilarity * 100))%")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.blue)
                         .fontDesign(.monospaced)
                 }
 
-                Slider(value: $viewModel.minConfidence, in: 0...1, step: 0.01)
+                Slider(value: $viewModel.minSimilarity, in: 0...1, step: 0.01)
             }
 
             // Multi-person search control
@@ -1200,13 +1214,238 @@ struct FlowLayout<Content: View>: View {
     }
 }
 
+// MARK: - Result Frame Preference (marquee selection)
+// Each result item reports its frame in the "resultsContent" coordinate space so the
+// marquee drag can hit-test against visible items. Frames are in content (not viewport)
+// coordinates, so they stay valid while the scroll position changes mid-drag.
+private struct ResultFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+// Tracks where the scroll content's origin currently sits relative to the visible
+// viewport (y goes negative as the user scrolls down). Needed to convert the marquee
+// cursor between content and viewport coordinates for edge auto-scroll.
+private struct ResultsContentOriginPreferenceKey: PreferenceKey {
+    static var defaultValue: CGPoint = .zero
+    static func reduce(value: inout CGPoint, nextValue: () -> CGPoint) {
+        value = nextValue()
+    }
+}
+
+// Resolves the AppKit NSScrollView backing the results ScrollView so edge auto-scroll
+// can drive it directly. SwiftUI's ScrollViewProxy.scrollTo is unreliable when called
+// repeatedly from a timer during an active drag; scrolling the clip view is not.
+private struct EnclosingScrollViewFinder: NSViewRepresentable {
+    let onResolve: (NSScrollView) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            if let scrollView = view.enclosingScrollView {
+                onResolve(scrollView)
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            if let scrollView = nsView.enclosingScrollView {
+                onResolve(scrollView)
+            }
+        }
+    }
+}
+
 // MARK: - Results Grid View
 struct ResultsGridView: View {
     @ObservedObject var viewModel: PostureKitViewModel
+    var availableHeight: CGFloat = 800  // Window height, used to bound the scrollable results area
+
+    // Marquee (rubber-band) selection state — all rects/points in "resultsContent" space
+    @State private var resultFrames: [String: CGRect] = [:]
+    @State private var marqueeRect: CGRect? = nil
+    @State private var marqueeBaseSelection: Set<String>? = nil
+    @State private var marqueeStart: CGPoint? = nil
+
+    // Edge auto-scroll state
+    @State private var contentOrigin: CGPoint = .zero
+    @State private var lastCursorViewportPoint: CGPoint? = nil
+    @State private var autoScrollDirection: AutoScrollDirection? = nil
+    @State private var autoScrollTimer: Timer? = nil
+    @State private var resultsScrollView: NSScrollView? = nil
+
+    private enum AutoScrollDirection { case up, down }
+
+    private var scrollAreaHeight: CGFloat {
+        max(400, availableHeight - 300)
+    }
 
     var columns: [GridItem] {
         // Uniform thumbnail sizing with increased spacing for better layout
         [GridItem(.adaptive(minimum: viewModel.thumbnailSize), spacing: 24)]
+    }
+
+    private var marqueeGesture: some Gesture {
+        DragGesture(minimumDistance: 5, coordinateSpace: .named("resultsContent"))
+            .onChanged { value in
+                if marqueeBaseSelection == nil {
+                    // Shift/Cmd-drag adds to the existing selection; plain drag replaces it
+                    let additive = NSEvent.modifierFlags.contains(.shift)
+                        || NSEvent.modifierFlags.contains(.command)
+                    marqueeBaseSelection = additive ? viewModel.selectedResultIds : []
+                    marqueeStart = value.startLocation
+                }
+                lastCursorViewportPoint = CGPoint(
+                    x: value.location.x + contentOrigin.x,
+                    y: value.location.y + contentOrigin.y
+                )
+                updateMarquee(to: value.location)
+                updateAutoScroll()
+            }
+            .onEnded { _ in
+                stopAutoScroll()
+                marqueeRect = nil
+                marqueeBaseSelection = nil
+                marqueeStart = nil
+                lastCursorViewportPoint = nil
+            }
+    }
+
+    private func updateMarquee(to point: CGPoint) {
+        guard let start = marqueeStart else { return }
+        let rect = CGRect(
+            x: min(start.x, point.x),
+            y: min(start.y, point.y),
+            width: abs(point.x - start.x),
+            height: abs(point.y - start.y)
+        )
+        marqueeRect = rect
+        let hits = Set(resultFrames.filter { $0.value.intersects(rect) }.map { $0.key })
+        viewModel.selectedResultIds = hits.union(marqueeBaseSelection ?? [])
+    }
+
+    // MARK: Edge auto-scroll
+
+    private var autoScrollEdgeZone: CGFloat { 36 }
+
+    private func updateAutoScroll() {
+        guard let viewportPoint = lastCursorViewportPoint else { return }
+        let direction: AutoScrollDirection?
+        if viewportPoint.y > scrollAreaHeight - autoScrollEdgeZone {
+            direction = .down
+        } else if viewportPoint.y < autoScrollEdgeZone {
+            direction = .up
+        } else {
+            direction = nil
+        }
+
+        guard direction != autoScrollDirection else { return }
+        autoScrollTimer?.invalidate()
+        autoScrollTimer = nil
+        autoScrollDirection = direction
+        guard direction != nil else { return }
+
+        // Register in .common run loop modes: the default mode's timers don't fire
+        // while AppKit is in its mouse-drag event-tracking mode, which is exactly
+        // when this timer needs to run.
+        let timer = Timer(timeInterval: 0.02, repeats: true) { _ in
+            autoScrollTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autoScrollTimer = timer
+    }
+
+    private func stopAutoScroll() {
+        autoScrollTimer?.invalidate()
+        autoScrollTimer = nil
+        autoScrollDirection = nil
+    }
+
+    // Speed scales with how far past the zone boundary the cursor is — gentle at the
+    // edge of the zone, fastest when dragged well beyond the viewport edge.
+    private func autoScrollStep(for direction: AutoScrollDirection) -> CGFloat {
+        let minStep: CGFloat = 4    // ~200 px/s at zone entry
+        let maxStep: CGFloat = 60   // ~3000 px/s when 100pt past the viewport edge
+        guard let viewportPoint = lastCursorViewportPoint else { return minStep }
+
+        let depth: CGFloat
+        switch direction {
+        case .down:
+            depth = viewportPoint.y - (scrollAreaHeight - autoScrollEdgeZone)
+        case .up:
+            depth = autoScrollEdgeZone - viewportPoint.y
+        }
+        let rampDistance = autoScrollEdgeZone + 100  // keeps accelerating past the edge
+        let normalized = max(0, min(depth, rampDistance)) / rampDistance
+        return minStep + normalized * normalized * (maxStep - minStep)
+    }
+
+    private func autoScrollTick() {
+        guard let direction = autoScrollDirection,
+              let scrollView = resultsScrollView,
+              let documentView = scrollView.documentView else { return }
+
+        let step = autoScrollStep(for: direction)
+        let clipView = scrollView.contentView
+        var origin = clipView.bounds.origin
+        let maxOffset = max(0, documentView.frame.height - clipView.bounds.height)
+
+        switch direction {
+        case .down:
+            origin.y = min(origin.y + step, maxOffset)
+        case .up:
+            origin.y = max(origin.y - step, 0)
+        }
+
+        guard origin != clipView.bounds.origin else { return }  // already at the end
+        clipView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(clipView)
+
+        // The cursor is stationary in the viewport while content scrolls underneath —
+        // recompute its content-space position so the marquee keeps growing. The
+        // contentOrigin preference lags this tick by a layout pass, so derive the
+        // fresh offset directly from the clip view.
+        if let viewportPoint = lastCursorViewportPoint {
+            let contentPoint = CGPoint(
+                x: viewportPoint.x - contentOrigin.x,
+                y: viewportPoint.y + origin.y
+            )
+            updateMarquee(to: contentPoint)
+        }
+    }
+
+    private func resultFrameReader(for id: String) -> some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: ResultFramePreferenceKey.self,
+                value: [id: geo.frame(in: .named("resultsContent"))]
+            )
+        }
+    }
+
+    private var contentOriginReader: some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: ResultsContentOriginPreferenceKey.self,
+                value: geo.frame(in: .named("resultsViewport")).origin
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var marqueeOverlay: some View {
+        if let rect = marqueeRect {
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.15))
+                .overlay(Rectangle().stroke(Color.accentColor.opacity(0.7), lineWidth: 1))
+                .frame(width: rect.width, height: rect.height)
+                .offset(x: rect.minX, y: rect.minY)
+                .allowsHitTesting(false)
+        }
     }
 
     var body: some View {
@@ -1214,7 +1453,7 @@ struct ResultsGridView: View {
             // Results header - make flexible
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("Results (\(viewModel.searchResults.count) found)")
+                    Text("Results (\(viewModel.totalResultCount) found)")
                         .font(.system(size: 14, weight: .semibold))
 
                     if !viewModel.selectedResultIds.isEmpty {
@@ -1242,6 +1481,54 @@ struct ResultsGridView: View {
                     }
                     .pickerStyle(SegmentedPickerStyle())
                     .frame(width: 140)
+
+                    // Page-size dropdown (per-page count; the threshold caps the full set)
+                    Menu {
+                        ForEach([5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000], id: \.self) { count in
+                            Button("\(count)") {
+                                viewModel.numberOfResults = count
+                                viewModel.numberOfResultsDouble = Double(count)
+                                viewModel.showAllResults = false
+                            }
+                        }
+                        Divider()
+                        Button("All") {
+                            viewModel.showAllResults = true
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Show:")
+                                .foregroundColor(.gray)
+                            Text(viewModel.showAllResults ? "All" : "\(viewModel.numberOfResults)")
+                                .fontWeight(.semibold)
+                        }
+                        .font(.system(size: 12))
+                    }
+                    .menuStyle(BorderlessButtonMenuStyle())
+                    .fixedSize()
+
+                    // Pagination controls — page through the result set (Swift-side, no re-search)
+                    if !viewModel.showAllResults && viewModel.totalPages > 1 {
+                        HStack(spacing: 6) {
+                            Button(action: { viewModel.goToPreviousPage() }) {
+                                Image(systemName: "chevron.left")
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            .disabled(viewModel.currentPage <= 1)
+
+                            Text("Page \(viewModel.currentPage) of \(viewModel.totalPages)")
+                                .foregroundColor(.gray)
+                                .monospacedDigit()
+
+                            Button(action: { viewModel.goToNextPage() }) {
+                                Image(systemName: "chevron.right")
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            .disabled(viewModel.currentPage >= viewModel.totalPages)
+                        }
+                        .font(.system(size: 12))
+                        .fixedSize()
+                    }
 
                     // Thumbnail size slider
                     HStack(spacing: 6) {
@@ -1271,39 +1558,74 @@ struct ResultsGridView: View {
                     }
                 }
             }
+            .padding(.horizontal, 24)
 
-            if viewModel.viewMode == .grid {
-                LazyVGrid(columns: columns, spacing: 24) {
-                    ForEach(Array(viewModel.searchResults.enumerated()), id: \.element.id) { index, result in
-                        ResultCardView(
-                            result: result,
-                            index: index,
-                            viewModel: viewModel
-                        )
+            // Dedicated, height-bounded scroll area for the results so they scroll with a real
+            // scrollbar (and don't force the whole page to scroll). Both grid and list share it,
+            // so list mode no longer collapses a nested scroll view inside the page scroll.
+            // The box's horizontal padding lives INSIDE the scroll content so a marquee drag
+            // can start from the box's left/right gutters; the content also fills the full
+            // viewport height so drags can start below the last row.
+            ScrollView {
+                resultsContent
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24)
+                    .frame(maxWidth: .infinity, minHeight: scrollAreaHeight, alignment: .topLeading)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        // Click on empty space (gutters, gaps, below the grid) clears the selection
+                        viewModel.clearSelection()
                     }
-                }
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(Array(viewModel.searchResults.enumerated()), id: \.element.id) { index, result in
-                            ResultListItemView(
-                                result: result,
-                                index: index,
-                                viewModel: viewModel
-                            )
-                        }
-                    }
-                }
+                    .simultaneousGesture(marqueeGesture)
+                    .coordinateSpace(name: "resultsContent")
+                    .background(contentOriginReader)
+                    .background(EnclosingScrollViewFinder { resultsScrollView = $0 })
+                    // Overlay (not a layout child): the marquee draws on top without
+                    // affecting layout, so dragging past the box edges can't stretch
+                    // the content horizontally or add phantom scroll space vertically.
+                    .overlay(marqueeOverlay, alignment: .topLeading)
             }
+            .coordinateSpace(name: "resultsViewport")
+            .onPreferenceChange(ResultFramePreferenceKey.self) { resultFrames = $0 }
+            .onPreferenceChange(ResultsContentOriginPreferenceKey.self) { contentOrigin = $0 }
+            .onDisappear { stopAutoScroll() }
+            .frame(height: scrollAreaHeight)
         }
         .frame(maxWidth: .infinity)
-        .padding(24)
+        .padding(.top, 24)
         .background(Color(NSColor.windowBackgroundColor))
         .cornerRadius(12)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.gray.opacity(0.2), lineWidth: 1)
         )
+    }
+
+    @ViewBuilder
+    private var resultsContent: some View {
+        if viewModel.viewMode == .grid {
+            LazyVGrid(columns: columns, spacing: 24) {
+                ForEach(Array(viewModel.searchResults.enumerated()), id: \.element.id) { index, result in
+                    ResultCardView(
+                        result: result,
+                        index: index,
+                        viewModel: viewModel
+                    )
+                    .background(resultFrameReader(for: result.id))
+                }
+            }
+        } else {
+            LazyVStack(spacing: 1) {
+                ForEach(Array(viewModel.searchResults.enumerated()), id: \.element.id) { index, result in
+                    ResultListItemView(
+                        result: result,
+                        index: index,
+                        viewModel: viewModel
+                    )
+                    .background(resultFrameReader(for: result.id))
+                }
+            }
+        }
     }
 
     private func moveSelectedFiles() {
@@ -1317,10 +1639,106 @@ struct ResultsGridView: View {
         if panel.runModal() == .OK, let url = panel.url {
             let result = viewModel.moveSelectedFiles(to: url.path)
 
-            // Show alert with results
+            var details = "Successfully moved \(result.success) file(s)."
+            if result.skipped > 0 {
+                details += "\nSkipped \(result.skipped) file(s) already in that folder."
+            }
+            if result.failed > 0 {
+                details += "\nFailed to move \(result.failed) file(s)."
+            }
+
             let alert = NSAlert()
             alert.messageText = "Files Moved"
-            alert.informativeText = "Successfully moved \(result.success) file(s).\(result.failed > 0 ? "\nFailed to move \(result.failed) file(s)." : "")"
+            alert.informativeText = details
+            alert.alertStyle = result.failed > 0 ? .warning : .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+}
+
+// MARK: - Result Context Menu (selection-aware right-click actions)
+// Acts on the full selection when the right-clicked item is part of it (Finder-style);
+// otherwise acts on just the clicked item.
+struct ResultContextMenu: View {
+    let result: SearchResult
+    @ObservedObject var viewModel: PostureKitViewModel
+
+    private var targets: [SearchResult] {
+        if viewModel.selectedResultIds.contains(result.id) && viewModel.selectedResultIds.count > 1 {
+            return viewModel.searchResults.filter { viewModel.selectedResultIds.contains($0.id) }
+        }
+        return [result]
+    }
+
+    var body: some View {
+        let items = targets
+        let count = items.count
+
+        Button(count > 1 ? "Open \(count) Items" : "Open") {
+            for path in items.compactMap(\.imagePath) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            }
+        }
+        Button(count > 1 ? "Reveal \(count) Items in Finder" : "Reveal in Finder") {
+            let urls = items.compactMap(\.imagePath).map { URL(fileURLWithPath: $0) }
+            if !urls.isEmpty {
+                NSWorkspace.shared.activateFileViewerSelecting(urls)
+            }
+        }
+        Button(count > 1 ? "Copy \(count) Paths" : "Copy Path") {
+            let paths = items.compactMap(\.imagePath)
+            if !paths.isEmpty {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(paths.joined(separator: "\n"), forType: .string)
+            }
+        }
+
+        Divider()
+
+        Button(count > 1 ? "Move \(count) Items to..." : "Move to...") {
+            moveItems(items)
+        }
+
+        Divider()
+
+        Button("Select All") {
+            viewModel.selectAll()
+        }
+        if !viewModel.selectedResultIds.isEmpty {
+            Button("Deselect All") {
+                viewModel.clearSelection()
+            }
+        }
+    }
+
+    private func moveItems(_ items: [SearchResult]) {
+        // moveSelectedFiles operates on the view model's selection — sync it to the
+        // right-clicked targets first (right-click implies selection, as in Finder).
+        viewModel.selectedResultIds = Set(items.map { $0.id })
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Move"
+        panel.message = "Select destination directory for selected files"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let result = viewModel.moveSelectedFiles(to: url.path)
+
+            var details = "Successfully moved \(result.success) file(s)."
+            if result.skipped > 0 {
+                details += "\nSkipped \(result.skipped) file(s) already in that folder."
+            }
+            if result.failed > 0 {
+                details += "\nFailed to move \(result.failed) file(s)."
+            }
+
+            let alert = NSAlert()
+            alert.messageText = "Files Moved"
+            alert.informativeText = details
             alert.alertStyle = result.failed > 0 ? .warning : .informational
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -1366,11 +1784,22 @@ struct ResultCardView: View {
             // Skeleton overlay
             if let keypoints = result.keypoints, !keypoints.isEmpty {
                 Canvas { context, size in
+                    // Calculate original image size for proper skeleton overlay positioning
+                    let originalSize: CGSize?
+                    if let width = result.imageWidth, let height = result.imageHeight {
+                        originalSize = CGSize(width: CGFloat(width), height: CGFloat(height))
+                    } else {
+                        originalSize = nil
+                    }
+                    
                     drawSkeleton(
                         context: context,
                         size: size,
                         keypoints: keypoints,
-                        detail: matchTier.skeletonDetail
+                        detail: matchTier.skeletonDetail,
+                        alreadyNormalized: false,
+                        isSelected: true,
+                        originalImageSize: originalSize
                     )
                 }
             }
@@ -1561,22 +1990,7 @@ struct ResultCardView: View {
             viewModel.toggleSelection(result.id, at: index, withCommandKey: false, withShiftKey: false)
         }
         .contextMenu {
-            if !viewModel.selectedResultIds.isEmpty {
-                Button("Move Selected to...") {
-                    moveSelectedFiles()
-                }
-                Divider()
-            }
-            Button("Open in Finder") {
-                openInFinder()
-            }
-            Button("Copy Path") {
-                copyPath()
-            }
-            Divider()
-            Button("Reveal in Finder") {
-                revealInFinder()
-            }
+            ResultContextMenu(result: result, viewModel: viewModel)
         }
         .onAppear {
             loadThumbnail()
@@ -1646,43 +2060,6 @@ struct ResultCardView: View {
         }
     }
 
-    private func openInFinder() {
-        guard let imagePath = result.imagePath else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: imagePath))
-    }
-
-    private func copyPath() {
-        guard let imagePath = result.imagePath else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(imagePath, forType: .string)
-    }
-
-    private func revealInFinder() {
-        guard let imagePath = result.imagePath else { return }
-        NSWorkspace.shared.selectFile(imagePath, inFileViewerRootedAtPath: "")
-    }
-
-    private func moveSelectedFiles() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Move"
-        panel.message = "Select destination directory for selected files"
-
-        if panel.runModal() == .OK, let url = panel.url {
-            let result = viewModel.moveSelectedFiles(to: url.path)
-
-            // Show alert with results
-            let alert = NSAlert()
-            alert.messageText = "Files Moved"
-            alert.informativeText = "Successfully moved \(result.success) file(s).\(result.failed > 0 ? "\nFailed to move \(result.failed) file(s)." : "")"
-            alert.alertStyle = result.failed > 0 ? .warning : .informational
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
-    }
 }
 
 // MARK: - Result List Item View
@@ -1811,22 +2188,7 @@ struct ResultListItemView: View {
             viewModel.toggleSelection(result.id, at: index, withCommandKey: false, withShiftKey: false)
         }
         .contextMenu {
-            if !viewModel.selectedResultIds.isEmpty {
-                Button("Move Selected to...") {
-                    moveSelectedFiles()
-                }
-                Divider()
-            }
-            Button("Open in Finder") {
-                openInFinder()
-            }
-            Button("Copy Path") {
-                copyPath()
-            }
-            Divider()
-            Button("Reveal in Finder") {
-                revealInFinder()
-            }
+            ResultContextMenu(result: result, viewModel: viewModel)
         }
         .onAppear {
             loadThumbnail()
@@ -1890,42 +2252,6 @@ struct ResultListItemView: View {
         return String(format: "%.1f MB", mb)
     }
 
-    private func openInFinder() {
-        guard let imagePath = result.imagePath else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: imagePath))
-    }
-
-    private func copyPath() {
-        guard let imagePath = result.imagePath else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(imagePath, forType: .string)
-    }
-
-    private func revealInFinder() {
-        guard let imagePath = result.imagePath else { return }
-        NSWorkspace.shared.selectFile(imagePath, inFileViewerRootedAtPath: "")
-    }
-
-    private func moveSelectedFiles() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Move"
-        panel.message = "Select destination directory for selected files"
-
-        if panel.runModal() == .OK, let url = panel.url {
-            let result = viewModel.moveSelectedFiles(to: url.path)
-
-            let alert = NSAlert()
-            alert.messageText = "Files Moved"
-            alert.informativeText = "Successfully moved \(result.success) file(s).\(result.failed > 0 ? "\nFailed to move \(result.failed) file(s)." : "")"
-            alert.alertStyle = result.failed > 0 ? .warning : .informational
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
-    }
 }
 
 // MARK: - Searching Overlay View

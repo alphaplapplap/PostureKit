@@ -1,6 +1,24 @@
 import SwiftUI
 import Combine
 
+extension NSImage {
+    // True pixel dimensions of the bitmap that Python will see.
+    // `.size` reports points (DPI-scaled); `.representations.first.pixelsWide` can
+    // also report points for some metadata configurations. Materializing through
+    // `tiffRepresentation` + `NSBitmapImageRep` is the same path `saveImageToTemp`
+    // uses to encode the PNG for Python, so the numbers always agree.
+    var pixelSize: CGSize {
+        if let tiff = self.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff) {
+            return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
+        }
+        if let rep = representations.first {
+            return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
+        }
+        return size
+    }
+}
+
 // MARK: - View Model
 class PostureKitViewModel: ObservableObject {
     private let pythonBridge = PythonBridgeSubprocess.shared
@@ -24,9 +42,17 @@ class PostureKitViewModel: ObservableObject {
     var extractedFeatures: GeometricFeatures?
 
     // Search Parameters
-    @Published var numberOfResults: Int = 20
+    @Published var numberOfResults: Int = 20  // Page size for the results grid (NOT a result cap)
     @Published var numberOfResultsDouble: Double = 20.0
-    @Published var minConfidence: Double = 0.5
+    @Published var showAllResults: Bool = false  // When true, show the entire result set on one page (no paging)
+
+    // Pagination over the cached result set (the result SET is bounded by minSimilarity, not these)
+    @Published var currentPage: Int = 1        // 1-based index of the displayed page
+    @Published var totalPages: Int = 1         // number of pages at the current page size
+    @Published var totalResultCount: Int = 0   // results at/above the current threshold (for "N–M of T")
+    // Similarity floor — THE result-set cap. Python returns every pose ≥ this; Swift paginates.
+    // Default 0.5 keeps the first search fast/complete; 0.0 means "everything" (full-index scan).
+    @Published var minSimilarity: Double = 0.5
     @Published var includeFlippedPoses: Bool = false
 
     // Body part filtering (18 specific NudeNet classes)
@@ -66,10 +92,10 @@ class PostureKitViewModel: ObservableObject {
 
     // Advanced Search Parameters
     @Published var kMultiplier: Double = 1.0  // DEPRECATED: Python applies intelligent multipliers (3-10×) based on search type
-    @Published var minFeatureConfidence: Double = 0.35  // Per-feature confidence threshold (0.0-1.0)
-    @Published var minValidOverlap: Double = 12.0  // Minimum matching dimensions (0-52)
+    @Published var minFeatureConfidence: Double = 0.0  // Filter rebuild: bare minimum
+    @Published var minValidOverlap: Double = 0.0  // Filter rebuild: bare minimum (0/52)
     @Published var showMultiplePeoplePerImage: Bool = false  // Show all people from multi-person images (default: deduplicate for cleaner results)
-    @Published var minRegionConfidence: Double = 0.3  // Minimum confidence for body part visibility (0.0-1.0)
+    @Published var minRegionConfidence: Double = 0.0  // Filter rebuild: bare minimum
 
     // Search Results
     @Published var searchResults: [SearchResult] = []
@@ -103,11 +129,50 @@ class PostureKitViewModel: ObservableObject {
     private var lastSearchFeatures: [Float]? = nil
     private var searchDebounceTimer: DispatchWorkItem? = nil
 
+    // Monotonic search generation. Bumped for every new search/browse and on cancel; the
+    // result handlers only apply results whose generation is still current, so a cancelled
+    // or superseded search (the Python call cannot be interrupted and runs to completion)
+    // can no longer overwrite the displayed grid. Reassigning searchResults rebuilds the
+    // ForEach and resets scroll position, so discarding stale results also keeps the grid
+    // scrollable. Lock-guarded because it is touched from the main thread and background
+    // threads, and the serial searchQueue is itself blocked during the synchronous Python call.
+    private let searchGenerationLock = NSLock()
+    private var searchGeneration: Int = 0
+
+    // Full result set from the last Python query (already ≥ lastQueriedThreshold, sorted best-first).
+    // Pagination and threshold RAISES re-slice/re-filter this cache on the main thread with no new
+    // Python round-trip; lowering the threshold below it re-queries.
+    private var rawResults: [SearchResult] = []
+    private var lastQueriedThreshold: Double = 0.0
+
     init() {
         // Listen for index preload notification
         NotificationCenter.default.publisher(for: .indexPreloaded)
             .sink { [weak self] _ in
                 self?.handleIndexPreloaded()
+            }
+            .store(in: &cancellables)
+
+        // "Show:" page size / "All" toggle → re-paginate the cached set instantly (NO re-search).
+        // The result SET is fixed by the threshold; these only change how it's chunked for display.
+        Publishers.CombineLatest($numberOfResults, $showAllResults)
+            .dropFirst()
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handlePageSizeChange()
+            }
+            .store(in: &cancellables)
+
+        // Threshold slider → it defines the result set. Raising it re-filters the cache instantly;
+        // lowering it below what we fetched re-queries Python. Debounced so dragging the slider
+        // doesn't fire a query per tick.
+        $minSimilarity
+            .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleThresholdChange()
             }
             .store(in: &cancellables)
     }
@@ -116,6 +181,89 @@ class PostureKitViewModel: ObservableObject {
         print("[VM] Index preloaded, refreshing statistics...")
         indexStatus = .ready
         loadIndexStatistics()
+    }
+
+    /// Slice the cached result set (`rawResults`, filtered to the current threshold) into the
+    /// page the grid displays, and publish page bookkeeping. Pure main-thread work — no Python.
+    func applyResultWindow() {
+        // Raises above the fetched floor are honored by re-filtering the cache here.
+        let floorPercent = Int(minSimilarity * 100)
+        let active = rawResults.filter { $0.similarity >= floorPercent }
+
+        totalResultCount = active.count
+
+        if showAllResults {
+            totalPages = 1
+            currentPage = 1
+            searchResults = active
+            return
+        }
+
+        let pageSize = max(1, numberOfResults)
+        totalPages = max(1, Int(ceil(Double(active.count) / Double(pageSize))))
+        if currentPage > totalPages { currentPage = totalPages }
+        if currentPage < 1 { currentPage = 1 }
+
+        let start = (currentPage - 1) * pageSize
+        let end = min(active.count, start + pageSize)
+        searchResults = (start < end) ? Array(active[start..<end]) : []
+    }
+
+    /// "Show:" page-size or "All" toggle changed: jump to page 1 and re-slice the cache. No re-search.
+    private func handlePageSizeChange() {
+        guard !rawResults.isEmpty else { return }
+        currentPage = 1
+        applyResultWindow()
+    }
+
+    /// Threshold slider changed. Raising it (or staying at/above the fetched floor) just re-filters
+    /// the cache instantly; lowering it below the fetched floor needs a fresh query so the newly
+    /// admitted (lower-similarity) results actually exist locally. No-op until a search has run.
+    private func handleThresholdChange() {
+        // Instant re-filter is only valid when the cache is COMPLETE down to the fetched floor:
+        // that holds only if the last query ran in threshold mode (lastQueriedThreshold > 0) AND
+        // the new floor isn't lower. In no-threshold mode the cache is just a top-N slice (not the
+        // full ≥0 set), so raising the slider must re-query to get the complete above-threshold set.
+        if lastQueriedThreshold > 0 && minSimilarity >= lastQueriedThreshold {
+            guard !rawResults.isEmpty else { return }
+            currentPage = 1
+            applyResultWindow()
+            return
+        }
+        // Lowering below the fetched floor (or leaving no-threshold mode): re-run at the new floor.
+        rerunLastSearch()
+    }
+
+    /// Page navigation (Swift-side; never re-queries Python).
+    func goToNextPage() {
+        guard currentPage < totalPages else { return }
+        currentPage += 1
+        applyResultWindow()
+    }
+
+    func goToPreviousPage() {
+        guard currentPage > 1 else { return }
+        currentPage -= 1
+        applyResultWindow()
+    }
+
+    /// Re-run the most recent search/browse (used when the threshold drops below the fetched set).
+    /// No-op until a search has actually been performed: on image load `extractedFeatures` is
+    /// cleared and auto-detection does not set it, so this only fires after the user has searched.
+    private func rerunLastSearch() {
+        if browseMode {
+            guard !requiredBodyParts.isEmpty else { return }
+            performBrowse()
+        } else {
+            guard let features = extractedFeatures else { return }
+            // Clear the duplicate-search guard so the identical pose re-runs at the new threshold.
+            searchQueue.async { [weak self] in self?.lastSearchFeatures = nil }
+            // executeSearch() calls searchQueue.sync; run it off-main so an in-flight search
+            // can't block the main thread and freeze the UI.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.executeSearch(features: features)
+            }
+        }
     }
 
     func loadIndexStatistics() {
@@ -144,6 +292,11 @@ class PostureKitViewModel: ObservableObject {
         multiPersonDetectionComplete = false
 
         searchResults = []
+        rawResults = []
+        lastQueriedThreshold = 0.0
+        currentPage = 1
+        totalPages = 1
+        totalResultCount = 0
         searchTime = 0.0
         searchStartTime = nil
         searchElapsed = 0.0
@@ -194,8 +347,27 @@ class PostureKitViewModel: ObservableObject {
         searchTimer = nil
     }
 
+    /// Begin a new search generation and return its id. Results tagged with an older id are stale.
+    @discardableResult
+    private func bumpSearchGeneration() -> Int {
+        searchGenerationLock.lock()
+        defer { searchGenerationLock.unlock() }
+        searchGeneration += 1
+        return searchGeneration
+    }
+
+    /// True if `generation` is still the most recent search (i.e. its results should be applied).
+    private func isCurrentSearchGeneration(_ generation: Int) -> Bool {
+        searchGenerationLock.lock()
+        defer { searchGenerationLock.unlock() }
+        return generation == searchGeneration
+    }
+
     func cancelSearch() {
         print("[VM] User cancelled search")
+        // Invalidate any in-flight search so its late results are discarded when the
+        // (uninterruptible) Python call finally returns, instead of overwriting the grid.
+        bumpSearchGeneration()
         pythonBridge.cancelSearch()
 
         // Reset state on main thread
@@ -284,7 +456,7 @@ class PostureKitViewModel: ObservableObject {
 
                 // Store keypoints and image size for skeleton overlay
                 self.detectedKeypoints = poseResult.keypoints
-                self.queryImageSize = image.size
+                self.queryImageSize = image.pixelSize
 
                 print("[VM DEBUG] ✅ UI updated successfully - app should remain running")
                 print("[VM DEBUG] DetectedPose: \(poseResult.confidence), PoseDetected: true")
@@ -350,7 +522,7 @@ class PostureKitViewModel: ObservableObject {
                     self.poseDetected = true
                     self.poseConfidence = firstPerson.confidence
                     self.detectedKeypoints = firstPerson.keypoints
-                    self.queryImageSize = image.size
+                    self.queryImageSize = image.pixelSize
 
                     print("[VM] Auto-selected Person 1/\(detectedPeople.count) (confidence: \(String(format: "%.2f", firstPerson.confidence)))")
                 }
@@ -481,7 +653,7 @@ class PostureKitViewModel: ObservableObject {
                 self.poseDetected = true
                 self.poseConfidence = pose.confidence
                 self.detectedKeypoints = pose.keypoints
-                self.queryImageSize = imageToDetect.size
+                self.queryImageSize = imageToDetect.pixelSize
                 self.isDetecting = false
             }
 
@@ -491,7 +663,11 @@ class PostureKitViewModel: ObservableObject {
     }
 
     private func executeSearch(features: GeometricFeatures, selectedPersonPose: PoseDetectionResult? = nil) {
-        // Check if identical search is already in progress
+        // Check if identical search is already in progress.
+        // NOTE: a `return` inside a searchQueue.sync closure only exits the closure, not
+        // executeSearch — so record the decision in `shouldProceed` and bail out below,
+        // otherwise duplicate searches launch anyway and stack up.
+        var shouldProceed = false
         searchQueue.sync {
             if searchInProgress {
                 print("[SEARCH DEBUG] Search already in progress, skipping duplicate")
@@ -506,7 +682,13 @@ class PostureKitViewModel: ObservableObject {
 
             searchInProgress = true
             lastSearchFeatures = features.featureVector
+            shouldProceed = true
         }
+        guard shouldProceed else { return }
+
+        // Tag this search so late results from a cancelled or superseded search are discarded
+        // instead of overwriting the grid (the Python call cannot be interrupted).
+        let myGeneration = bumpSearchGeneration()
 
         DispatchQueue.main.async { [weak self] in
             self?.isSearching = true
@@ -528,11 +710,14 @@ class PostureKitViewModel: ObservableObject {
             let searchVector = features.featureVector
             let searchConfidence = features.featureConfidence  // Pass confidence for confidence-aware matching
 
-            // Pass numberOfResults directly to Python - Python applies intelligent multipliers:
-            // - 10× for confidence-aware search (needs re-ranking buffer)
-            // - 5× for region filtering (needs candidate buffer)
-            // - 3× for basic search (accounts for deduplication/filtering)
-            let requestCount = self.numberOfResults
+            // The threshold (minSimilarity) — not "Show:" — defines the result SET now: Python
+            // returns EVERY pose at/above it, and Swift paginates that set. "Show:" is only the
+            // page size. Request the whole index so the threshold (not k) bounds the result set;
+            // this keeps the slider monotonic (lower threshold ⇒ more results, always). 0% means
+            // "everything" (heavy but honest); the non-zero default threshold keeps the common
+            // case fast. Capture the threshold so raises can re-filter the cache without re-query.
+            let queryThreshold = self.minSimilarity
+            let requestCount = max(self.totalPosesIndexed, 500)
 
             // Convert requiredBodyParts Set to Array for Python bridge
             // ONLY apply body part filters in Browse Database mode (not in Search by Image mode)
@@ -561,22 +746,25 @@ class PostureKitViewModel: ObservableObject {
             }
 
             print("[SEARCH DEBUG] Search parameters:")
-            print("  - k (requested): \(requestCount) (Python will apply 3-10× multiplier for buffering)")
-            print("  - minConfidence: \(self.minConfidence)")
+            print("  - k (requested): \(requestCount) (threshold bounds the set; k is just a ceiling)")
+            print("  - minSimilarity: \(queryThreshold) (applied in Python — returns ALL at/above it)")
             print("  - minFeatureConfidence: \(self.minFeatureConfidence)")
             print("  - minValidOverlap: \(Int(self.minValidOverlap))")
 
-            // Perform search with the features (already from flipped image if flip was enabled)
+            // Perform search with the features (already from flipped image if flip was enabled).
+            // minConfidence=0.0 passed to Python so pose-detection-confidence doesn't cull candidates.
+            // minSimilarity is applied IN Python: it returns every pose at/above the threshold.
             let results = self.pythonBridge.searchSimilar(
                 featureVector: searchVector,
                 k: requestCount,
-                minConfidence: self.minConfidence,
+                minConfidence: 0.0,
                 featureConfidence: searchConfidence,
                 minFeatureConfidence: self.minFeatureConfidence,
                 minValidOverlap: Int(self.minValidOverlap),
                 requiredRegions: bodyPartsArray,
                 deduplicateImages: !self.showMultiplePeoplePerImage,  // Inverted: true to show multiple = false to deduplicate
-                minRegionConfidence: self.minRegionConfidence
+                minRegionConfidence: self.minRegionConfidence,
+                minSimilarity: queryThreshold
             )
 
             let elapsed = Date().timeIntervalSince(startTime)
@@ -587,6 +775,13 @@ class PostureKitViewModel: ObservableObject {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
+
+                // Discard results if this search was cancelled or superseded by a newer one.
+                // Applying them would overwrite the grid and reset the user's scroll position.
+                guard self.isCurrentSearchGeneration(myGeneration) else {
+                    print("[SEARCH DEBUG] Ignoring \(results.count) results from a cancelled/superseded search")
+                    return
+                }
 
                 print("[SEARCH DEBUG] Received \(results.count) results from Python")
 
@@ -603,44 +798,31 @@ class PostureKitViewModel: ObservableObject {
                     }
                 }
 
-                // Filter by similarity score (this is what the user expects!)
-                let minSimilarityPercent = Int(self.minConfidence * 100)
-                let similarityFiltered = results.filter { result in
-                    result.similarity >= minSimilarityPercent
-                }
-                print("[SEARCH DEBUG] After similarity filter (≥\(minSimilarityPercent)%): \(similarityFiltered.count) results")
-
-                if !results.isEmpty && similarityFiltered.isEmpty {
-                    print("[SEARCH DEBUG] ⚠️  All results filtered out by similarity threshold")
-                    print("      → Try lowering 'Min similarity' slider (currently \(minSimilarityPercent)%)")
-                }
-
-                // Filter out results where image files no longer exist on disk
-                let existingFiles = similarityFiltered.filter { result in
+                // Python already applied the similarity threshold; just drop any whose image
+                // file vanished from disk, then cache the full set for pagination.
+                let existingFiles = results.filter { result in
                     guard let path = result.imagePath else { return false }
                     return FileManager.default.fileExists(atPath: path)
                 }
-                print("[SEARCH DEBUG] After file existence filter: \(existingFiles.count) results")
+                print("[SEARCH DEBUG] \(existingFiles.count) results at/above \(Int(queryThreshold * 100))% (of \(results.count) returned)")
 
-                // Take only the requested number of results
-                let finalResults = Array(existingFiles.prefix(self.numberOfResults))
-                print("[SEARCH DEBUG] Returning \(finalResults.count) results (requested: \(self.numberOfResults))")
-
-                if finalResults.isEmpty && !results.isEmpty {
-                    print("[SEARCH DEBUG] ⚠️  Had \(results.count) raw results but all filtered out")
-                }
-
-                self.searchResults = finalResults
+                // Cache as the paginated set. queryThreshold is the floor Python used, so the
+                // user can RAISE the slider and have applyResultWindow() re-filter instantly;
+                // LOWERING below it re-queries (handleThresholdChange).
+                self.rawResults = existingFiles
+                self.lastQueriedThreshold = queryThreshold
+                self.currentPage = 1
+                self.applyResultWindow()
                 self.searchTime = elapsed
                 self.isSearching = false
                 self.stopSearchTimer()  // Stop elapsed time tracking
 
                 // Update error message for UI display
-                if finalResults.isEmpty && !self.isSearching {
+                if self.searchResults.isEmpty {
                     if results.isEmpty {
-                        self.errorMessage = "No similar poses found. Try adjusting search parameters."
+                        self.errorMessage = "No poses found at/above \(Int(queryThreshold * 100))% similarity. Try lowering the threshold."
                     } else {
-                        self.errorMessage = "Results filtered out. Try lowering similarity threshold."
+                        self.errorMessage = "No matching files on disk."
                     }
                 } else {
                     self.errorMessage = nil
@@ -654,6 +836,9 @@ class PostureKitViewModel: ObservableObject {
             errorMessage = "Select at least one body part to browse"
             return
         }
+
+        // Tag this browse so late results from a cancelled or superseded browse are discarded.
+        let myGeneration = bumpSearchGeneration()
 
         isSearching = true
         errorMessage = nil
@@ -672,10 +857,12 @@ class PostureKitViewModel: ObservableObject {
             print("[BROWSE DEBUG] Active thresholds: \(activeThresholds)")
             print("[BROWSE DEBUG] Required regions: \(self.requiredBodyParts)")
 
+            // Fetch the full set; "Show:" is the page size (applied Swift-side), not a fetch cap.
+            let browseK = max(self.totalPosesIndexed, 500)
             let results = self.pythonBridge.browseByBodyParts(
                 requiredRegions: Array(self.requiredBodyParts),
                 categoryThresholds: activeThresholds,
-                k: self.numberOfResults,
+                k: browseK,
                 sortBy: "confidence"
             )
 
@@ -684,12 +871,23 @@ class PostureKitViewModel: ObservableObject {
             DispatchQueue.main.async {
                 print("[BROWSE DEBUG] Received \(results.count) results in \(elapsed)s")
 
-                self.searchResults = results
+                // Discard if this browse was cancelled or superseded by a newer search/browse.
+                guard self.isCurrentSearchGeneration(myGeneration) else {
+                    print("[BROWSE DEBUG] Ignoring \(results.count) results from a cancelled/superseded browse")
+                    return
+                }
+
+                // Browse has no similarity threshold (sorted by detection confidence), so the
+                // whole returned set is the page-able set.
+                self.rawResults = results
+                self.lastQueriedThreshold = 0.0
+                self.currentPage = 1
+                self.applyResultWindow()
                 self.searchTime = elapsed
                 self.isSearching = false
                 self.stopSearchTimer()
 
-                if results.isEmpty {
+                if self.searchResults.isEmpty {
                     self.errorMessage = "No images found with selected body parts. Try lowering thresholds."
                 } else {
                     self.errorMessage = nil
@@ -819,12 +1017,17 @@ class PostureKitViewModel: ObservableObject {
         return flippedImage
     }
 
-    func moveSelectedFiles(to destinationDirectory: String) -> (success: Int, failed: Int) {
+    func moveSelectedFiles(to destinationDirectory: String) -> (success: Int, failed: Int, skipped: Int) {
         var successCount = 0
         var failedCount = 0
+        var skippedCount = 0
+        var movedIds: Set<String> = []
         let fileManager = FileManager.default
 
         let selectedResults = searchResults.filter { selectedResultIds.contains($0.id) }
+
+        // Normalize destination once so we can compare parent folders reliably.
+        let destFolderURL = URL(fileURLWithPath: destinationDirectory).standardizedFileURL
 
         for result in selectedResults {
             guard let sourcePath = result.imagePath else {
@@ -833,8 +1036,16 @@ class PostureKitViewModel: ObservableObject {
             }
 
             let sourceURL = URL(fileURLWithPath: sourcePath)
+            let sourceFolderURL = sourceURL.deletingLastPathComponent().standardizedFileURL
+
+            // No-op if the file is already in the chosen destination folder.
+            if sourceFolderURL.path == destFolderURL.path {
+                skippedCount += 1
+                continue
+            }
+
             let filename = sourceURL.lastPathComponent
-            let destinationURL = URL(fileURLWithPath: destinationDirectory).appendingPathComponent(filename)
+            let destinationURL = destFolderURL.appendingPathComponent(filename)
 
             do {
                 // Check if destination exists and create unique name if needed
@@ -850,20 +1061,26 @@ class PostureKitViewModel: ObservableObject {
 
                 try fileManager.moveItem(at: sourceURL, to: finalDestinationURL)
                 successCount += 1
+                movedIds.insert(result.id)
             } catch {
                 print("Failed to move \(sourcePath): \(error)")
                 failedCount += 1
             }
         }
 
-        // Clear selection after move
-        if successCount > 0 {
+        // Prune moved results from the grid so they don't reappear for repeat moves,
+        // and clear selection. DB still references old paths but the fileExists filter
+        // on the next search will drop them.
+        if !movedIds.isEmpty {
             DispatchQueue.main.async {
+                // Drop from the cache too, then re-paginate so page counts stay correct.
+                self.rawResults.removeAll { movedIds.contains($0.id) }
+                self.applyResultWindow()
                 self.clearSelection()
             }
         }
 
-        return (successCount, failedCount)
+        return (successCount, failedCount, skippedCount)
     }
 
     // MARK: - Keypoint Normalization Helper

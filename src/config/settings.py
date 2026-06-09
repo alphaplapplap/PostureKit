@@ -180,7 +180,7 @@ class Settings:
     VISUAL_MODEL: str = os.getenv('VISUAL_MODEL', 'mobilenet_v3_small')  # mobilenet_v3_small, disabled
 
     # Layer 4: Search Features
-    SEARCH_FEATURE_MODE: str = os.getenv('SEARCH_FEATURE_MODE', 'fused')  # geometric, fused
+    SEARCH_FEATURE_MODE: str = os.getenv('SEARCH_FEATURE_MODE', 'geometric')  # geometric, fused
 
     # ========================================================================
     # Pose-Based Search Configuration (Appearance-Free)

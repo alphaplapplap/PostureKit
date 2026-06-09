@@ -1,0 +1,15 @@
+---
+alwaysApply: true
+---
+# REQUIRED BEHAVIORS
+- ALWAYS explain changes before implementing
+- NEVER modify files without explicit approval
+- ASK for approach confirmation before coding
+- STOP after each logical change for review
+- PRESERVE existing patterns unless told otherwise
+
+# FORBIDDEN ACTIONS
+- No refactoring without permission
+- No dependency additions without approval
+- No architectural changes
+- No "optimizations" unless requested

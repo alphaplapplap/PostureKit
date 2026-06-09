@@ -27,6 +27,24 @@ class PythonBridgeSubprocess {
         value ? "True" : "False"
     }
 
+    // MARK: - Helper: Extract JSON payload from noisy stdout
+    // Python subprocess stdout may be preceded by arbitrary log lines from
+    // rtmlib, onnxruntime, mmengine, etc. (e.g. "load …onnx with onnxruntime
+    // backend"). All three call sites print JSON as the final line via
+    // `print(json.dumps(...))`, so we find the last line starting with '['
+    // or '{' and return from there. Line-based is more robust than a first-
+    // bracket scan — a log line like "[INFO] starting" would break that.
+    private func extractJSON(from output: String) -> String {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        for line in lines.reversed() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") || trimmed.hasPrefix("{") {
+                return String(line)
+            }
+        }
+        return output
+    }
+
     private init() {
         // Use venv Python to ensure PyTorch and all dependencies are loaded correctly
         self.pythonExecutable = "/Users/linuxbabe/Hardware-Aware/PostureKit/venv/bin/python3"
@@ -41,7 +59,7 @@ class PythonBridgeSubprocess {
     private func getThreadSettings() -> (threads: Int, useGPU: Bool) {
         let threads = UserDefaults.standard.integer(forKey: "detectionThreads")
         let useGPU = UserDefaults.standard.bool(forKey: "useGPU")
-        return (threads > 0 ? threads : 8, useGPU)  // Default to 8 (M2 Pro performance cores)
+        return (threads > 0 ? threads : 16, useGPU)  // Default to 16 (M5 Max: 6 Super + 12 Performance cores)
     }
 
     // MARK: - Database Profile Helper
@@ -277,7 +295,7 @@ class PythonBridgeSubprocess {
         }
 
         // Read detector settings from UserDefaults
-        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "rtmw-l"
+        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
         let fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
         let useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
         let (threads, useGPU) = getThreadSettings()
@@ -322,14 +340,7 @@ class PythonBridgeSubprocess {
         }
         print("[DEBUG] Python output length: \(output.count) chars")
 
-        // Strip mmengine checkpoint loading message
-        var cleanOutput = output
-        if let range = output.range(of: "Loads checkpoint by local backend from path:") {
-            if let newlineRange = output[range.lowerBound...].range(of: "\n") {
-                cleanOutput = String(output[newlineRange.upperBound...])
-            }
-        }
-
+        let cleanOutput = extractJSON(from: output)
         print("[DEBUG] Clean output: \(cleanOutput)")
 
         // Parse JSON array of results
@@ -367,7 +378,7 @@ class PythonBridgeSubprocess {
         }
 
         // Read detector settings from UserDefaults
-        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "rtmw-l"
+        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
         let fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
         let useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
         let (threads, useGPU) = getThreadSettings()
@@ -414,14 +425,7 @@ class PythonBridgeSubprocess {
         }
         print("[DEBUG] Python output length: \(output.count) chars")
 
-        // Strip mmengine checkpoint loading message that corrupts JSON output
-        var cleanOutput = output
-        if let range = output.range(of: "Loads checkpoint by local backend from path:") {
-            if let newlineRange = output[range.lowerBound...].range(of: "\n") {
-                cleanOutput = String(output[newlineRange.upperBound...])
-            }
-        }
-
+        let cleanOutput = extractJSON(from: output)
         print("[DEBUG] Clean output: \(cleanOutput)")
 
         // Parse JSON result
@@ -500,13 +504,7 @@ class PythonBridgeSubprocess {
             return nil
         }
 
-        // Strip mmengine checkpoint loading message that corrupts JSON output
-        var cleanOutput = output
-        if let range = output.range(of: "Loads checkpoint by local backend from path:") {
-            if let newlineRange = output[range.lowerBound...].range(of: "\n") {
-                cleanOutput = String(output[newlineRange.upperBound...])
-            }
-        }
+        let cleanOutput = extractJSON(from: output)
 
         guard let data = cleanOutput.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -530,6 +528,7 @@ class PythonBridgeSubprocess {
         requiredRegions: [String]? = nil,
         deduplicateImages: Bool = false,
         minRegionConfidence: Double = 0.3,
+        minSimilarity: Double = 0.0,
         includeFlippedPoses: Bool = false
     ) -> [SearchResult] {
         // Debug logging
@@ -551,6 +550,7 @@ class PythonBridgeSubprocess {
             "min_valid_overlap": minValidOverlap,
             "deduplicate_images": deduplicateImages,
             "min_region_confidence": minRegionConfidence,
+            "min_similarity": minSimilarity,
             "include_flipped": includeFlippedPoses,
             "config": [
                 "num_threads": threads,
@@ -958,7 +958,7 @@ class PythonBridgeSubprocess {
 
     // MARK: - Directory Indexing
     func startIndexing(
-        directory: String,
+        directories: [String],
         recursive: Bool = true,
         minConfidence: Double = 0.3,
         skipIndexed: Bool = true,
@@ -979,20 +979,205 @@ class PythonBridgeSubprocess {
             // First image pays ~1.8s warmup cost, but subsequent images are extremely fast
             let device = "mps"
 
+            // Serialize directory list as JSON to safely handle paths with special characters
+            let directoriesJSON: String
+            if let data = try? JSONSerialization.data(withJSONObject: directories),
+               let jsonString = String(data: data, encoding: .utf8) {
+                directoriesJSON = jsonString
+            } else {
+                print("[BRIDGE DEBUG] Failed to serialize directories to JSON")
+                return
+            }
+
             let script = """
             import sys
             sys.path.insert(0, '\(self.venvSitePackages)')
             sys.path.insert(0, '\(self.projectPath)')
             from src.swift_bridge import PostureKitBridge
+            from pathlib import Path
             import json
 
-            print('DEBUG: Starting indexing with num_threads=\(threads), device=\\'\(device)\\', delete_missing=\(deleteMissingStr)', file=sys.stderr, flush=True)
+            DIRECTORIES = json.loads('''\(directoriesJSON)''')
+            RECURSIVE = \(recursiveStr)
+            SKIP_INDEXED = \(skipIndexedStr)
+            DELETE_MISSING = \(deleteMissingStr)
+            MIN_CONFIDENCE = \(minConfidence)
+
+            print(f'DEBUG: Starting multi-directory indexing: {len(DIRECTORIES)} directories', file=sys.stderr, flush=True)
+            for i, d in enumerate(DIRECTORIES):
+                print(f'DEBUG:   [{i+1}/{len(DIRECTORIES)}] {d}', file=sys.stderr, flush=True)
+
+            # Pre-scan: count total images across all directories for unified progress denominator
+            IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+            def count_images(directory_path, recursive):
+                p = Path(directory_path)
+                if not p.exists():
+                    return 0
+                if recursive:
+                    files = [f for f in p.rglob('*') if f.suffix.lower() in IMAGE_EXTENSIONS]
+                else:
+                    files = [f for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS]
+                return len([f for f in files if not f.name.startswith('._') and not f.name.startswith('.')])
+
+            grand_total_images = 0
+            for d in DIRECTORIES:
+                count = count_images(d, RECURSIVE)
+                grand_total_images += count
+                print(f'DEBUG: {d} -> {count} images', file=sys.stderr, flush=True)
+            print(f'DEBUG: Grand total images across all directories: {grand_total_images}', file=sys.stderr, flush=True)
+
+            # Emit initial progress so the UI shows the true total immediately
+            initial = {
+                'type': 'progress',
+                'current_file': 'Scanning directories...',
+                'images_processed': 0,
+                'total_images': grand_total_images,
+                'poses_indexed': 0,
+                'failed_images': 0,
+                'skipped_images': 0,
+                'progress': 0.0,
+            }
+            print(f'PROGRESS:{json.dumps(initial)}', flush=True)
+
+            print(f'DEBUG: Initializing bridge with num_threads=\(threads), device=\\'\(device)\\', delete_missing={DELETE_MISSING}', file=sys.stderr, flush=True)
             bridge = PostureKitBridge(num_threads=\(threads), device='\(device)')
-            result = bridge.index_directory('\(directory)', recursive=\(recursiveStr), min_confidence=\(minConfidence), skip_indexed=\(skipIndexedStr), delete_missing=\(deleteMissingStr))
-            print(json.dumps(result))
+
+            # Cumulative stats across directories (used to offset per-directory PROGRESS lines)
+            cum_processed = 0
+            cum_poses = 0
+            cum_failed = 0
+            cum_skipped = 0
+
+            # Stdout interceptor: rewrite PROGRESS: lines to include cumulative offsets
+            # and the unified grand total, so the Swift UI sees one continuous progress stream.
+            class ProgressInterceptor:
+                def __init__(self, real_stdout):
+                    self.real_stdout = real_stdout
+                    self.buffer = ''
+                    self.last_processed = 0
+                    self.last_poses = 0
+                    self.last_failed = 0
+                    self.last_skipped = 0
+
+                def write(self, s):
+                    self.buffer += s
+                    while '\\n' in self.buffer:
+                        line, self.buffer = self.buffer.split('\\n', 1)
+                        self._handle_line(line)
+                    return len(s)
+
+                def _handle_line(self, line):
+                    if line.startswith('PROGRESS:'):
+                        try:
+                            data = json.loads(line[len('PROGRESS:'):])
+                            self.last_processed = data.get('images_processed', 0)
+                            self.last_poses = data.get('poses_indexed', 0)
+                            self.last_failed = data.get('failed_images', 0)
+                            self.last_skipped = data.get('skipped_images', 0)
+                            total_processed = cum_processed + self.last_processed
+                            combined = {
+                                'type': 'progress',
+                                'current_file': data.get('current_file', ''),
+                                'images_processed': total_processed,
+                                'total_images': grand_total_images if grand_total_images > 0 else data.get('total_images', 0),
+                                'poses_indexed': cum_poses + self.last_poses,
+                                'failed_images': cum_failed + self.last_failed,
+                                'skipped_images': cum_skipped + self.last_skipped,
+                                'progress': (total_processed / grand_total_images) if grand_total_images > 0 else data.get('progress', 0),
+                            }
+                            self.real_stdout.write(f'PROGRESS:{json.dumps(combined)}\\n')
+                            self.real_stdout.flush()
+                        except Exception as e:
+                            self.real_stdout.write(line + '\\n')
+                            self.real_stdout.flush()
+                    else:
+                        self.real_stdout.write(line + '\\n')
+                        self.real_stdout.flush()
+
+                def flush(self):
+                    if self.buffer:
+                        # Retain tail — no newline yet
+                        pass
+                    self.real_stdout.flush()
+
+            real_stdout = sys.stdout
+            aggregated = {
+                'total_images': grand_total_images,
+                'processed_images': 0,
+                'poses_indexed': 0,
+                'failed_images': 0,
+                'skipped_images': 0,
+                'failed_index_additions': 0,
+                'deleted_images': 0,
+                'deleted_poses': 0,
+                'deleted_from_index': 0,
+                'success': True,
+                'directories': DIRECTORIES,
+                'per_directory_results': [],
+            }
+
+            # delete_missing should only run once, before the first directory
+            first_dir = True
+            for d in DIRECTORIES:
+                print(f'DEBUG: === Indexing directory: {d} ===', file=sys.stderr, flush=True)
+                interceptor = ProgressInterceptor(real_stdout)
+                sys.stdout = interceptor
+                try:
+                    result = bridge.index_directory(
+                        d,
+                        recursive=RECURSIVE,
+                        min_confidence=MIN_CONFIDENCE,
+                        skip_indexed=SKIP_INDEXED,
+                        delete_missing=DELETE_MISSING if first_dir else False,
+                    )
+                finally:
+                    sys.stdout = real_stdout
+                first_dir = False
+
+                if not result.get('success', False):
+                    err_msg = result.get('error', 'unknown')
+                    print(f'DEBUG: Directory {d} failed: {err_msg}', file=sys.stderr, flush=True)
+                    aggregated['success'] = False
+
+                # Use authoritative counts from the return value
+                cum_processed += result.get('processed_images', interceptor.last_processed)
+                cum_poses += result.get('poses_indexed', interceptor.last_poses)
+                cum_failed += result.get('failed_images', interceptor.last_failed)
+                cum_skipped += result.get('skipped_images', interceptor.last_skipped)
+
+                aggregated['processed_images'] = cum_processed
+                aggregated['poses_indexed'] = cum_poses
+                aggregated['failed_images'] = cum_failed
+                aggregated['skipped_images'] = cum_skipped
+                aggregated['failed_index_additions'] += result.get('failed_index_additions', 0)
+                aggregated['deleted_images'] += result.get('deleted_images', 0)
+                aggregated['deleted_poses'] += result.get('deleted_poses', 0)
+                aggregated['deleted_from_index'] += result.get('deleted_from_index', 0)
+                aggregated['per_directory_results'].append({
+                    'directory': d,
+                    'processed_images': result.get('processed_images', 0),
+                    'poses_indexed': result.get('poses_indexed', 0),
+                    'failed_images': result.get('failed_images', 0),
+                    'skipped_images': result.get('skipped_images', 0),
+                })
+
+            # Emit a final 100% progress tick so the UI completes cleanly
+            final_progress = {
+                'type': 'progress',
+                'current_file': 'Complete',
+                'images_processed': cum_processed,
+                'total_images': grand_total_images if grand_total_images > 0 else cum_processed,
+                'poses_indexed': cum_poses,
+                'failed_images': cum_failed,
+                'skipped_images': cum_skipped,
+                'progress': 1.0,
+            }
+            print(f'PROGRESS:{json.dumps(final_progress)}', flush=True)
+
+            print(json.dumps(aggregated))
             """
 
-            print("[BRIDGE DEBUG] About to execute Python script with streaming progress")
+            print("[BRIDGE DEBUG] About to execute Python script with streaming progress for \(directories.count) director\(directories.count == 1 ? "y" : "ies")")
 
             self.runPythonScriptWithProgress(script, progressCallback: progressCallback)
         }

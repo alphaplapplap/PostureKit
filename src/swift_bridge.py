@@ -344,8 +344,8 @@ class PostureKitBridge:
                             if TWO_STAGE_AVAILABLE:
                                 self.detector = TwoStageDetector(
                                     pose_detector=self.pose_detector,
-                                    person_model="yolov8n.pt",  # Nano model (6MB, fast)
-                                    min_person_conf=0.15,  # Lowered from 0.3 to catch more people
+                                    person_model="yolov8x.pt",
+                                    min_person_conf=0.05,
                                     crop_padding=0.1,
                                 )
                                 logger.info(f"Two-stage detection enabled: {spec['name'].upper()}")
@@ -690,6 +690,7 @@ class PostureKitBridge:
                       min_valid_overlap: int = 12,
                       required_regions: Optional[List[str]] = None,
                       min_region_confidence: float = 0.3,
+                      min_similarity: float = 0.0,
                       deduplicate_images: bool = True,
                       query_keypoints: Optional[List[float]] = None,
                       query_bbox: Optional[List[float]] = None,
@@ -749,6 +750,7 @@ class PostureKitBridge:
                 'deduplicate_images': deduplicate_images,
                 'required_regions': required_regions,
                 'min_region_confidence': min_region_confidence,
+                'min_similarity': min_similarity,
                 'query_keypoints': query_kp_array,
                 'query_bbox': query_bbox_array
             }
@@ -770,8 +772,18 @@ class PostureKitBridge:
                     **search_kwargs
                 )
 
-            # Convert to Swift-friendly format
+            # Convert to Swift-friendly format.
+            #
+            # The base64 thumbnail (~17 KB), keypoints (399 floats) and detailed regions are by
+            # far the heaviest per-result fields, and the response scales with result count. A low
+            # similarity threshold can return tens of thousands of results — at full fidelity that
+            # is a ~0.5 GB single-line JSON blob, which overruns the Swift stdin/stdout reader and
+            # comes back as ZERO results. Past a cap we omit those fields; Swift then loads each
+            # visible cell's thumbnail from disk (it already falls back to that) and simply skips
+            # the skeleton overlay / detailed-region breakdown for very large sets.
             import base64
+            HEAVY_PAYLOAD_CAP = 1000
+            include_heavy = len(results) <= HEAVY_PAYLOAD_CAP
             swift_results = []
             for result in results:
                 result_dict = {
@@ -799,10 +811,8 @@ class PostureKitBridge:
                     'image_height': result.get('image_height'),
                     'file_size': result.get('file_size'),
 
-                    # Pose data
-                    'keypoints': result.get('keypoints', []),  # 133 keypoints × 3 [x, y, confidence]
+                    # Pose data (lightweight)
                     'visible_regions': result.get('visible_regions', []),
-                    'visible_regions_detailed': result.get('visible_regions_detailed', []),
 
                     # Metadata
                     'is_corrected': result.get('is_corrected', False),
@@ -810,11 +820,21 @@ class PostureKitBridge:
                     'valid_dimensions': result.get('valid_dimensions')  # Confidence-aware search
                 }
 
-                # Convert thumbnail bytes to base64 if present
-                if result.get('thumbnail'):
-                    result_dict['thumbnail_base64'] = base64.b64encode(result['thumbnail']).decode('utf-8')
+                # Heavy fields only for reasonably-sized result sets; otherwise omit to keep the
+                # JSON response transferable (Swift loads thumbnails from disk on demand).
+                if include_heavy:
+                    result_dict['keypoints'] = result.get('keypoints', [])  # 133 × 3 [x, y, confidence]
+                    result_dict['visible_regions_detailed'] = result.get('visible_regions_detailed', [])
+                    if result.get('thumbnail'):
+                        result_dict['thumbnail_base64'] = base64.b64encode(result['thumbnail']).decode('utf-8')
 
                 swift_results.append(result_dict)
+
+            if not include_heavy:
+                logger.info(
+                    f"Large result set ({len(results)} > {HEAVY_PAYLOAD_CAP}): omitted thumbnails/keypoints/"
+                    f"detailed-regions to keep the response transferable; Swift will load thumbnails from disk"
+                )
 
             return swift_results
 

@@ -39,33 +39,100 @@ struct IndexDirectoryView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     // Directory Selection
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Directory to Index")
-                            .font(.system(size: 13, weight: .semibold))
-                        
-                        HStack(spacing: 8) {
-                            TextField("", text: $indexViewModel.selectedDirectory)
-                                .textFieldStyle(PlainTextFieldStyle())
-                                .padding(10)
+                        HStack {
+                            Text("Directories to Index")
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            Text("\(indexViewModel.selectedDirectories.count) selected")
+                                .font(.system(size: 11))
+                                .foregroundColor(.gray)
+                        }
+
+                        // List of selected directories
+                        VStack(spacing: 6) {
+                            if indexViewModel.selectedDirectories.isEmpty {
+                                HStack {
+                                    Image(systemName: "folder.badge.plus")
+                                        .foregroundColor(.gray)
+                                    Text("No directories selected. Click Add to choose folders.")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.gray)
+                                    Spacer()
+                                }
+                                .padding(12)
+                                .frame(maxWidth: .infinity)
                                 .background(Color.gray.opacity(0.05))
                                 .cornerRadius(6)
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 6)
-                                        .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+                                        .stroke(Color.gray.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [4]))
                                 )
-                            
-                            Button(action: { selectDirectory() }) {
+                            } else {
+                                ForEach(Array(indexViewModel.selectedDirectories.enumerated()), id: \.offset) { index, path in
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "folder.fill")
+                                            .foregroundColor(.blue)
+                                            .font(.system(size: 12))
+                                        Text(path)
+                                            .font(.system(size: 12))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                        Button(action: {
+                                            indexViewModel.removeDirectory(at: index)
+                                        }) {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .foregroundColor(.gray)
+                                                .font(.system(size: 14))
+                                        }
+                                        .buttonStyle(PlainButtonStyle())
+                                        .disabled(indexViewModel.isIndexing)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(Color.gray.opacity(0.05))
+                                    .cornerRadius(6)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+                                    )
+                                }
+                            }
+                        }
+
+                        HStack(spacing: 8) {
+                            Button(action: { selectDirectories() }) {
                                 HStack(spacing: 6) {
-                                    Image(systemName: "folder")
-                                    Text("Browse")
+                                    Image(systemName: "plus.circle.fill")
+                                    Text("Add Directory")
                                 }
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundColor(.white)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 10)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
                                 .background(Color.blue)
                                 .cornerRadius(6)
                             }
                             .buttonStyle(PlainButtonStyle())
+                            .disabled(indexViewModel.isIndexing)
+
+                            if !indexViewModel.selectedDirectories.isEmpty {
+                                Button(action: { indexViewModel.clearDirectories() }) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "trash")
+                                        Text("Clear All")
+                                    }
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundColor(.primary)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color.gray.opacity(0.1))
+                                    .cornerRadius(6)
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                                .disabled(indexViewModel.isIndexing)
+                            }
+                            Spacer()
                         }
                     }
                     
@@ -109,10 +176,15 @@ struct IndexDirectoryView: View {
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 14)
-                            .background(indexViewModel.isIndexing ? (indexViewModel.isPaused ? Color.orange : Color.blue) : Color.blue)
+                            .background(
+                                indexViewModel.isIndexing
+                                    ? (indexViewModel.isPaused ? Color.orange : Color.blue)
+                                    : (indexViewModel.selectedDirectories.isEmpty ? Color.gray.opacity(0.4) : Color.blue)
+                            )
                             .cornerRadius(8)
                         }
                         .buttonStyle(PlainButtonStyle())
+                        .disabled(!indexViewModel.isIndexing && indexViewModel.selectedDirectories.isEmpty)
                         
                         Button(action: {
                             indexViewModel.cancelIndexing()
@@ -138,14 +210,16 @@ struct IndexDirectoryView: View {
         }
     }
 
-    private func selectDirectory() {
+    private func selectDirectories() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        
-        if panel.runModal() == .OK, let url = panel.url {
-            indexViewModel.selectedDirectory = url.path
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Select one or more directories to index"
+
+        if panel.runModal() == .OK {
+            indexViewModel.addDirectories(panel.urls.map { $0.path })
         }
     }
 }
@@ -239,11 +313,17 @@ struct IndexProgressView: View {
 
 // MARK: - Index View Model
 class IndexViewModel: ObservableObject {
+    private static let directoriesKey = "IndexDirectoryView.selectedDirectories"
+
     private let pythonBridge = PythonBridgeSubprocess.shared
     private var startTime: Date?
     weak var mainViewModel: PostureKitViewModel?
 
-    @Published var selectedDirectory: String = "/Users/you/Pictures/yoga_dataset"
+    @Published var selectedDirectories: [String] {
+        didSet {
+            UserDefaults.standard.set(selectedDirectories, forKey: Self.directoriesKey)
+        }
+    }
     @Published var includeSubdirectories: Bool = true
     @Published var skipIndexed: Bool = true
     @Published var deleteMissing: Bool = false
@@ -260,6 +340,31 @@ class IndexViewModel: ObservableObject {
     @Published var timeElapsed: String = "00:00:00"
     @Published var timeRemaining: String = "00:00:00"
 
+    init() {
+        // Restore previously selected directories from UserDefaults.
+        // Filter out any paths that no longer exist on disk so the UI doesn't
+        // show stale entries (e.g. unmounted external drives, deleted folders).
+        let saved = UserDefaults.standard.stringArray(forKey: Self.directoriesKey) ?? []
+        self.selectedDirectories = saved.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    func addDirectories(_ paths: [String]) {
+        for path in paths {
+            if !selectedDirectories.contains(path) {
+                selectedDirectories.append(path)
+            }
+        }
+    }
+
+    func removeDirectory(at index: Int) {
+        guard index >= 0 && index < selectedDirectories.count else { return }
+        selectedDirectories.remove(at: index)
+    }
+
+    func clearDirectories() {
+        selectedDirectories.removeAll()
+    }
+
     func startIndexing() {
         print("[INDEX DEBUG] startIndexing called")
         guard !isIndexing else {
@@ -267,7 +372,12 @@ class IndexViewModel: ObservableObject {
             return
         }
 
-        print("[INDEX DEBUG] Starting index of directory: \(selectedDirectory)")
+        guard !selectedDirectories.isEmpty else {
+            print("[INDEX DEBUG] No directories selected, returning")
+            return
+        }
+
+        print("[INDEX DEBUG] Starting index of \(selectedDirectories.count) directories: \(selectedDirectories)")
         isIndexing = true
         isPaused = false
         progress = 0.0
@@ -281,7 +391,7 @@ class IndexViewModel: ObservableObject {
         // This captures most detections - filtering by confidence happens during search
         print("[INDEX DEBUG] Calling pythonBridge.startIndexing")
         pythonBridge.startIndexing(
-            directory: selectedDirectory,
+            directories: selectedDirectories,
             recursive: includeSubdirectories,
             minConfidence: 0.2,
             skipIndexed: skipIndexed,

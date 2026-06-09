@@ -391,9 +391,9 @@ struct DetectionSection: View {
                         .foregroundColor(.gray)
 
                     Picker("", selection: $viewModel.poseModel) {
-                        Text("RTMW-L (Default - 220MB, Fast)").tag("rtmw-l")
+                        Text("RTMW-L (220MB, Fast)").tag("rtmw-l")
                         Text("RTMW-X (353MB, Best Quality)").tag("rtmw-x")
-                        Text("Ensemble: RTMW-L + RTMW-X (2.5x slower, 10-15% better)").tag("ensemble")
+                        Text("Ensemble: RTMW-L + RTMW-X (Default — 10–15% better, 2.5× slower)").tag("ensemble")
                     }
                     .pickerStyle(MenuPickerStyle())
                     .frame(maxWidth: .infinity)
@@ -503,9 +503,9 @@ struct PerformanceSection: View {
 
                     Picker("", selection: $viewModel.detectionThreads) {
                         Text("4 (Conservative)").tag(4)
-                        Text("8 (Recommended - Performance Cores)").tag(8)
-                        Text("12 (Aggressive - All Cores)").tag(12)
-                        Text("16 (Over-provisioned)").tag(16)
+                        Text("8 (Balanced)").tag(8)
+                        Text("12 (Aggressive)").tag(12)
+                        Text("16 (Recommended — M5 Max)").tag(16)
                     }
                     .pickerStyle(MenuPickerStyle())
                     .frame(maxWidth: .infinity)
@@ -517,7 +517,7 @@ struct PerformanceSection: View {
                             .stroke(Color.gray.opacity(0.2), lineWidth: 1)
                     )
 
-                    Text("M2 Pro has 8 performance + 4 efficiency cores. Using 8 threads provides best performance/efficiency balance.")
+                    Text("M5 Max has 6 Super + 12 Performance cores (18 total). 16 threads leaves headroom for the UI and OS.")
                         .font(.system(size: 11))
                         .foregroundColor(.gray)
                         .fixedSize(horizontal: false, vertical: true)
@@ -605,13 +605,13 @@ class SettingsViewModel: ObservableObject {
     @Published var isLoadingProfileStats: Bool = false
 
     // Detection settings
-    @Published var poseModel: String = "rtmw-l"
+    @Published var poseModel: String = "ensemble"
     @Published var fusionMethod: String = "confidence_weighted"
-    @Published var useTwoStage: Bool = false
+    @Published var useTwoStage: Bool = true
 
     // Performance settings
-    @Published var detectionThreads: Int = 4
-    @Published var useGPU: Bool = false  // Disable MPS by default (PyTorch 2.0.1 MPS is slower than CPU due to fallback overhead)
+    @Published var detectionThreads: Int = 16
+    @Published var useGPU: Bool = true
 
     // Display settings
     @Published var theme: String = "auto"
@@ -672,13 +672,13 @@ class SettingsViewModel: ObservableObject {
         activeProfile = UserDefaults.standard.string(forKey: "activeProfile") ?? "irl"
 
         // Load detection settings
-        poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "rtmw-l"
+        poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
         fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
         useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
 
         // Load performance settings
         let threads = UserDefaults.standard.integer(forKey: "detectionThreads")
-        detectionThreads = threads > 0 ? threads : 8  // Default to 8 (M2 Pro performance cores)
+        detectionThreads = threads > 0 ? threads : 16  // Default to 16 (M5 Max: 6 Super + 12 Performance cores)
 
         // GPU setting: Explicit check for first launch vs user choice
         // UserDefaults.register() in PostureKitApp.init() sets default to true,

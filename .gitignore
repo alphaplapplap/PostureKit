@@ -34,3 +34,19 @@ data/models/*.onnx
 # Test files
 test_output/
 temp/
+
+# Model weights and runtime artifacts
+*.pt
+*.profraw
+data/checkpoints/
+data/test_images/
+
+# Local photo libraries (never publish)
+test-photos/
+
+# Redundant vendored archive (extracted copy is committed)
+upgrades4posturekit.zip
+
+# Xcode user state
+*.xcuserstate
+xcuserdata/

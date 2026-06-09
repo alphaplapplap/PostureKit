@@ -15,7 +15,11 @@ from dataclasses import dataclass
 import torch
 
 from src.core.pose_detector import RTMWCocktail14Detector, PoseResult
-from src.core.person_detector import YOLOPersonDetector, PersonDetection
+from src.core.person_detector import (
+    YOLOPersonDetector,
+    RTMOPersonDetector,
+    PersonDetection,
+)
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -111,17 +115,27 @@ class EnsembleDetector:
                 logger.error(f"Failed to load model {i}: {e}")
                 raise
 
-        # Initialize YOLO person detector for multi-person scenarios
+        # Bottom-up person detection via RTMO-l body7 (74.8 COCO / 83.8 CrowdPose AP).
+        # Replaces YOLOv8x: top-down YOLO cannot separate entangled bodies on this
+        # corpus — it fuses overlapping people into a single mega-bbox or drops the
+        # occluded partner. RTMO clusters keypoints bottom-up and handles crowds
+        # natively. Falls back to YOLOv8x if the ONNX or rtmlib is missing.
+        self.person_detector = None
         try:
-            self.person_detector = YOLOPersonDetector(
-                model_name='yolov8n.pt',  # Nano model (6MB, fast)
-                confidence_threshold=0.15,  # Low threshold to catch all people
-                device=self.device
-            )
-            logger.info("YOLO person detector initialized for multi-person ensemble")
+            self.person_detector = RTMOPersonDetector(device='mps')
+            logger.info("RTMO person detector initialized (rtmo-l body7, device=mps)")
         except Exception as e:
-            logger.warning(f"Failed to initialize person detector: {e}")
-            self.person_detector = None
+            logger.warning(f"RTMO init failed, falling back to YOLOv8x: {e}")
+            try:
+                self.person_detector = YOLOPersonDetector(
+                    model_name='yolov8x.pt',
+                    confidence_threshold=0.05,
+                    device=self.device,
+                )
+                logger.info("YOLOv8x fallback initialized (conf=0.05)")
+            except Exception as e2:
+                logger.warning(f"YOLOv8x fallback also failed: {e2}")
+                self.person_detector = None
 
         total_weight = sum(d["weight"] for d in self.detectors)
         logger.info(
@@ -253,7 +267,22 @@ class EnsembleDetector:
             logger.info("No people detected by YOLO")
             return []
 
-        logger.info(f"YOLO detected {len(person_detections)} people")
+        logger.info(f"{type(self.person_detector).__name__} detected {len(person_detections)} people (pre-filter)")
+
+        # The mega-bbox filter is a YOLO-specific safety net: YOLO top-down often
+        # fuses entangled bodies into one box AND emits the legit single-body
+        # boxes alongside. RTMO is bottom-up — it clusters per-person keypoints,
+        # so its detections legitimately overlap in tight compositions (center
+        # body + partner stacked above/below). Applying the mega-bbox filter to
+        # RTMO drops good detections like the center woman in 1362107066.jpg.
+        if isinstance(self.person_detector, RTMOPersonDetector):
+            logger.info("Skipping mega-bbox filter (RTMO bottom-up detections)")
+        else:
+            person_detections = self._filter_mega_bboxes(person_detections, image.shape[:2])
+            if not person_detections:
+                logger.info("All detections filtered out by mega-bbox filter")
+                return []
+            logger.info(f"After mega-bbox filter: {len(person_detections)} people")
 
         # Step 2: For each person, run ensemble detection and fusion
         all_fused_results = []
@@ -343,6 +372,68 @@ class EnsembleDetector:
         )
 
         return all_fused_results
+
+    def _filter_mega_bboxes(
+        self,
+        detections: List[PersonDetection],
+        image_shape: tuple,
+        area_threshold: float = 0.55,
+        overlap_threshold: float = 0.30,
+    ) -> List[PersonDetection]:
+        """
+        Drop YOLO "mega-bbox" false positives.
+
+        A mega-bbox covers >area_threshold of the image AND overlaps (IoA >=
+        overlap_threshold) with at least one other smaller detection. It is almost always
+        YOLO fusing two entangled bodies into a single "person". If no overlapping smaller
+        detection exists, the big box is kept (legitimate full-frame solo shot).
+        """
+        if len(detections) <= 1:
+            return detections
+
+        H, W = image_shape
+        image_area = float(H * W)
+
+        def area(bbox: np.ndarray) -> float:
+            return float(bbox[2] * bbox[3])
+
+        def ioa(inner: np.ndarray, outer: np.ndarray) -> float:
+            """Intersection area of inner with outer, normalized by inner's area."""
+            ix1 = max(inner[0], outer[0])
+            iy1 = max(inner[1], outer[1])
+            ix2 = min(inner[0] + inner[2], outer[0] + outer[2])
+            iy2 = min(inner[1] + inner[3], outer[1] + outer[3])
+            iw = max(0.0, ix2 - ix1)
+            ih = max(0.0, iy2 - iy1)
+            inner_area = area(inner)
+            if inner_area <= 0:
+                return 0.0
+            return (iw * ih) / inner_area
+
+        kept: List[PersonDetection] = []
+        dropped = 0
+        for i, det in enumerate(detections):
+            frac = area(det.bbox) / image_area
+            if frac >= area_threshold:
+                overlaps_smaller = any(
+                    j != i
+                    and area(other.bbox) < area(det.bbox)
+                    and ioa(other.bbox, det.bbox) >= overlap_threshold
+                    for j, other in enumerate(detections)
+                )
+                if overlaps_smaller:
+                    logger.info(
+                        f"Dropped mega-bbox: person_id={det.person_id} "
+                        f"frac={frac:.2f} conf={det.confidence:.2f}"
+                    )
+                    dropped += 1
+                    continue
+            kept.append(det)
+
+        if dropped:
+            for new_id, d in enumerate(kept):
+                d.person_id = new_id
+        return kept
 
     def _fuse_weighted_average(
         self, predictions: List[Dict]

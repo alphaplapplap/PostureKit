@@ -64,6 +64,12 @@ class SimilarityEngine:
         self.index_path = self.index_dir / "pose_features.index"
         self.mapping_path = self.index_dir / "pose_mapping.npy"
 
+        # Tracks whether the currently-loaded index is a clean, validated load
+        # or a successful build. Prevents close() from re-saving stale data when
+        # load_index() fails validation or when the engine is shut down without
+        # any local mutations (e.g., another process rebuilt the index externally).
+        self._loaded_clean: bool = False
+
         # Thread safety for concurrent index operations
         self._index_lock = threading.RLock()  # Reentrant lock for nested calls
         self._build_lock = threading.Lock()    # Exclusive lock for building
@@ -175,6 +181,7 @@ class SimilarityEngine:
 
         # Save to disk
         self.save_index()
+        self._loaded_clean = True
 
         if progress_callback:
             progress_callback(3, 3, f"Index built with {len(self.pose_id_map)} poses")
@@ -243,6 +250,12 @@ class SimilarityEngine:
         except Exception as e:
             logger.error(f"Failed to save index: {e}", exc_info=True)
 
+    def _reset_index_state(self) -> None:
+        """Clear in-memory index state. Used after failed loads so close() won't re-save stale data."""
+        self.index = None
+        self.pose_id_map = {}
+        self.next_id_counter = 0
+
     def load_index(self) -> bool:
         """
         Load FAISS index from disk with backwards compatibility and corruption recovery.
@@ -278,6 +291,7 @@ class SimilarityEngine:
                                     f"engine expects '{self.feature_mode.value}'. "
                                     f"Index rebuild required."
                                 )
+                                self._reset_index_state()
                                 return False
 
                         # Validate dimension (if stored)
@@ -289,6 +303,7 @@ class SimilarityEngine:
                                     f"engine expects {self.dimension}D. "
                                     f"Index rebuild required."
                                 )
+                                self._reset_index_state()
                                 return False
 
                         logger.info(
@@ -299,6 +314,7 @@ class SimilarityEngine:
                         raise ValueError("Invalid dict format in mapping file")
                 except Exception as e:
                     logger.error(f"Failed to load new format: {e}")
+                    self._reset_index_state()
                     return False
             else:
                 # Old format: list of UUIDs (backwards compatibility)
@@ -322,6 +338,7 @@ class SimilarityEngine:
                         logger.warning(f"Failed to extract vectors: {reconstruct_error}")
                         logger.warning("Skipping index upgrade, using existing index as-is")
                         # Can't upgrade, but old index still works
+                        self._loaded_clean = True
                         return True
 
                     base_index = faiss.IndexFlatL2(dimension)
@@ -342,6 +359,7 @@ class SimilarityEngine:
 
             logger.info(f"Loaded index with dimension: {self.dimension}")
 
+            self._loaded_clean = True
             return True
         except Exception as e:
             logger.error(f"Failed to load index (likely corrupted): {e}")
@@ -358,6 +376,7 @@ class SimilarityEngine:
             except Exception as cleanup_error:
                 logger.error(f"Failed to cleanup corrupted files: {cleanup_error}")
 
+            self._reset_index_state()
             return False
 
     def search_by_feature(
@@ -371,6 +390,7 @@ class SimilarityEngine:
         deduplicate_images: bool = True,
         required_regions: Optional[List[str]] = None,
         min_region_confidence: float = 0.3,
+        min_similarity: float = 0.0,
         query_keypoints: Optional[np.ndarray] = None,
         query_bbox: Optional[np.ndarray] = None
     ) -> List[Dict]:
@@ -432,7 +452,8 @@ class SimilarityEngine:
             min_valid_overlap,
             deduplicate_images,
             regions_tuple,
-            min_region_confidence
+            min_region_confidence,
+            min_similarity
         )
 
         # Thread-safe cache check
@@ -483,7 +504,13 @@ class SimilarityEngine:
             else:
                 multiplier = 3
 
-            search_k = min(k * multiplier, self.index.ntotal)
+            if min_similarity > 0.0:
+                # Threshold mode: the caller wants EVERY pose at/above a similarity floor, not a
+                # top-k slice. IndexFlatL2 scans the whole index per query regardless of k, so we
+                # request all of it and let the threshold (not k) bound the result set.
+                search_k = self.index.ntotal
+            else:
+                search_k = min(k * multiplier, self.index.ntotal)
             distances, indices = self.index.search(query, search_k)
 
         # === CONFIDENCE-AWARE RE-RANKING ===
@@ -503,15 +530,21 @@ class SimilarityEngine:
             if not candidate_ids:
                 return []
 
-            # Batch load feature vectors and confidences for all candidates
+            # Batch load feature vectors and confidences for all candidates.
+            # In threshold mode search_k == ntotal, so candidate_ids spans the whole index;
+            # skip the (huge) IN clause and load every row in one shot instead.
             with self.storage.session_scope() as session:
-                confidence_query = session.query(
+                base_conf_query = session.query(
                     GeometricFeatures.pose_id,
                     GeometricFeatures.feature_vector,
                     GeometricFeatures.feature_confidence
-                ).filter(
-                    GeometricFeatures.pose_id.in_(candidate_ids)
-                ).all()
+                )
+                if len(candidate_ids) >= self.index.ntotal:
+                    confidence_query = base_conf_query.all()
+                else:
+                    confidence_query = base_conf_query.filter(
+                        GeometricFeatures.pose_id.in_(candidate_ids)
+                    ).all()
 
                 # Build lookup maps
                 candidate_features = {}
@@ -653,176 +686,205 @@ class SimilarityEngine:
                 # Store OKS similarities for later inclusion in results
                 oks_similarity_map = {c['pose_id']: c['oks_similarity'] for c in oks_reranked}
 
-        # Build results with database metadata
+        # Build results with database metadata.
+        #
+        # Two-phase to avoid one DB round-trip per candidate (the old hot loop issued a query
+        # per pose, which is what made large / "All" searches take ~90s):
+        #   Phase 1: trim candidates cheaply by base similarity (derived from distance, no DB).
+        #   Phase 2: bulk-fetch poses/images/features and body parts for the survivors in a
+        #            couple of chunked queries, then iterate in memory applying the same
+        #            filters plus the min_similarity floor.
+        from src.config.settings import settings
+
+        # A candidate can only reach final_similarity >= min_similarity if its base similarity
+        # (pre-plausibility) is >= min_similarity / max_boost. plausibility_score <= 1.0, so the
+        # boost is bounded; use that bound to stop scanning once distances grow too large
+        # (candidates are already sorted nearest-first by L2 / masked / OKS distance).
+        if settings.ENABLE_PLAUSIBILITY_SCORING:
+            max_boost = 0.8 + 0.2 * settings.PLAUSIBILITY_WEIGHT
+        else:
+            max_boost = 1.0
+        base_similarity_floor = (min_similarity / max_boost) if min_similarity > 0.0 else 0.0
+
+        # In top-k mode (no threshold) bound how many candidates we bulk-load so we don't fetch
+        # thumbnails for the entire re-ranking buffer; a small multiple of k covers filter
+        # dropouts. In threshold mode the base-similarity early-stop bounds the shortlist instead.
+        result_fetch_cap = None if min_similarity > 0.0 else max(k * 2, 200)
+
+        # Phase 1: ordered candidate shortlist (faiss_idx, distance, pose_id, base_similarity)
+        candidates = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx == -1:  # FAISS returns -1 for empty slots
+                continue
+            dist_f = float(dist)
+            base_sim = self._distance_to_similarity(dist_f)
+            if min_similarity > 0.0 and base_sim < base_similarity_floor:
+                # Sorted nearest-first → every remaining candidate is also below the floor.
+                break
+            candidates.append((int(idx), dist_f, UUID(self.pose_id_map[idx]), base_sim))
+            if result_fetch_cap is not None and len(candidates) >= result_fetch_cap:
+                break
+
         results = []
-        seen_images = set()  # Track seen images for deduplication
 
-        with self.storage.session_scope() as session:
-            for rank, (idx, dist) in enumerate(zip(indices[0], distances[0]), 1):
-                if idx == -1:  # FAISS returns -1 for empty slots
-                    continue
+        if candidates:
+            seen_images = set()  # Track seen images for deduplication
+            candidate_pose_ids = [c[2] for c in candidates]
 
-                pose_id = UUID(self.pose_id_map[idx])
+            from src.storage.models import BodyPart
+            from collections import defaultdict
 
-                # Get pose metadata
-                pose_query = session.query(
-                    PoseDetection,
-                    Image,
-                    GeometricFeatures
-                ).join(
-                    Image, PoseDetection.image_id == Image.id
-                ).join(
-                    GeometricFeatures, PoseDetection.id == GeometricFeatures.pose_id
-                ).filter(
-                    PoseDetection.id == pose_id
-                )
+            with self.storage.session_scope() as session:
+                # Phase 2a: bulk-load pose/image/feature rows (chunked to keep IN lists sane)
+                record_map = {}
+                for chunk_start in range(0, len(candidate_pose_ids), 1000):
+                    chunk = candidate_pose_ids[chunk_start:chunk_start + 1000]
+                    rows = session.query(
+                        PoseDetection,
+                        Image,
+                        GeometricFeatures
+                    ).join(
+                        Image, PoseDetection.image_id == Image.id
+                    ).join(
+                        GeometricFeatures, PoseDetection.id == GeometricFeatures.pose_id
+                    ).filter(
+                        PoseDetection.id.in_(chunk)
+                    ).all()
+                    for pose, image, features in rows:
+                        record_map[pose.id] = (pose, image, features)
 
-                result = pose_query.first()
-                if not result:
-                    continue
+                # Phase 2b: bulk-load body parts for all involved images, grouped by
+                # (image_id, person_index) — matches the old per-pose filter.
+                image_ids = list({image.id for (_, image, _) in record_map.values()})
+                bp_map = defaultdict(list)
+                for chunk_start in range(0, len(image_ids), 1000):
+                    chunk = image_ids[chunk_start:chunk_start + 1000]
+                    for bp in session.query(BodyPart).filter(
+                        BodyPart.image_id.in_(chunk),
+                        BodyPart.confidence >= min_region_confidence
+                    ).all():
+                        bp_map[(bp.image_id, bp.person_index)].append(bp)
 
-                pose, image, features = result
-
-                # Filter by confidence
-                if pose.overall_confidence < min_confidence:
-                    continue
-
-                # Skip if image file no longer exists on disk
-                if not Path(image.file_path).exists():
-                    logger.debug(f"Skipping missing file: {image.file_path}")
-                    continue
-
-                # Deduplicate by image
-                if deduplicate_images:
-                    if str(image.id) in seen_images:
-                        logger.debug(f"[DEDUPE] Skipping pose {pose_id} - image {image.id} already seen (person_id={pose.person_id})")
+                # Phase 3: iterate candidates in ranked order, filter, score, cap at k.
+                for faiss_idx, dist_f, pose_id, base_sim in candidates:
+                    rec = record_map.get(pose_id)
+                    if rec is None:
                         continue
-                    seen_images.add(str(image.id))
-                    logger.debug(f"[DEDUPE] Including first pose {pose_id} from image {image.id} (person_id={pose.person_id})")
+                    pose, image, features = rec
 
-                # Query body parts for this image (for filtering and display)
-                from src.storage.models import BodyPart
-                body_parts = session.query(BodyPart).filter(
-                    BodyPart.image_id == image.id,
-                    BodyPart.person_index == pose.person_id,
-                    BodyPart.confidence >= min_region_confidence
-                ).all()
+                    # Filter by confidence
+                    if pose.overall_confidence < min_confidence:
+                        continue
 
-                # Get set of visible canonical regions
-                visible_regions = list(set(bp.canonical_region for bp in body_parts))
+                    # Skip if image file no longer exists on disk
+                    if not Path(image.file_path).exists():
+                        logger.debug(f"Skipping missing file: {image.file_path}")
+                        continue
 
-                # Get detailed breakdown of body parts (18 NudeNet classes)
-                visible_regions_detailed = [
-                    {
-                        'part_name': bp.part_name,
-                        'canonical_region': bp.canonical_region,
-                        'confidence': float(bp.confidence),
-                        'is_exposed': bp.is_exposed
-                    }
-                    for bp in body_parts
-                ]
+                    # Deduplicate by image
+                    if deduplicate_images:
+                        if str(image.id) in seen_images:
+                            continue
+                        seen_images.add(str(image.id))
 
-                # Filter by required body regions/classes (if specified)
-                if required_regions:
-                    # Support both canonical regions AND specific NudeNet class names
-                    # Get all detected class names meeting confidence threshold
-                    detected_classes = {
-                        bp.part_name
+                    # Body parts for this image+person (already confidence-filtered in the query)
+                    body_parts = bp_map.get((image.id, pose.person_id), [])
+
+                    # Get set of visible canonical regions
+                    visible_regions = list(set(bp.canonical_region for bp in body_parts))
+
+                    # Get detailed breakdown of body parts (18 NudeNet classes)
+                    visible_regions_detailed = [
+                        {
+                            'part_name': bp.part_name,
+                            'canonical_region': bp.canonical_region,
+                            'confidence': float(bp.confidence),
+                            'is_exposed': bp.is_exposed
+                        }
                         for bp in body_parts
-                        if bp.confidence >= min_region_confidence
-                    }
-                    detected_canonical = set(visible_regions)
+                    ]
 
-                    # Check if all required items are present
-                    # Can be class names (e.g., "FEMALE_BREAST_EXPOSED") OR canonical regions (e.g., "face")
-                    missing = set(required_regions) - (detected_classes | detected_canonical)
-                    if missing:
-                        logger.debug(f"Skipping pose {pose_id}: missing {missing}")
-                        continue
+                    # Filter by required body regions/classes (if specified)
+                    if required_regions:
+                        # Support both canonical regions AND specific NudeNet class names
+                        detected_classes = {bp.part_name for bp in body_parts}
+                        detected_canonical = set(visible_regions)
+                        missing = set(required_regions) - (detected_classes | detected_canonical)
+                        if missing:
+                            logger.debug(f"Skipping pose {pose_id}: missing {missing}")
+                            continue
 
-                # Normalize keypoints to thumbnail size (200x200) for overlay rendering
-                keypoints_normalized = []
-                if pose.keypoints and len(pose.keypoints) == 399:  # 133 keypoints × 3
-                    for i in range(0, 399, 3):
-                        x = pose.keypoints[i]
-                        y = pose.keypoints[i + 1]
-                        conf = pose.keypoints[i + 2]
-
-                        # Normalize to thumbnail coordinates (200x200) using letterboxing/pillarboxing
-                        # Matches thumbnail_generator.py logic (lines 54-71)
-                        # Thumbnails FIT WITHIN 200x200 canvas (no cropping, black padding on edges)
+                    # Normalize keypoints to thumbnail size (200x200) for overlay rendering.
+                    # Thumbnails FIT WITHIN a 200x200 canvas (letterbox/pillarbox), matching
+                    # thumbnail_generator.py.
+                    keypoints_normalized = []
+                    if pose.keypoints and len(pose.keypoints) == 399:  # 133 keypoints × 3
                         width = image.width
                         height = image.height
-
-                        # Calculate scale that fits image WITHIN 200x200 (same as thumbnail generation)
                         scale = min(200.0 / width, 200.0 / height)
                         new_width = width * scale
                         new_height = height * scale
-
-                        # Calculate padding offsets (center image on canvas)
                         x_offset = (200.0 - new_width) / 2
                         y_offset = (200.0 - new_height) / 2
+                        for i in range(0, 399, 3):
+                            x = pose.keypoints[i]
+                            y = pose.keypoints[i + 1]
+                            conf = pose.keypoints[i + 2]
+                            keypoints_normalized.append([x * scale + x_offset, y * scale + y_offset, conf])
 
-                        # Apply scale and offset
-                        x_norm = x * scale + x_offset
-                        y_norm = y * scale + y_offset
+                    # Base similarity already computed from distance in Phase 1
+                    base_similarity = base_sim
 
-                        keypoints_normalized.append([x_norm, y_norm, conf])
+                    # Compute plausibility score (anatomical validity)
+                    plausibility_score = self._compute_plausibility_score(pose, features)
 
-                # Compute base similarity from distance
-                base_similarity = self._distance_to_similarity(float(dist))
+                    # Apply plausibility boost if enabled
+                    if settings.ENABLE_PLAUSIBILITY_SCORING:
+                        boost_factor = 0.8 + 0.2 * plausibility_score * settings.PLAUSIBILITY_WEIGHT
+                        final_similarity = base_similarity * boost_factor
+                    else:
+                        final_similarity = base_similarity
 
-                # Compute plausibility score (anatomical validity)
-                plausibility_score = self._compute_plausibility_score(pose, features)
+                    # Apply the similarity threshold (exact, after the plausibility boost)
+                    if min_similarity > 0.0 and final_similarity < min_similarity:
+                        continue
 
-                # Apply plausibility boost if enabled
-                from src.config.settings import settings
-                if settings.ENABLE_PLAUSIBILITY_SCORING:
-                    # Boost high-plausibility poses, penalize low-plausibility
-                    # Formula: similarity * (0.8 + 0.2 * plausibility * weight)
-                    # At plausibility=1.0, weight=0.2: boost = 0.8 + 0.2 * 1.0 * 0.2 = 0.84 (4% boost)
-                    # At plausibility=0.5, weight=0.2: boost = 0.8 + 0.2 * 0.5 * 0.2 = 0.82 (2% penalty)
-                    boost_factor = 0.8 + 0.2 * plausibility_score * settings.PLAUSIBILITY_WEIGHT
-                    final_similarity = base_similarity * boost_factor
-                else:
-                    final_similarity = base_similarity
+                    result_dict = {
+                        'pose_id': str(pose_id),
+                        'distance': dist_f,
+                        'similarity_score': final_similarity,
+                        'base_similarity': base_similarity,  # Original score before plausibility
+                        'plausibility_score': plausibility_score,  # Anatomical validity (0-1)
+                        'rank': len(results) + 1,  # Rank after filtering
+                        'image_path': image.file_path,
+                        'image_id': str(image.id),
+                        'detection_confidence': pose.overall_confidence,
+                        'is_corrected': pose.is_corrected,
+                        'person_id': pose.person_id,
+                        'bbox': pose.bbox,  # Bounding box [x_min, y_min, x_max, y_max]
+                        'category': None,  # Will be filled if training_labels exist
+                        'image_width': image.width,
+                        'image_height': image.height,
+                        'file_size': image.file_size_bytes,
+                        'thumbnail': image.thumbnail,  # Pre-generated JPEG thumbnail bytes
+                        'visible_regions': visible_regions,  # Canonical regions (7 categories)
+                        'visible_regions_detailed': visible_regions_detailed,  # Full NudeNet classes (18 categories)
+                        'keypoints': keypoints_normalized  # Normalized to 200x200 for skeleton overlay
+                    }
 
-                result_dict = {
-                    'pose_id': str(pose_id),
-                    'distance': float(dist),
-                    'similarity_score': final_similarity,
-                    'base_similarity': base_similarity,  # Original score before plausibility
-                    'plausibility_score': plausibility_score,  # Anatomical validity (0-1)
-                    'rank': len(results) + 1,  # Rank after filtering
-                    'image_path': image.file_path,
-                    'image_id': str(image.id),
-                    'detection_confidence': pose.overall_confidence,
-                    'is_corrected': pose.is_corrected,
-                    'person_id': pose.person_id,
-                    'bbox': pose.bbox,  # Bounding box [x_min, y_min, x_max, y_max]
-                    'category': None,  # Will be filled if training_labels exist
-                    'image_width': image.width,
-                    'image_height': image.height,
-                    'file_size': image.file_size_bytes,
-                    'thumbnail': image.thumbnail,  # Pre-generated JPEG thumbnail bytes
-                    'visible_regions': visible_regions,  # Canonical regions (7 categories)
-                    'visible_regions_detailed': visible_regions_detailed,  # Full NudeNet classes (18 categories)
-                    'keypoints': keypoints_normalized  # Normalized to 200x200 for skeleton overlay
-                }
+                    # Add valid_dimensions if confidence-aware search was used
+                    if pose_id in valid_dimensions_map:
+                        result_dict['valid_dimensions'] = valid_dimensions_map[pose_id]
 
-                # Add valid_dimensions if confidence-aware search was used
-                if pose_id in valid_dimensions_map:
-                    result_dict['valid_dimensions'] = valid_dimensions_map[pose_id]
+                    # Add OKS similarity if OKS-based search was used
+                    if pose_id in oks_similarity_map:
+                        result_dict['oks_similarity'] = oks_similarity_map[pose_id]
 
-                # Add OKS similarity if OKS-based search was used
-                if pose_id in oks_similarity_map:
-                    result_dict['oks_similarity'] = oks_similarity_map[pose_id]
+                    results.append(result_dict)
 
-                results.append(result_dict)
-
-                # Stop once we have enough results
-                if len(results) >= k:
-                    break
+                    # Stop once we have enough results (k is large in threshold mode)
+                    if len(results) >= k:
+                        break
 
         # Thread-safe cache store and eviction
         with self._cache_lock:
@@ -961,6 +1023,7 @@ class SimilarityEngine:
 
             # Save updated index
             self.save_index()
+            self._loaded_clean = True
 
         logger.info(f"Added pose {pose_id} to index (now {len(self.pose_id_map)} poses)")
         return True
@@ -999,6 +1062,7 @@ class SimilarityEngine:
 
             # Save updated index
             self.save_index()
+            self._loaded_clean = True
 
         logger.info(f"Removed pose {pose_id} from index (now {len(self.pose_id_map)} poses)")
         return True
@@ -1011,22 +1075,18 @@ class SimilarityEngine:
 
     def close(self) -> None:
         """
-        Clean shutdown: save index to disk, clear caches, release locks.
+        Clean shutdown: clear caches, release locks.
 
-        Call this when shutting down the application to ensure:
-        - Index is persisted to disk
-        - All caches are cleared
-        - File handles are released
-        - Locks are freed
+        Does NOT re-save the index on close. All mutation paths (build_index,
+        add_pose, remove_pose) already persist immediately, so re-saving here
+        is redundant. More importantly, a blind re-save would overwrite any
+        externally-rebuilt index on disk with whatever stale state this
+        process happens to be holding (e.g., a subprocess that loaded an
+        old-mode index before the user rebuilt it with a different config).
         """
         logger.info("Closing SimilarityEngine...")
 
         try:
-            # Save index to disk if it exists
-            if self.index is not None:
-                logger.info("Saving index before close...")
-                self.save_index()
-
             # Clear search cache
             self.clear_search_cache()
 
@@ -1511,8 +1571,10 @@ class SimilarityEngine:
                 **search_kwargs
             )
 
-        # Search with normal orientation
-        k_per_search = settings.FLIP_SEARCH_MERGE_TOP_K
+        # Search with normal orientation.
+        # In threshold mode (min_similarity > 0) the caller wants every match above the floor,
+        # so each sub-search must use the full k rather than the fixed merge-top-k.
+        k_per_search = k if search_kwargs.get('min_similarity', 0.0) > 0.0 else settings.FLIP_SEARCH_MERGE_TOP_K
         normal_results = self.search_by_feature(
             feature_vector,
             query_confidence=query_confidence,
