@@ -182,6 +182,18 @@ class Settings:
     # Layer 4: Search Features
     SEARCH_FEATURE_MODE: str = os.getenv('SEARCH_FEATURE_MODE', 'geometric')  # geometric, fused
 
+    # Multi-modal fusion of geometric + visual into the stored 628-dim vector.
+    # Only affects ranking when SEARCH_FEATURE_MODE='fused'. 'weighted' keeps the
+    # geometric subspace at its native scale (fused-mode distances stay comparable
+    # to geometric mode) and scales the unit-norm visual embedding: visual is the
+    # resolution/compression-sensitive modality, so it gets a bounded, deliberate
+    # share of the distance instead of an accident of vector scale. Changing these
+    # (or the visual transform) requires re-extracting features for stored fused
+    # vectors to stay mutually comparable.
+    FUSION_METHOD: str = os.getenv('FUSION_METHOD', 'weighted')  # concatenate, weighted, normalized
+    FUSION_GEOMETRIC_WEIGHT: float = float(os.getenv('FUSION_GEOMETRIC_WEIGHT', '1.0'))
+    FUSION_VISUAL_WEIGHT: float = float(os.getenv('FUSION_VISUAL_WEIGHT', '0.5'))
+
     # ========================================================================
     # Pose-Based Search Configuration (Appearance-Free)
     # ========================================================================

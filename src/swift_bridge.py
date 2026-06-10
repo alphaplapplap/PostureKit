@@ -376,7 +376,11 @@ class PostureKitBridge:
         else:
             self.visual_extractor = None
 
-        self.fusion_engine = MultiModalFusion(fusion_method='concatenate')
+        self.fusion_engine = MultiModalFusion(
+            fusion_method=settings.FUSION_METHOD,
+            geometric_weight=settings.FUSION_GEOMETRIC_WEIGHT,
+            visual_weight=settings.FUSION_VISUAL_WEIGHT,
+        )
 
         # Ensure PostgreSQL is running before attempting database operations
         import socket

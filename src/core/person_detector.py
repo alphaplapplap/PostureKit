@@ -303,6 +303,12 @@ class RTMOPersonDetector:
         bbox_pad: float = 0.10,
         min_bbox_side: int = 40,
         device: str = 'mps',
+        tile_min_long_side: int = 1600,
+        tile_size: int = 1280,
+        tile_overlap: float = 0.25,
+        tile_min_visible_kps: int = 8,
+        tile_iou_dedup_thr: float = 0.35,
+        tile_containment_thr: float = 0.5,
     ):
         default_path = settings.PROJECT_ROOT / "data" / "models" / "rtmo-l_body7.onnx"
         self.onnx_path = onnx_path or str(default_path)
@@ -328,6 +334,29 @@ class RTMOPersonDetector:
         # detection is a face fragment or a patch of skin that happens to have
         # a few high-confidence keypoints clustered together.
         self.min_bbox_side = min_bbox_side
+        # RTMO resizes its input to 640x640, so a 4K image leaves ~150px per body —
+        # below the model's effective resolution. For images whose long side is
+        # >= tile_min_long_side, we ALSO run detection on overlapping tile_size
+        # crops (tile_overlap fraction of overlap) and pool all candidates through
+        # the same greedy dedup: large/close people come from the full-image pass,
+        # small/distant people from the tiles. tile_min_long_side <= 0 disables.
+        self.tile_min_long_side = tile_min_long_side
+        self.tile_size = tile_size
+        self.tile_overlap = tile_overlap
+        # Tiles zoomed into a large body see featureless skin/texture patches and
+        # hallucinate 4-6 confident keypoints on them (verified on the 4K entangled
+        # test image). Tile candidates therefore need >= tile_min_visible_kps —
+        # a small person worth recovering from a tile is fully visible there, so
+        # most of their 17 keypoints score; heavily occluded people stay the
+        # full-image pass's job under its permissive min_visible_kps gate.
+        self.tile_min_visible_kps = tile_min_visible_kps
+        # Tile candidates also dedup under stricter overlap thresholds than the
+        # full pass: a tile seeing part of a large body emits blob detections
+        # ~50-60% contained in the best detection — under the loose containment
+        # bar (tuned to keep entangled full-pass partners) but a duplicate.
+        # Tile recoveries are a bonus, so they must be clearly distinct to win.
+        self.tile_iou_dedup_thr = tile_iou_dedup_thr
+        self.tile_containment_thr = tile_containment_thr
         self.device = device
         self.model = None
 
@@ -376,57 +405,62 @@ class RTMOPersonDetector:
 
         # rtmlib/RTMO was trained on BGR (OpenCV convention); caller passes RGB.
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        try:
-            keypoints, scores = self.model(bgr)
-        except Exception as e:
-            raise PersonDetectorError(f"RTMO inference failed: {e}") from e
-
         H, W = image.shape[:2]
         detections: List[PersonDetection] = []
 
-        if keypoints is None or len(keypoints) == 0:
+        # Full-image pass: finds large/close people regardless of image size.
+        candidates = self._collect_candidates(bgr, (0, 0))
+
+        # High-res tiling pass: each tile is a pixel crop (no resize), so RTMO's
+        # 640x640 input sees small people at tile_size/640 ≈ 2x the detail of the
+        # full-image pass. Tile fragments of people the full pass already found
+        # have fewer visible keypoints and get dropped by the containment dedup.
+        if self.tile_min_long_side > 0 and max(H, W) >= self.tile_min_long_side:
+            tiles = self._generate_tiles(W, H)
+            for (tx1, ty1, tx2, ty2) in tiles:
+                candidates.extend(self._collect_candidates(
+                    bgr[ty1:ty2, tx1:tx2], (tx1, ty1),
+                    min_visible=self.tile_min_visible_kps,
+                    from_tile=True
+                ))
+            logger.info(
+                f"RTMO tiled detection: {len(tiles)} tiles for {W}x{H}, "
+                f"{len(candidates)} candidates pre-dedup"
+            )
+
+        if not candidates:
             logger.info("RTMO detected 0 people")
             return detections
 
-        # Collect candidate detections that pass the per-person quality bar.
-        candidates = []  # (quality, max_score, visible_count, bbox_xyxy, raw_idx)
-        for i in range(keypoints.shape[0]):
-            kpts = keypoints[i]
-            sc = scores[i]
-            max_score = float(sc.max())
-            visible_mask = sc >= self.min_kp_score
-            n_visible = int(visible_mask.sum())
-
-            # Entangled/occluded poses have low *mean* score (many hidden
-            # keypoints) but at least one very confident keypoint. Gate on
-            # max_score + visible_count rather than mean.
-            if max_score < self.min_max_kp_score:
-                continue
-            if n_visible < self.min_visible_kps:
-                continue
-
-            xs = kpts[visible_mask, 0]
-            ys = kpts[visible_mask, 1]
-            x1, y1 = float(xs.min()), float(ys.min())
-            x2, y2 = float(xs.max()), float(ys.max())
-            if x2 - x1 <= 0 or y2 - y1 <= 0:
-                continue
-            if (x2 - x1) < self.min_bbox_side or (y2 - y1) < self.min_bbox_side:
-                continue
-
-            # quality = visible_count (primary) + max_score (tie-breaker)
-            quality = n_visible * 10.0 + max_score
-            candidates.append((quality, max_score, n_visible,
-                               (x1, y1, x2, y2), i))
-
-        # Greedy IoU/containment dedup: sort best-first, drop any whose bbox
-        # overlaps too much with one already kept.
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        kept: List[tuple] = []
-        for cand in candidates:
-            _, _, _, bx, _ = cand
-            if self._overlaps_kept(bx, [k[3] for k in kept],
+        # Two-phase greedy dedup. Phase 1: the legacy walk — full-pass candidates
+        # dedup among themselves under the tuned thresholds. Losers are
+        # permanently suppressed: a blob that lost to a full-pass box is a
+        # duplicate regardless of what tiling finds, and letting it re-compete
+        # against a different (tile) winner revives it — observed, not
+        # hypothetical. With tiling off this IS the final result, bit-identical
+        # to pre-tiling behavior.
+        full_cands = [c for c in candidates if not c[4]]
+        full_cands.sort(key=lambda c: c[0], reverse=True)
+        legacy: List[tuple] = []
+        for cand in full_cands:
+            if self._overlaps_kept(cand[3], [k[3] for k in legacy],
                                    self.iou_dedup_thr, self.containment_thr):
+                continue
+            legacy.append(cand)
+
+        # Phase 2: legacy survivors and tile candidates compete head-to-head, so
+        # a sharper tile detection (more visible keypoints) can replace a merged
+        # full-pass mega-box — tile recoveries of people inside mega-boxes are
+        # the point of tiling. Tile candidates are held to the stricter tile_*
+        # overlap thresholds.
+        pool = legacy + [c for c in candidates if c[4]]
+        pool.sort(key=lambda c: c[0], reverse=True)
+        kept: List[tuple] = []
+        for cand in pool:
+            from_tile = cand[4]
+            iou_thr = self.tile_iou_dedup_thr if from_tile else self.iou_dedup_thr
+            cont_thr = self.tile_containment_thr if from_tile else self.containment_thr
+            if self._overlaps_kept(cand[3], [k[3] for k in kept], iou_thr, cont_thr):
                 continue
             kept.append(cand)
 
@@ -458,6 +492,87 @@ class RTMOPersonDetector:
             }}
         )
         return detections
+
+    def _collect_candidates(
+        self,
+        bgr_region: np.ndarray,
+        offset: tuple,
+        min_visible: Optional[int] = None,
+        from_tile: bool = False,
+    ) -> List[tuple]:
+        """Run RTMO on a BGR region and return quality-gated candidates with
+        bboxes translated into full-image coordinates by `offset` (x, y).
+
+        Candidate tuple: (quality, max_score, visible_count, bbox_xyxy, from_tile).
+        Tiles are pixel crops, so keypoint coords are already at full-image scale;
+        the quality gates (min_kp_score, min_bbox_side) keep their pixel semantics.
+        `min_visible` overrides min_visible_kps (tiles use the stricter
+        tile_min_visible_kps to suppress skin-patch hallucinations).
+        """
+        if min_visible is None:
+            min_visible = self.min_visible_kps
+        if bgr_region.shape[0] < 2 or bgr_region.shape[1] < 2:
+            return []
+        try:
+            keypoints, scores = self.model(bgr_region)
+        except Exception as e:
+            raise PersonDetectorError(f"RTMO inference failed: {e}") from e
+
+        if keypoints is None or len(keypoints) == 0:
+            return []
+
+        ox, oy = float(offset[0]), float(offset[1])
+        candidates = []
+        for i in range(keypoints.shape[0]):
+            kpts = keypoints[i]
+            sc = scores[i]
+            max_score = float(sc.max())
+            visible_mask = sc >= self.min_kp_score
+            n_visible = int(visible_mask.sum())
+
+            # Entangled/occluded poses have low *mean* score (many hidden
+            # keypoints) but at least one very confident keypoint. Gate on
+            # max_score + visible_count rather than mean.
+            if max_score < self.min_max_kp_score:
+                continue
+            if n_visible < min_visible:
+                continue
+
+            xs = kpts[visible_mask, 0]
+            ys = kpts[visible_mask, 1]
+            x1, y1 = float(xs.min()) + ox, float(ys.min()) + oy
+            x2, y2 = float(xs.max()) + ox, float(ys.max()) + oy
+            if x2 - x1 <= 0 or y2 - y1 <= 0:
+                continue
+            if (x2 - x1) < self.min_bbox_side or (y2 - y1) < self.min_bbox_side:
+                continue
+
+            # quality = visible_count (primary) + max_score (tie-breaker)
+            quality = n_visible * 10.0 + max_score
+            candidates.append((quality, max_score, n_visible,
+                               (x1, y1, x2, y2), from_tile))
+        return candidates
+
+    def _generate_tiles(self, W: int, H: int) -> List[tuple]:
+        """Sliding-window tile boxes (x1, y1, x2, y2) of tile_size with
+        tile_overlap fractional overlap. The last tile per axis is shifted to
+        end exactly at the image edge, so coverage is complete without
+        spilling out of bounds. An axis shorter than tile_size yields one
+        full-span tile."""
+        def starts(length: int) -> List[int]:
+            if length <= self.tile_size:
+                return [0]
+            step = max(1, int(self.tile_size * (1.0 - self.tile_overlap)))
+            s = list(range(0, length - self.tile_size + 1, step))
+            if s[-1] != length - self.tile_size:
+                s.append(length - self.tile_size)
+            return s
+
+        return [
+            (x, y, min(x + self.tile_size, W), min(y + self.tile_size, H))
+            for y in starts(H)
+            for x in starts(W)
+        ]
 
     @staticmethod
     def _overlaps_kept(

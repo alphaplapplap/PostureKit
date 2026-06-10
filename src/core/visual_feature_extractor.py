@@ -25,6 +25,27 @@ def _has_mps_module() -> bool:
     return hasattr(torch, 'mps')
 
 
+class _LetterboxToSquare:
+    """Pad the image to a centered square before resizing.
+
+    Replaces the Resize(256)+CenterCrop(224) pipeline, which discarded the top
+    and bottom of typical standing-person crops (~1:2.5 aspect) — head and feet
+    never reached the embedding, and the result shifted with bbox placement.
+    Padding keeps the whole person and is aspect/resolution invariant.
+    """
+
+    FILL = (124, 116, 104)  # ImageNet mean in uint8 — ~zero after Normalize
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if w == h:
+            return img
+        side = max(w, h)
+        canvas = Image.new('RGB', (side, side), self.FILL)
+        canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+        return canvas
+
+
 @dataclass
 class VisualFeatures:
     """
@@ -132,6 +153,19 @@ class VisualFeatureExtractor:
             f"model={self.MODEL_NAME}, normalize={self.normalize}"
         )
 
+    @staticmethod
+    def _build_transform() -> transforms.Compose:
+        """Letterbox → 224x224 → ImageNet normalization (no center crop)."""
+        return transforms.Compose([
+            _LetterboxToSquare(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
     def _initialize_device(self) -> torch.device:
         """Initialize and validate torch device."""
         try:
@@ -178,15 +212,7 @@ class VisualFeatureExtractor:
             self._model = cached_model
             logger.info(f"Reusing cached MobileNetV3 model on {str(self._device_obj)}")
             # Still need to initialize transforms
-            self._transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
-            ])
+            self._transform = self._build_transform()
             return
 
         logger.info("Loading MobileNetV3-Small model...")
@@ -208,15 +234,7 @@ class VisualFeatureExtractor:
             self._model_cache[cache_key] = self._model
 
             # Initialize transforms
-            self._transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
-            ])
+            self._transform = self._build_transform()
 
             logger.info(
                 f"Model loaded successfully: {self.MODEL_NAME} on {str(self._device_obj)}, "
