@@ -460,6 +460,7 @@ class EnsembleDetector:
         # Initialize arrays for weighted sum
         fused_keypoints = np.zeros((num_keypoints, 2), dtype=np.float32)
         fused_visibility = np.zeros(num_keypoints, dtype=np.float32)
+        fused_kp_conf = np.zeros(num_keypoints, dtype=np.float32)
 
         # Weighted average of keypoints
         for pred in predictions:
@@ -469,6 +470,8 @@ class EnsembleDetector:
             # Extract only x,y coordinates (keypoints is shape (133, 3) with [x, y, confidence])
             fused_keypoints += pose.keypoints[:, :2] * weight
             fused_visibility += pose.visibility * weight
+            # Real [0,1] model confidence, averaged under the same weights
+            fused_kp_conf += pose.keypoints[:, 2] * weight
 
         # Average confidence across models
         avg_confidence = float(
@@ -481,14 +484,18 @@ class EnsembleDetector:
             weight = pred["weight"] / total_weight
             fused_bbox += pred["pose"].bbox * weight
 
-        # CRITICAL: Convert visibility to integers (database expects 0, 1, or 2)
-        # Fused visibility is float average, need to round and clip
-        fused_visibility_int = np.clip(np.round(fused_visibility), 0, 2).astype(np.int32)
+        # Convert visibility to integers (database expects 0, 1, or 2). Exact
+        # halves round DOWN (toward more-occluded) — see _fuse_confidence_weighted.
+        fused_visibility_int = np.clip(
+            np.ceil(fused_visibility - 0.5), 0, 2
+        ).astype(np.int32)
 
         # Create fused result (pre-allocate for performance)
+        # Column 2 carries genuine [0,1] confidence, not [0,2] visibility — see
+        # _fuse_confidence_weighted for why this distinction is load-bearing.
         fused_keypoints_with_conf = np.empty((num_keypoints, 3), dtype=np.float32)
         fused_keypoints_with_conf[:, :2] = fused_keypoints
-        fused_keypoints_with_conf[:, 2] = fused_visibility
+        fused_keypoints_with_conf[:, 2] = np.clip(fused_kp_conf, 0.0, 1.0)
 
         fused = PoseResult(
             keypoints=fused_keypoints_with_conf,
@@ -529,6 +536,7 @@ class EnsembleDetector:
 
         # Initialize arrays
         fused_keypoints = np.zeros((num_keypoints, 2), dtype=np.float32)
+        fused_kp_conf = np.zeros(num_keypoints, dtype=np.float32)
         total_confidence = np.zeros(num_keypoints, dtype=np.float32)
 
         # Confidence-weighted averaging
@@ -541,11 +549,24 @@ class EnsembleDetector:
 
             # Accumulate weighted keypoints (extract only x,y from (133, 3) array)
             fused_keypoints += pose.keypoints[:, :2] * weights[:, np.newaxis]
+            # Real [0,1] model confidence, fused under the same weights as positions
+            fused_kp_conf += pose.keypoints[:, 2] * weights
             total_confidence += weights
 
         # Normalize by total confidence per keypoint
         # Add small epsilon to avoid division by zero
         fused_keypoints /= total_confidence[:, np.newaxis] + 1e-6
+        fused_kp_conf /= total_confidence + 1e-6
+
+        # Keypoints every model missed (zero total weight) would otherwise land
+        # at (0,0) — top-left corner — from the 0/eps division. Fall back to the
+        # plain mean position; confidence stays ~0 so downstream gates skip them.
+        zero_weight = total_confidence <= 1e-6
+        if np.any(zero_weight):
+            mean_positions = np.mean(
+                [p["pose"].keypoints[:, :2] for p in predictions], axis=0
+            )
+            fused_keypoints[zero_weight] = mean_positions[zero_weight]
 
         # Normalize visibility scores
         total_model_weight = sum(p["weight"] for p in predictions)
@@ -555,9 +576,12 @@ class EnsembleDetector:
         # Visibility ranges from 0-2, so divide by 2 to get confidence in [0, 1]
         overall_conf = float(np.mean(fused_visibility) / 2.0)
 
-        # CRITICAL: Convert visibility to integers (database expects 0, 1, or 2)
-        # Fused visibility is float, need to round and clip
-        fused_visibility_int = np.clip(np.round(fused_visibility), 0, 2).astype(np.int32)
+        # Convert visibility to integers (database expects 0, 1, or 2). Exact
+        # halves round DOWN (toward more-occluded): a 1-vs-2 model disagreement
+        # is an occlusion vote, and np.round's half-to-even would erase it.
+        fused_visibility_int = np.clip(
+            np.ceil(fused_visibility - 0.5), 0, 2
+        ).astype(np.int32)
 
         # Average bbox
         fused_bbox = np.mean([p["pose"].bbox for p in predictions], axis=0).astype(
@@ -565,9 +589,13 @@ class EnsembleDetector:
         )
 
         # Create fused result (pre-allocate for performance)
+        # Column 2 carries genuine [0,1] confidence. It was previously overwritten
+        # with [0,2] visibility, which silently doubled every downstream
+        # conf>=threshold gate (extractor 0.3, masked-distance 0.35, OKS, bbox
+        # refinement) and disabled the entire occlusion-handling stack.
         fused_keypoints_with_conf = np.empty((num_keypoints, 3), dtype=np.float32)
         fused_keypoints_with_conf[:, :2] = fused_keypoints
-        fused_keypoints_with_conf[:, 2] = fused_visibility
+        fused_keypoints_with_conf[:, 2] = np.clip(fused_kp_conf, 0.0, 1.0)
 
         fused = PoseResult(
             keypoints=fused_keypoints_with_conf,

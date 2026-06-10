@@ -595,10 +595,15 @@ class SimilarityEngine:
                     min_valid_overlap=min_valid_overlap
                 )
 
-                # Skip candidates with insufficient overlap
+                # Insufficient overlap: not enough mutual signal to mask. Fall
+                # back to the plain full-vector distance instead of dropping the
+                # candidate — a heavily occluded query previously hit this cliff
+                # for EVERY candidate and returned zero results. FAISS reports
+                # squared L2; sqrt puts the fallback on the same true-L2 scale
+                # as the masked distances it ranks against.
                 if masked_dist == float('inf'):
-                    logger.debug(f"Skipping pose {pose_id}: insufficient valid overlap ({valid_count}/{min_valid_overlap})")
-                    continue
+                    logger.debug(f"Pose {pose_id}: insufficient valid overlap ({valid_count}/{min_valid_overlap}), falling back to unmasked distance")
+                    masked_dist = float(np.sqrt(max(faiss_dist, 0.0)))
 
                 reranked_candidates.append({
                     'faiss_idx': idx,
@@ -1237,9 +1242,16 @@ class SimilarityEngine:
         if valid_count < min_valid_overlap:
             return (float('inf'), valid_count)
 
-        # Compute L2 distance on valid dimensions only
+        # Compute L2 distance on valid dimensions only, scaled to the
+        # full-dimension equivalent (RMS-preserving). Without the scaling,
+        # fewer valid dims systematically yields smaller raw distances, so
+        # heavily-occluded candidates rank above better full matches purely
+        # by having less signal to compare. _distance_to_similarity is
+        # calibrated for the full dimension count.
         diff = query_vec[valid_mask] - candidate_vec[valid_mask]
-        distance = float(np.linalg.norm(diff))
+        distance = float(np.linalg.norm(diff)) * float(
+            np.sqrt(len(query_vec) / valid_count)
+        )
 
         return (distance, valid_count)
 
@@ -1686,10 +1698,17 @@ class SimilarityEngine:
         )
         flipped_features = extractor.extract(flipped_pose)
 
-        # Search with flipped orientation
+        # Search with flipped orientation. The confidence vector must be the
+        # flipped pose's own — the extractor just computed it from the mirrored
+        # keypoints, so its left/right dims are already swapped to match the
+        # flipped feature vector. Reusing the unflipped query_confidence masked
+        # exactly the wrong side for asymmetrically occluded queries.
         flipped_results = self.search_by_feature(
             flipped_features.feature_vector,
-            query_confidence=query_confidence,  # TODO: flip confidence row order to match swapped keypoints
+            query_confidence=(
+                flipped_features.feature_confidence
+                if query_confidence is not None else None
+            ),
             k=k_per_search,
             **search_kwargs
         )

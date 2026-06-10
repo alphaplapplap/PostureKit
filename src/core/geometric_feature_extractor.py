@@ -82,6 +82,12 @@ class GeometricFeatureExtractor:
         normalize: Whether to normalize features to [0, 1] range
     """
 
+    # Weight of the binary occlusion-pattern dims (45-51) in the normalized
+    # vector. At 1.0 a single flipped flag contributes the same squared L2 as a
+    # 180-degree joint-angle error and dominates the metric; 0.25 makes it
+    # equivalent to a 45-degree difference — informative, not dominant.
+    OCCLUSION_FLAG_WEIGHT = 0.25
+
     # Keypoint indices (RTMW-L 133-keypoint model)
     KEYPOINT_NOSE = 0
     KEYPOINT_LEFT_EYE = 1
@@ -245,17 +251,27 @@ class GeometricFeatureExtractor:
                 vis = float(self._current_visibility[idx])
                 conf = keypoints[idx, 2]
 
+                # Scale trust by visibility: an occluded-but-inferred keypoint
+                # (vis=1) keeps its geometry in the feature VALUE but loses most
+                # of its confidence — the model's raw score on hallucinated
+                # keypoints stays high under occlusion (measured ~0.9), so
+                # confidence alone cannot gate them; visibility is the more
+                # sensitive signal. Squared so vis=1 gives trust 0.25: a typical
+                # 0.9-confidence hallucination lands at ~0.22, below the default
+                # 0.35 masked-search gate, while vis=2 keypoints are untouched.
+                vis_trust = (min(vis, 2.0) / 2.0) ** 2
+
                 if self.use_occluded_keypoints:
                     # Accept occluded or better (vis >= 1.0)
                     if vis >= 1.0 and conf >= self.confidence_threshold:
-                        confidences.append(conf)
+                        confidences.append(conf * vis_trust)
                     else:
                         return 0.0  # Invalid keypoint, feature is unreliable
                 else:
                     # Accept only mostly visible keypoints (vis >= 1.5)
                     # This excludes purely occluded (vis=1.0) but includes partially visible
                     if vis >= 1.5 and conf >= self.confidence_threshold:
-                        confidences.append(conf)
+                        confidences.append(conf * vis_trust)
                     else:
                         return 0.0
             else:
@@ -347,7 +363,9 @@ class GeometricFeatureExtractor:
             - ratios_dict: Limb ratio features (default 0.25 if missing)
             - confidence_dict: Confidence per ratio (0.0 if any endpoint invalid)
         """
-        body_height = self._calculate_body_height(keypoints) or 100.0
+        body_height = self._calculate_body_height(keypoints)
+        height_valid = body_height is not None
+        body_height = body_height or 100.0
 
         # Get keypoints
         l_shoulder = self._get_keypoint(keypoints, self.KEYPOINT_LEFT_SHOULDER)
@@ -392,6 +410,13 @@ class GeometricFeatureExtractor:
             'shoulder_width': self._get_keypoint_confidence(keypoints, [self.KEYPOINT_LEFT_SHOULDER, self.KEYPOINT_RIGHT_SHOULDER]),
             'hip_width': self._get_keypoint_confidence(keypoints, [self.KEYPOINT_LEFT_HIP, self.KEYPOINT_RIGHT_HIP]),
         }
+
+        # Without a measurable body height (nose + an ankle), every ratio is
+        # scaled by the 100px fallback — the values are scale-corrupted even
+        # when their endpoint keypoints are confident. Zero the confidences so
+        # masked search ignores them.
+        if not height_valid:
+            confidences = {k: 0.0 for k in confidences}
 
         return ratios, confidences
 
@@ -496,8 +521,16 @@ class GeometricFeatureExtractor:
             - symmetry_dict: Symmetry features (0 = symmetric, 1 = asymmetric)
             - confidence_dict: Confidence per symmetry (min of left & right confidences)
         """
-        def symmetry(left_val, right_val):
-            """Calculate symmetry score (0 = perfect symmetry)."""
+        def symmetry(left_val, right_val, left_conf, right_conf):
+            """Calculate symmetry score (0 = perfect symmetry).
+
+            When either side is invalid (confidence 0), its value is an imputed
+            default — comparing it against the real side produces a full-range
+            garbage score. Return neutral 0.0 instead; the paired confidence
+            (min of both sides) is already 0 so masked search ignores the dim.
+            """
+            if left_conf <= 0.0 or right_conf <= 0.0:
+                return 0.0
             if left_val == 0 and right_val == 0:
                 return 0.0
             return abs(left_val - right_val) / (abs(left_val) + abs(right_val) + 1e-6)
@@ -505,35 +538,51 @@ class GeometricFeatureExtractor:
         scores = {
             'elbow_symmetry': symmetry(
                 joint_angles['left_elbow'],
-                joint_angles['right_elbow']
+                joint_angles['right_elbow'],
+                angle_confidences['left_elbow'],
+                angle_confidences['right_elbow']
             ),
             'shoulder_symmetry': symmetry(
                 joint_angles['left_shoulder'],
-                joint_angles['right_shoulder']
+                joint_angles['right_shoulder'],
+                angle_confidences['left_shoulder'],
+                angle_confidences['right_shoulder']
             ),
             'hip_symmetry': symmetry(
                 joint_angles['left_hip'],
-                joint_angles['right_hip']
+                joint_angles['right_hip'],
+                angle_confidences['left_hip'],
+                angle_confidences['right_hip']
             ),
             'knee_symmetry': symmetry(
                 joint_angles['left_knee'],
-                joint_angles['right_knee']
+                joint_angles['right_knee'],
+                angle_confidences['left_knee'],
+                angle_confidences['right_knee']
             ),
             'upper_arm_length_symmetry': symmetry(
                 limb_ratios['left_upper_arm'],
-                limb_ratios['right_upper_arm']
+                limb_ratios['right_upper_arm'],
+                ratio_confidences['left_upper_arm'],
+                ratio_confidences['right_upper_arm']
             ),
             'forearm_length_symmetry': symmetry(
                 limb_ratios['left_forearm'],
-                limb_ratios['right_forearm']
+                limb_ratios['right_forearm'],
+                ratio_confidences['left_forearm'],
+                ratio_confidences['right_forearm']
             ),
             'thigh_length_symmetry': symmetry(
                 limb_ratios['left_thigh'],
-                limb_ratios['right_thigh']
+                limb_ratios['right_thigh'],
+                ratio_confidences['left_thigh'],
+                ratio_confidences['right_thigh']
             ),
             'shin_length_symmetry': symmetry(
                 limb_ratios['left_shin'],
-                limb_ratios['right_shin']
+                limb_ratios['right_shin'],
+                ratio_confidences['left_shin'],
+                ratio_confidences['right_shin']
             ),
         }
 
@@ -593,43 +642,48 @@ class GeometricFeatureExtractor:
         Returns:
             Binary array (7,) indicating region visibility
         """
-        # Check visibility of major regions (use visibility flags directly)
+        # Check visibility of major regions. >= 1.5 rather than == 2: same
+        # semantics for integer visibility, robust to continuous values from
+        # ensemble fusion or stored float arrays.
+        def vis(idx):
+            return float(visibility[idx]) >= 1.5
+
         head_visible = (
-            visibility[self.KEYPOINT_NOSE] == 2 or
-            visibility[self.KEYPOINT_LEFT_EYE] == 2 or
-            visibility[self.KEYPOINT_RIGHT_EYE] == 2
+            vis(self.KEYPOINT_NOSE) or
+            vis(self.KEYPOINT_LEFT_EYE) or
+            vis(self.KEYPOINT_RIGHT_EYE)
         )
 
         left_arm_visible = (
-            visibility[self.KEYPOINT_LEFT_SHOULDER] == 2 and
-            visibility[self.KEYPOINT_LEFT_ELBOW] == 2
+            vis(self.KEYPOINT_LEFT_SHOULDER) and
+            vis(self.KEYPOINT_LEFT_ELBOW)
         )
 
         right_arm_visible = (
-            visibility[self.KEYPOINT_RIGHT_SHOULDER] == 2 and
-            visibility[self.KEYPOINT_RIGHT_ELBOW] == 2
+            vis(self.KEYPOINT_RIGHT_SHOULDER) and
+            vis(self.KEYPOINT_RIGHT_ELBOW)
         )
 
         torso_visible = (
-            visibility[self.KEYPOINT_LEFT_SHOULDER] == 2 and
-            visibility[self.KEYPOINT_RIGHT_SHOULDER] == 2 and
-            visibility[self.KEYPOINT_LEFT_HIP] == 2 and
-            visibility[self.KEYPOINT_RIGHT_HIP] == 2
+            vis(self.KEYPOINT_LEFT_SHOULDER) and
+            vis(self.KEYPOINT_RIGHT_SHOULDER) and
+            vis(self.KEYPOINT_LEFT_HIP) and
+            vis(self.KEYPOINT_RIGHT_HIP)
         )
 
         left_leg_visible = (
-            visibility[self.KEYPOINT_LEFT_HIP] == 2 and
-            visibility[self.KEYPOINT_LEFT_KNEE] == 2
+            vis(self.KEYPOINT_LEFT_HIP) and
+            vis(self.KEYPOINT_LEFT_KNEE)
         )
 
         right_leg_visible = (
-            visibility[self.KEYPOINT_RIGHT_HIP] == 2 and
-            visibility[self.KEYPOINT_RIGHT_KNEE] == 2
+            vis(self.KEYPOINT_RIGHT_HIP) and
+            vis(self.KEYPOINT_RIGHT_KNEE)
         )
 
         feet_visible = (
-            visibility[self.KEYPOINT_LEFT_ANKLE] == 2 or
-            visibility[self.KEYPOINT_RIGHT_ANKLE] == 2
+            vis(self.KEYPOINT_LEFT_ANKLE) or
+            vis(self.KEYPOINT_RIGHT_ANKLE)
         )
 
         return np.array([
@@ -743,11 +797,23 @@ class GeometricFeatureExtractor:
         vector = np.array(features, dtype=np.float32)
         confidence_vector = np.array(confidences, dtype=np.float32)
 
-        # Normalize to [0, 1] if requested
+        # Normalize to [0, 1] if requested. Each block gets its own transform —
+        # the old single `vector[:45] /= 180` also divided the limb-ratio and
+        # symmetry dims (already ~[0,1]) by 180, crushing 18 of 52 dims to
+        # numerical irrelevance, and clipped every negative body angle to 0.
         if self.normalize:
-            # Normalize angles to [0, 1] (divide by 180)
-            vector[:45] = np.clip(vector[:45] / 180.0, 0.0, 1.0)
-            # Symmetry and occlusion already in [0, 1]
+            # Joint angles (0-11): 0..180 degrees
+            vector[0:12] = np.clip(vector[0:12] / 180.0, 0.0, 1.0)
+            # Limb ratios (12-21): body-height fractions, already ~[0,1]
+            vector[12:22] = np.clip(vector[12:22], 0.0, 1.0)
+            # Body angles (22-36): signed -180..180 from vertical; map so the
+            # sign survives (0 degrees -> 0.5, the missing-keypoint default)
+            vector[22:37] = np.clip((vector[22:37] + 180.0) / 360.0, 0.0, 1.0)
+            # Symmetry (37-44): already [0,1] by construction
+            # Occlusion flags (45-51): binary; down-weighted so one mismatched
+            # flag costs the same squared distance as a 45-degree joint-angle
+            # difference instead of a 180-degree one
+            vector[45:52] = vector[45:52] * self.OCCLUSION_FLAG_WEIGHT
 
         return vector, confidence_vector
 
