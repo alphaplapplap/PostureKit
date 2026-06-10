@@ -712,6 +712,53 @@ class PythonBridgeSubprocess {
         return true
     }
 
+    // MARK: - Corpus Re-detection
+
+    /// Re-runs detection on every indexed image with the current detection
+    /// pipeline, replacing stored poses EXCEPT manually corrected ones (new
+    /// detections overlapping a corrected pose are dropped). Streams the same
+    /// IndexProgress protocol as directory indexing and rebuilds the FAISS
+    /// index at the end. Blocks until the run finishes — call from a
+    /// background queue. Cancellable via cancelIndexing(); completed images
+    /// keep their new detections on cancel.
+    func redetectAllImages(progressCallback: @escaping (IndexProgress) -> Void) {
+        // Read detector settings from UserDefaults (same as detectAllPoses)
+        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
+        let fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
+        let useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
+        let (threads, useGPU) = getThreadSettings()
+        let device = useGPU ? "mps" : "cpu"
+
+        let poseModelsParam: String
+        if poseModel == "ensemble" {
+            poseModelsParam = "[\"rtmw-l\", \"rtmw-x\"]"
+        } else {
+            poseModelsParam = "\"\(poseModel)\""
+        }
+
+        print("[REDETECT] Starting corpus re-detection: poseModel=\(poseModel), device=\(device)")
+
+        let script = """
+        import sys
+        sys.path.insert(0, '\(venvSitePackages)')
+        sys.path.insert(0, '\(projectPath)')
+        from src.swift_bridge import PostureKitBridge
+
+        print('DEBUG: Initializing bridge for corpus re-detection', file=sys.stderr, flush=True)
+        bridge = PostureKitBridge(
+            pose_models=\(poseModelsParam),
+            fusion_method='\(fusionMethod)',
+            use_two_stage=\(pythonBool(useTwoStage)),
+            num_threads=\(threads),
+            device='\(device)'
+        )
+        result = bridge.redetect_all_images()
+        print(f'DEBUG: Re-detection complete: {result}', file=sys.stderr, flush=True)
+        """
+
+        runPythonScriptWithProgress(script, progressCallback: progressCallback)
+    }
+
     // MARK: - Index Statistics
     func getIndexStatistics() -> Int {
         let (threads, useGPU) = getThreadSettings()

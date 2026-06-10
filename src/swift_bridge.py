@@ -928,6 +928,338 @@ class PostureKitBridge:
             ]
         return len(image_files)
 
+    @staticmethod
+    def _bbox_iou_xywh(a, b) -> float:
+        """IoU of two [x, y, w, h] boxes."""
+        ax1, ay1, ax2, ay2 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+        bx1, by1, bx2, by2 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+        iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = iw * ih
+        union = a[2] * a[3] + b[2] * b[3] - inter
+        return inter / union if union > 0 else 0.0
+
+    def redetect_all_images(
+        self,
+        min_confidence: float = 0.3,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Re-run detection on every indexed image with the current pipeline.
+
+        Replaces each image's existing poses with fresh detections, EXCEPT
+        manually corrected poses (is_corrected=True), which are preserved —
+        new detections overlapping a preserved pose (IoU >= 0.45) are dropped
+        so corrected people aren't duplicated. An image's old poses are only
+        deleted after detection on it succeeds, so a crash mid-run leaves
+        every image either fully old or fully new, never empty.
+
+        Emits the same PROGRESS stdout protocol as index_directory (Swift
+        parses it with the existing IndexProgress machinery) and rebuilds the
+        FAISS index once at the end.
+
+        Args:
+            min_confidence: Minimum overall pose confidence to store
+            limit: Optional cap on number of images (validation runs)
+
+        Returns:
+            Summary dict with totals.
+        """
+        import sys
+        import cv2
+        from src.storage.models import Image as ImageModel, PoseDetection
+        from src.core.image_ingestor import ImageMetadata
+        from src.utils.image_utils import ImageUtils
+
+        with self.storage_manager.session_scope() as session:
+            rows = [
+                (r[0], r[1])
+                for r in session.query(ImageModel.id, ImageModel.file_path)
+                .order_by(ImageModel.created_at)
+                .all()
+            ]
+
+        excluded = [f['folder_path'] for f in self.storage_manager.get_excluded_folders()]
+        if excluded:
+            rows = [r for r in rows
+                    if not self.storage_manager.is_path_excluded(r[1], excluded)]
+        if limit is not None:
+            rows = rows[:limit]
+
+        total_images = len(rows)
+        processed = poses_stored = failed = missing = preserved = deleted = 0
+        logger.info(f"Re-detection starting: {total_images} images")
+
+        for image_id, file_path in rows:
+            progress = {
+                'type': 'progress',
+                'current_file': Path(file_path).name,
+                'images_processed': processed,
+                'total_images': total_images,
+                'poses_indexed': poses_stored,
+                'failed_images': failed,
+                'skipped_images': missing,
+                'failed_index_additions': 0,
+                'progress': processed / total_images if total_images else 0.0,
+            }
+            print(f"PROGRESS:{json.dumps(progress)}", flush=True)
+
+            image_path = Path(file_path)
+            try:
+                if not image_path.exists():
+                    missing += 1
+                    processed += 1
+                    continue
+
+                image = cv2.imread(str(image_path))
+                if image is None:
+                    # Unicode-path fallback (e.g. narrow no-break spaces)
+                    data = np.fromfile(str(image_path), dtype=np.uint8)
+                    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if image is None:
+                    print(f"ERROR [Redetect Load]: {image_path.name}", file=sys.stderr, flush=True)
+                    failed += 1
+                    processed += 1
+                    continue
+                image_rgb = ImageUtils.normalize_to_rgb(image, image_path)
+
+                # Existing poses: corrected ones are preserved, the rest replaced
+                with self.storage_manager.session_scope() as session:
+                    existing = session.query(
+                        PoseDetection.id,
+                        PoseDetection.bbox,
+                        PoseDetection.is_corrected,
+                    ).filter(PoseDetection.image_id == image_id).all()
+                corrected_bboxes = [e[1] for e in existing if e[2] and e[1] is not None]
+                replace_ids = [e[0] for e in existing if not e[2]]
+                preserved += len(existing) - len(replace_ids)
+
+                if hasattr(self.detector, 'detect_multi_person'):
+                    poses = self.detector.detect_multi_person(image_rgb)
+                else:
+                    poses = self.detector.detect(image_rgb)
+                valid_poses = [p for p in poses if p.overall_confidence >= min_confidence]
+                if corrected_bboxes:
+                    valid_poses = [
+                        p for p in valid_poses
+                        if all(self._bbox_iou_xywh(p.bbox, cb) < 0.45
+                               for cb in corrected_bboxes)
+                    ]
+
+                # Detection succeeded — now safe to drop the replaced poses
+                for pid in replace_ids:
+                    if self.storage_manager.delete_pose(pid):
+                        deleted += 1
+
+                channels = image.shape[2] if len(image.shape) == 3 else 1
+                image_metadata = ImageMetadata(
+                    file_path=image_path,
+                    original_width=image.shape[1],
+                    original_height=image.shape[0],
+                    file_size_bytes=image_path.stat().st_size,
+                    channels=channels,
+                    dtype=str(image.dtype),
+                    content_hash=None,
+                )
+
+                for pose in valid_poses:
+                    extracted = self._extract_person_features(image_rgb, pose, image_path.name)
+                    if extracted is None:
+                        continue
+                    features, visual_features, fused_features, body_part_detections = extracted
+                    try:
+                        self.storage_manager.store_detection(
+                            image_path=image_path,
+                            image_metadata=image_metadata,
+                            pose_result=pose,
+                            features=features,
+                            visual_features=visual_features,
+                            fused_features=fused_features,
+                            thumbnail_bytes=None,  # keep the existing thumbnail
+                            body_part_detections=body_part_detections,
+                        )
+                        poses_stored += 1
+                    except Exception as e:
+                        logger.error(f"Redetect storage failed for {image_path.name}: {e}", exc_info=True)
+                        print(f"ERROR [Redetect Storage]: {image_path.name}: {e}", file=sys.stderr, flush=True)
+                processed += 1
+
+            except Exception as e:
+                import traceback
+                print(f"ERROR [Redetect]: {image_path}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+                logger.error(f"Redetect failed for {image_path}: {e}", exc_info=True)
+                failed += 1
+                processed += 1
+
+        # Single rebuild at the end — incremental adds would fight the deletions
+        self.similarity_engine.build_index(force_rebuild=True)
+
+        final_progress = {
+            'type': 'progress',
+            'current_file': 'Index rebuild complete',
+            'images_processed': processed,
+            'total_images': total_images,
+            'poses_indexed': poses_stored,
+            'failed_images': failed,
+            'skipped_images': missing,
+            'failed_index_additions': 0,
+            'progress': 1.0,
+        }
+        print(f"PROGRESS:{json.dumps(final_progress)}", flush=True)
+
+        summary = {
+            'total_images': total_images,
+            'processed_images': processed,
+            'poses_stored': poses_stored,
+            'poses_deleted': deleted,
+            'poses_preserved': preserved,
+            'failed_images': failed,
+            'missing_files': missing,
+        }
+        logger.info(f"Re-detection complete: {summary}")
+        return summary
+
+    def _extract_person_features(self, image_rgb, pose, image_name):
+        """Extract geometric, visual, fused, and body-part features for one
+        detected person. Shared by index_directory and redetect_all_images.
+
+        Returns (features, visual_features, fused_features, body_part_detections),
+        or None when geometric extraction fails (skip the person).
+        """
+        import sys
+        person_id = pose.person_id
+
+        # Extract geometric features
+        try:
+            features = self.feature_extractor.extract(pose)
+            logger.debug(f"Extracted geometric features for person {person_id}")
+        except Exception as e:
+            logger.error(f"Geometric feature extraction failed for person {person_id}: {e}", exc_info=True)
+            print(f"ERROR [Geometric Features]: {image_name} person {person_id}: {e}", file=sys.stderr, flush=True)
+            return None  # Skip this person
+
+        # Extract visual features from person's bbox crop (ACCURACY IMPROVEMENT)
+        visual_features = None
+        if self.visual_extractor is not None:
+            try:
+                # Crop to person's bbox for better visual features
+                x, y, w, h = [int(v) for v in pose.bbox]
+                # Ensure bbox is within image bounds
+                x = max(0, min(x, image_rgb.shape[1] - 1))
+                y = max(0, min(y, image_rgb.shape[0] - 1))
+                w = min(w, image_rgb.shape[1] - x)
+                h = min(h, image_rgb.shape[0] - y)
+
+                if w > 10 and h > 10:  # Ensure valid crop size
+                    person_crop = image_rgb[y:y+h, x:x+w]
+                    visual_features = self.visual_extractor.extract(person_crop)
+                    logger.debug(f"Extracted visual features for person {person_id} from bbox crop")
+                else:
+                    logger.warning(f"Person {person_id} bbox too small for visual feature extraction")
+            except Exception as e:
+                logger.error(f"Visual feature extraction failed for person {person_id}: {e}", exc_info=True)
+                print(f"ERROR [Visual Features]: {image_name} person {person_id}: {e}", file=sys.stderr, flush=True)
+                visual_features = None
+        else:
+            logger.debug(f"Visual features disabled")
+
+        # Fuse geometric and visual features
+        fused_features = None
+        if visual_features is not None:
+            try:
+                fused_features = self.fusion_engine.fuse(features, visual_features)
+                logger.debug(f"Fused features for person {person_id}")
+            except Exception as e:
+                logger.error(f"Feature fusion failed for person {person_id}: {e}", exc_info=True)
+                print(f"ERROR [Feature Fusion]: {image_name} person {person_id}: {e}", file=sys.stderr, flush=True)
+                fused_features = None
+
+        # Detect body parts in person's bbox crop (ACCURACY IMPROVEMENT)
+        # OPTIMIZED: Lower bbox threshold (30x30), dual-pass detection, adaptive thresholds
+        body_part_detections = []
+        if self.body_part_model != 'disabled':
+            try:
+                from src.core.body_part_detector import BodyPartDetector
+                if not hasattr(self, '_body_detector'):
+                    self._body_detector = BodyPartDetector(
+                        model_size=self.body_part_model,
+                        min_confidence=self.body_part_confidence,
+                        category_thresholds=self.body_part_thresholds
+                    )
+                    logger.info(f"Initialized BodyPartDetector: model={self.body_part_model}, adaptive_thresholds={bool(self.body_part_thresholds)}")
+
+                # Crop to person's bbox
+                x, y, w, h = [int(v) for v in pose.bbox]
+                x = max(0, min(x, image_rgb.shape[1] - 1))
+                y = max(0, min(y, image_rgb.shape[0] - 1))
+                w = min(w, image_rgb.shape[1] - x)
+                h = min(h, image_rgb.shape[0] - y)
+
+                # OPTIMIZATION 1: Lowered bbox threshold from 50x50 to 30x30
+                if w > 30 and h > 30:
+                    # Pass 1: Detect on person crop
+                    person_crop = image_rgb[y:y+h, x:x+w]
+                    body_parts_crop = self._body_detector.detect(
+                        person_crop,
+                        min_confidence=self.body_part_confidence,
+                        use_adaptive=True
+                    )
+
+                    # Adjust bbox coordinates back to original image space
+                    for part in body_parts_crop:
+                        part.bbox[0] += x  # x1
+                        part.bbox[1] += y  # y1
+                        part.bbox[2] += x  # x2
+                        part.bbox[3] += y  # y2
+
+                    body_part_detections.extend(body_parts_crop)
+
+                    # OPTIMIZATION 2: Dual-pass detection if few parts found
+                    # Run full-image detection to catch faces/distant parts
+                    if len(body_part_detections) < 2:
+                        body_parts_full = self._body_detector.detect(
+                            image_rgb,
+                            min_confidence=self.body_part_confidence * 0.8,  # Slightly lower threshold
+                            use_adaptive=True
+                        )
+
+                        # Filter to parts within person's bbox region (with 50px margin)
+                        for part in body_parts_full:
+                            part_center_x = (part.bbox[0] + part.bbox[2]) / 2
+                            part_center_y = (part.bbox[1] + part.bbox[3]) / 2
+
+                            if (x - 50 <= part_center_x <= x + w + 50 and
+                                y - 50 <= part_center_y <= y + h + 50):
+                                # Check if not already detected (avoid duplicates)
+                                is_duplicate = False
+                                for existing in body_part_detections:
+                                    # Simple overlap check
+                                    overlap_x = min(part.bbox[2], existing.bbox[2]) - max(part.bbox[0], existing.bbox[0])
+                                    overlap_y = min(part.bbox[3], existing.bbox[3]) - max(part.bbox[1], existing.bbox[1])
+                                    if overlap_x > 0 and overlap_y > 0:
+                                        overlap_area = overlap_x * overlap_y
+                                        part_area = (part.bbox[2] - part.bbox[0]) * (part.bbox[3] - part.bbox[1])
+                                        if overlap_area / part_area > 0.5:  # 50% overlap = duplicate
+                                            is_duplicate = True
+                                            break
+
+                                if not is_duplicate:
+                                    body_part_detections.append(part)
+
+                    logger.debug(f"Detected {len(body_part_detections)} body parts for person {person_id} (dual-pass, adaptive thresholds)")
+                else:
+                    logger.warning(f"Person {person_id} bbox too small for body part detection ({w}x{h} < 30x30)")
+            except ImportError as e:
+                logger.warning(f"NudeNet not available: {e}")
+            except Exception as e:
+                logger.error(f"Body part detection failed for person {person_id}: {e}", exc_info=True)
+                print(f"WARNING [Body Part Detection]: {image_name} person {person_id}: {e}", file=sys.stderr, flush=True)
+        else:
+            logger.debug(f"Body part detection disabled")
+
+
+        return (features, visual_features, fused_features, body_part_detections)
+
     def index_directory(self, directory_path: str, recursive: bool = True,
                        min_confidence: float = 0.3, skip_indexed: bool = True,
                        delete_missing: bool = False) -> Dict[str, Any]:
@@ -1152,133 +1484,10 @@ class PostureKitBridge:
                         person_id = pose.person_id
                         logger.debug(f"Processing person {person_id} in {image_path.name}")
 
-                        # Extract geometric features
-                        try:
-                            features = self.feature_extractor.extract(pose)
-                            logger.debug(f"Extracted geometric features for person {person_id}")
-                        except Exception as e:
-                            logger.error(f"Geometric feature extraction failed for person {person_id}: {e}", exc_info=True)
-                            print(f"ERROR [Geometric Features]: {image_path.name} person {person_id}: {e}", file=sys.stderr, flush=True)
-                            continue  # Skip this person
-
-                        # Extract visual features from person's bbox crop (ACCURACY IMPROVEMENT)
-                        visual_features = None
-                        if self.visual_extractor is not None:
-                            try:
-                                # Crop to person's bbox for better visual features
-                                x, y, w, h = [int(v) for v in pose.bbox]
-                                # Ensure bbox is within image bounds
-                                x = max(0, min(x, image_rgb.shape[1] - 1))
-                                y = max(0, min(y, image_rgb.shape[0] - 1))
-                                w = min(w, image_rgb.shape[1] - x)
-                                h = min(h, image_rgb.shape[0] - y)
-
-                                if w > 10 and h > 10:  # Ensure valid crop size
-                                    person_crop = image_rgb[y:y+h, x:x+w]
-                                    visual_features = self.visual_extractor.extract(person_crop)
-                                    logger.debug(f"Extracted visual features for person {person_id} from bbox crop")
-                                else:
-                                    logger.warning(f"Person {person_id} bbox too small for visual feature extraction")
-                            except Exception as e:
-                                logger.error(f"Visual feature extraction failed for person {person_id}: {e}", exc_info=True)
-                                print(f"ERROR [Visual Features]: {image_path.name} person {person_id}: {e}", file=sys.stderr, flush=True)
-                                visual_features = None
-                        else:
-                            logger.debug(f"Visual features disabled")
-
-                        # Fuse geometric and visual features
-                        fused_features = None
-                        if visual_features is not None:
-                            try:
-                                fused_features = self.fusion_engine.fuse(features, visual_features)
-                                logger.debug(f"Fused features for person {person_id}")
-                            except Exception as e:
-                                logger.error(f"Feature fusion failed for person {person_id}: {e}", exc_info=True)
-                                print(f"ERROR [Feature Fusion]: {image_path.name} person {person_id}: {e}", file=sys.stderr, flush=True)
-                                fused_features = None
-
-                        # Detect body parts in person's bbox crop (ACCURACY IMPROVEMENT)
-                        # OPTIMIZED: Lower bbox threshold (30x30), dual-pass detection, adaptive thresholds
-                        body_part_detections = []
-                        if self.body_part_model != 'disabled':
-                            try:
-                                from src.core.body_part_detector import BodyPartDetector
-                                if not hasattr(self, '_body_detector'):
-                                    self._body_detector = BodyPartDetector(
-                                        model_size=self.body_part_model,
-                                        min_confidence=self.body_part_confidence,
-                                        category_thresholds=self.body_part_thresholds
-                                    )
-                                    logger.info(f"Initialized BodyPartDetector: model={self.body_part_model}, adaptive_thresholds={bool(self.body_part_thresholds)}")
-
-                                # Crop to person's bbox
-                                x, y, w, h = [int(v) for v in pose.bbox]
-                                x = max(0, min(x, image_rgb.shape[1] - 1))
-                                y = max(0, min(y, image_rgb.shape[0] - 1))
-                                w = min(w, image_rgb.shape[1] - x)
-                                h = min(h, image_rgb.shape[0] - y)
-
-                                # OPTIMIZATION 1: Lowered bbox threshold from 50x50 to 30x30
-                                if w > 30 and h > 30:
-                                    # Pass 1: Detect on person crop
-                                    person_crop = image_rgb[y:y+h, x:x+w]
-                                    body_parts_crop = self._body_detector.detect(
-                                        person_crop,
-                                        min_confidence=self.body_part_confidence,
-                                        use_adaptive=True
-                                    )
-
-                                    # Adjust bbox coordinates back to original image space
-                                    for part in body_parts_crop:
-                                        part.bbox[0] += x  # x1
-                                        part.bbox[1] += y  # y1
-                                        part.bbox[2] += x  # x2
-                                        part.bbox[3] += y  # y2
-
-                                    body_part_detections.extend(body_parts_crop)
-
-                                    # OPTIMIZATION 2: Dual-pass detection if few parts found
-                                    # Run full-image detection to catch faces/distant parts
-                                    if len(body_part_detections) < 2:
-                                        body_parts_full = self._body_detector.detect(
-                                            image_rgb,
-                                            min_confidence=self.body_part_confidence * 0.8,  # Slightly lower threshold
-                                            use_adaptive=True
-                                        )
-
-                                        # Filter to parts within person's bbox region (with 50px margin)
-                                        for part in body_parts_full:
-                                            part_center_x = (part.bbox[0] + part.bbox[2]) / 2
-                                            part_center_y = (part.bbox[1] + part.bbox[3]) / 2
-
-                                            if (x - 50 <= part_center_x <= x + w + 50 and
-                                                y - 50 <= part_center_y <= y + h + 50):
-                                                # Check if not already detected (avoid duplicates)
-                                                is_duplicate = False
-                                                for existing in body_part_detections:
-                                                    # Simple overlap check
-                                                    overlap_x = min(part.bbox[2], existing.bbox[2]) - max(part.bbox[0], existing.bbox[0])
-                                                    overlap_y = min(part.bbox[3], existing.bbox[3]) - max(part.bbox[1], existing.bbox[1])
-                                                    if overlap_x > 0 and overlap_y > 0:
-                                                        overlap_area = overlap_x * overlap_y
-                                                        part_area = (part.bbox[2] - part.bbox[0]) * (part.bbox[3] - part.bbox[1])
-                                                        if overlap_area / part_area > 0.5:  # 50% overlap = duplicate
-                                                            is_duplicate = True
-                                                            break
-
-                                                if not is_duplicate:
-                                                    body_part_detections.append(part)
-
-                                    logger.debug(f"Detected {len(body_part_detections)} body parts for person {person_id} (dual-pass, adaptive thresholds)")
-                                else:
-                                    logger.warning(f"Person {person_id} bbox too small for body part detection ({w}x{h} < 30x30)")
-                            except ImportError as e:
-                                logger.warning(f"NudeNet not available: {e}")
-                            except Exception as e:
-                                logger.error(f"Body part detection failed for person {person_id}: {e}", exc_info=True)
-                                print(f"WARNING [Body Part Detection]: {image_path.name} person {person_id}: {e}", file=sys.stderr, flush=True)
-                        else:
-                            logger.debug(f"Body part detection disabled")
+                        extracted = self._extract_person_features(image_rgb, pose, image_path.name)
+                        if extracted is None:
+                            continue  # Geometric extraction failed; skip this person
+                        features, visual_features, fused_features, body_part_detections = extracted
 
                         # Store in database
                         try:

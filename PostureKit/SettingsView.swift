@@ -48,6 +48,9 @@ struct SettingsView: View {
                     // Excluded Folders Section
                     ExcludedFoldersSection()
 
+                    // Maintenance Section (corpus re-detection)
+                    MaintenanceSection()
+
                     // Performance Section
                     PerformanceSection(viewModel: settingsViewModel)
 
@@ -597,6 +600,81 @@ struct DisplaySection: View {
         .padding(16)
         .background(Color.gray.opacity(0.05))
         .cornerRadius(8)
+    }
+}
+
+// MARK: - Maintenance Section
+struct MaintenanceSection: View {
+    @State private var isRedetecting = false
+    @State private var progress: Double = 0
+    @State private var statusText: String?
+    @State private var showConfirm = false
+
+    private let pythonBridge = PythonBridgeSubprocess.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Maintenance")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if isRedetecting {
+                    Button("Cancel") {
+                        pythonBridge.cancelIndexing()
+                    }
+                    .font(.system(size: 12))
+                } else {
+                    Button("Re-detect All Poses...") {
+                        showConfirm = true
+                    }
+                    .font(.system(size: 12))
+                }
+            }
+
+            Text("Re-runs pose detection on every indexed image with the current detection pipeline and rebuilds the search index. Manually corrected poses are preserved. Processes the entire library — this can take many hours, and can be cancelled at any time (completed images keep their new detections).")
+                .font(.system(size: 11))
+                .foregroundColor(.gray)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if isRedetecting {
+                ProgressView(value: progress)
+            }
+
+            if let statusText = statusText {
+                Text(statusText)
+                    .font(.system(size: 11))
+                    .foregroundColor(.gray)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(16)
+        .background(Color.gray.opacity(0.05))
+        .cornerRadius(8)
+        .alert("Re-detect entire library?", isPresented: $showConfirm) {
+            Button("Re-detect", role: .destructive) { startRedetection() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Every indexed image will be re-processed with the current detection models, replacing existing poses. Manual corrections are kept. This can take many hours.")
+        }
+    }
+
+    private func startRedetection() {
+        isRedetecting = true
+        progress = 0
+        statusText = "Starting (loading models)..."
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Progress callbacks are dispatched to the main queue by the bridge
+            pythonBridge.redetectAllImages { p in
+                progress = p.progress
+                statusText = "\(p.imagesProcessed)/\(p.totalImages) images — \(p.posesIndexed) poses — \(p.currentFile)"
+            }
+            DispatchQueue.main.async {
+                isRedetecting = false
+                statusText = "Re-detection finished. Restart the app to load the updated search index."
+            }
+        }
     }
 }
 
