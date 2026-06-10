@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xcodebuild -project PostureKit.xcodeproj -scheme PostureKit build)",
+      "Bash(xcodebuild -project PostureKit.xcodeproj -scheme PostureKit build *)",
+      "Bash(venv/bin/python3 -m py_compile *)",
+      "Bash(venv/bin/python3 test_min_similarity_threshold.py)",
+      "Bash(DB_PROFILE=irl venv/bin/python3 test_min_similarity_threshold.py)",
+      "Bash(DB_PROFILE=2d venv/bin/python3 test_min_similarity_threshold.py)",
+      "Bash(DB_PROFILE=3d venv/bin/python3 test_min_similarity_threshold.py)",
+      "mcp__ccd_session_mgmt__search_session_transcripts",
+      "mcp__ccd_session_mgmt__list_sessions"
+    ]
+  }
+}

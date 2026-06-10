@@ -437,6 +437,19 @@ class SimilarityEngine:
             else 'none'
         )
 
+        # OKS inputs change the ranking entirely — the same feature vector with and
+        # without keypoints must not collide in the cache
+        kp_hash = (
+            hashlib.md5(query_keypoints.tobytes()).hexdigest()[:8]
+            if query_keypoints is not None
+            else 'none'
+        )
+        bbox_hash = (
+            hashlib.md5(query_bbox.tobytes()).hexdigest()[:8]
+            if query_bbox is not None
+            else 'none'
+        )
+
         # Log search configuration for debugging
         logger.info(f"[SEARCH] deduplicate_images={deduplicate_images}, k={k}, min_conf={min_confidence:.2f}, "
                    f"min_feat_conf={min_feature_confidence:.2f}, min_overlap={min_valid_overlap}")
@@ -446,6 +459,8 @@ class SimilarityEngine:
         cache_key = (
             query_hash,
             conf_hash,
+            kp_hash,
+            bbox_hash,
             k,
             min_confidence,
             min_feature_confidence,
@@ -610,15 +625,25 @@ class SimilarityEngine:
         # ===== OKS-BASED RE-RANKING (Optional) =====
         from src.config.settings import settings
         oks_similarity_map = {}
+        # True once OKS has replaced the distance arrays: distances are then 1-OKS in [0, 1]
+        # rather than L2, and Phase 1 must convert them to similarity accordingly.
+        oks_active = False
 
         if settings.ENABLE_OKS_METRIC and query_keypoints is not None and query_bbox is not None:
             logger.debug(f"Re-ranking using OKS metric on {len(indices[0])} candidates")
 
-            # Collect candidate pose IDs for batch loading
+            # Collect candidate pose IDs for batch loading. Candidates arrive sorted
+            # nearest-first (L2 or masked distance), so capping keeps the best N — an
+            # uncapped re-rank in threshold mode would OKS-score the entire index.
             oks_candidates = []
             for idx, dist in zip(indices[0], distances[0]):
                 if idx == -1:
                     continue
+                if len(oks_candidates) >= settings.OKS_RERANK_CANDIDATES:
+                    logger.info(
+                        f"OKS re-rank capped to top {settings.OKS_RERANK_CANDIDATES} candidates"
+                    )
+                    break
                 pose_id = UUID(self.pose_id_map[idx])
                 oks_candidates.append({'faiss_idx': idx, 'pose_id': pose_id, 'faiss_dist': dist})
 
@@ -677,7 +702,7 @@ class SimilarityEngine:
                 # Sort by OKS distance (ascending, lower = better)
                 oks_reranked.sort(key=lambda x: x['distance'])
 
-                logger.debug(f"OKS re-ranking: {len(oks_candidates)} → {len(oks_reranked)} candidates")
+                logger.info(f"OKS re-ranking: {len(oks_candidates)} → {len(oks_reranked)} candidates")
 
                 # Reconstruct indices and distances from OKS-ranked results
                 indices = np.array([[c['faiss_idx'] for c in oks_reranked[:search_k]]], dtype=np.int64)
@@ -685,6 +710,7 @@ class SimilarityEngine:
 
                 # Store OKS similarities for later inclusion in results
                 oks_similarity_map = {c['pose_id']: c['oks_similarity'] for c in oks_reranked}
+                oks_active = True
 
         # Build results with database metadata.
         #
@@ -717,7 +743,11 @@ class SimilarityEngine:
             if idx == -1:  # FAISS returns -1 for empty slots
                 continue
             dist_f = float(dist)
-            base_sim = self._distance_to_similarity(dist_f)
+            # OKS distances are already 1-OKS in [0, 1]; mapping them through the L2
+            # exp(-d/scale) curve would compress every score into [0.61, 1.0] and break
+            # threshold semantics. Either way distances ascend, so similarity descends
+            # and the floor early-stop below stays valid.
+            base_sim = (1.0 - dist_f) if oks_active else self._distance_to_similarity(dist_f)
             if min_similarity > 0.0 and base_sim < base_similarity_floor:
                 # Sorted nearest-first → every remaining candidate is also below the floor.
                 break
@@ -726,6 +756,12 @@ class SimilarityEngine:
                 break
 
         results = []
+
+        # Excluded folders filter (already-indexed images vanish from results without a
+        # re-index). MUST be loaded before the Phase 2 session opens: get_excluded_folders
+        # uses its own session_scope, and nesting it inside the active scoped session would
+        # close that session and detach every ORM object Phase 2/3 is iterating.
+        excluded_folders = [f['folder_path'] for f in self.storage.get_excluded_folders()]
 
         if candidates:
             seen_images = set()  # Track seen images for deduplication
@@ -774,6 +810,10 @@ class SimilarityEngine:
 
                     # Filter by confidence
                     if pose.overall_confidence < min_confidence:
+                        continue
+
+                    # Skip images inside excluded folders
+                    if excluded_folders and self.storage.is_path_excluded(image.file_path, excluded_folders):
                         continue
 
                     # Skip if image file no longer exists on disk
@@ -885,6 +925,15 @@ class SimilarityEngine:
                     # Stop once we have enough results (k is large in threshold mode)
                     if len(results) >= k:
                         break
+
+        # The plausibility boost multiplies each score by a per-pose factor in [0.8, 1.0],
+        # so final similarity is no longer monotonic in distance — re-sort so implausible
+        # poses sink in position, not just in score. (Top-k caveat, pre-existing: in top-k
+        # mode the len(results) >= k cut above happens in distance order, so a boosted pose
+        # just outside the buffer can't re-enter; threshold mode is unaffected since k≈ntotal.)
+        results.sort(key=lambda r: r['similarity_score'], reverse=True)
+        for rank, result_dict in enumerate(results, 1):
+            result_dict['rank'] = rank
 
         # Thread-safe cache store and eviction
         with self._cache_lock:
@@ -1286,6 +1335,8 @@ class SimilarityEngine:
         # Thighs (hip → knee)
         left_hip, right_hip = get_kp(11), get_kp(12)
         left_knee, right_knee = get_kp(13), get_kp(14)
+        left_thigh: Optional[float] = None
+        right_thigh: Optional[float] = None
         if all(v is not None for v in [left_hip, right_hip, left_knee, right_knee]):
             left_thigh = float(np.linalg.norm(left_knee - left_hip))
             right_thigh = float(np.linalg.norm(right_knee - right_hip))
@@ -1338,8 +1389,10 @@ class SimilarityEngine:
                 angle_validity_score = float(np.mean(valid_angles))
 
         # ===== 3. Body Proportion Consistency (30% weight) =====
-        # Check if body proportions make sense (torso height relative to limbs)
-        if left_hip and right_hip and left_shoulder and right_shoulder:
+        # Check if body proportions make sense (torso height relative to limbs).
+        # NOTE: these are numpy arrays / Optional floats — explicit None checks only
+        # (array truthiness raises ValueError).
+        if all(v is not None for v in [left_hip, right_hip, left_shoulder, right_shoulder]):
             # Torso length (shoulder midpoint to hip midpoint)
             shoulder_mid = (left_shoulder + right_shoulder) / 2
             hip_mid = (left_hip + right_hip) / 2
@@ -1350,7 +1403,7 @@ class SimilarityEngine:
 
             # Torso should be roughly 2-3× head size, 0.8-1.2× thigh length
             # (These are approximate human body proportions)
-            if left_thigh and right_thigh:
+            if left_thigh is not None and right_thigh is not None:
                 avg_thigh = (left_thigh + right_thigh) / 2
                 if avg_thigh > 0:
                     torso_to_thigh = torso_length / avg_thigh
@@ -1444,15 +1497,18 @@ class SimilarityEngine:
             np.full(116, 0.05, dtype=np.float32)  # Remaining 116 keypoints (hands, face, feet)
         ])
 
-        # Compute scale factor from bounding box area
-        # s = sqrt(area) normalizes by person size
+        # Canonicalize both poses into their own bbox frames (translate by bbox origin,
+        # scale by own sqrt(area)). COCO's OKS compares detections within ONE image, where
+        # translation is meaningful; across different images, identical poses at different
+        # positions/scales would score ~0 in absolute coordinates. After canonicalization
+        # distances are in normalized person-size units, so the COCO formula applies with
+        # s = 1 and the κ sigmas keep their calibrated meaning.
         query_area = query_bbox[2] * query_bbox[3]  # w * h
         candidate_area = candidate_bbox[2] * candidate_bbox[3]
-        # Use average scale between query and candidate
-        scale = float(np.sqrt((query_area + candidate_area) / 2.0))
-
-        if scale == 0:
+        if query_area <= 0 or candidate_area <= 0:
             return (float('inf'), 0.0)
+        query_scale = float(np.sqrt(query_area))
+        candidate_scale = float(np.sqrt(candidate_area))
 
         # Compute OKS
         oks_sum = 0.0
@@ -1464,14 +1520,18 @@ class SimilarityEngine:
             cand_conf = candidate_keypoints[i, 2]
 
             if query_conf >= min_confidence and cand_conf >= min_confidence:
-                # Euclidean distance between keypoints
-                dx = query_keypoints[i, 0] - candidate_keypoints[i, 0]
-                dy = query_keypoints[i, 1] - candidate_keypoints[i, 1]
+                # Euclidean distance in canonical (bbox-relative, scale-normalized) space
+                qx = (query_keypoints[i, 0] - query_bbox[0]) / query_scale
+                qy = (query_keypoints[i, 1] - query_bbox[1]) / query_scale
+                cx = (candidate_keypoints[i, 0] - candidate_bbox[0]) / candidate_scale
+                cy = (candidate_keypoints[i, 1] - candidate_bbox[1]) / candidate_scale
+                dx = qx - cx
+                dy = qy - cy
                 d_squared = dx * dx + dy * dy
 
-                # OKS contribution: exp(-d²/(2s²κ²))
+                # OKS contribution: exp(-d²/(2κ²)) — s = 1 in canonical space
                 sigma = extended_sigmas[i]
-                denominator = 2.0 * scale * scale * sigma * sigma
+                denominator = 2.0 * sigma * sigma
                 oks_contribution = np.exp(-d_squared / denominator)
 
                 oks_sum += oks_contribution
@@ -1571,6 +1631,16 @@ class SimilarityEngine:
                 **search_kwargs
             )
 
+        # OKS re-ranking is incompatible with flip search: the flipped leg would score the
+        # UNFLIPPED query keypoints against mirror-matched candidates (penalizing exactly the
+        # poses it's meant to find), and OKS distances [0, 1] are incomparable with the other
+        # leg's L2 distances at merge time. Strip the OKS inputs so both legs rank by L2.
+        # Mirrored-keypoint OKS for flip queries is future work.
+        if search_kwargs.get('query_keypoints') is not None or search_kwargs.get('query_bbox') is not None:
+            logger.info("Flip search active: OKS re-ranking disabled for this query")
+        search_kwargs = {kw: v for kw, v in search_kwargs.items()
+                         if kw not in ('query_keypoints', 'query_bbox')}
+
         # Search with normal orientation.
         # In threshold mode (min_similarity > 0) the caller wants every match above the floor,
         # so each sub-search must use the full k rather than the fixed merge-top-k.
@@ -1585,18 +1655,41 @@ class SimilarityEngine:
         # Flip keypoints and re-extract features
         flipped_keypoints = self._flip_keypoints_horizontal(keypoints)
 
-        # Extract geometric features from flipped pose
+        # Extract geometric features from flipped pose. The extractor takes a PoseResult,
+        # not a raw array — derive visibility from keypoint confidence and a tight bbox
+        # from the confident keypoints.
         from src.core.geometric_feature_extractor import GeometricFeatureExtractor
+        from src.core.pose_detector import PoseResult
+
+        flipped_vis = np.where(flipped_keypoints[:, 2] >= 0.3, 2, 0).astype(np.int64)
+        confident = flipped_keypoints[flipped_keypoints[:, 2] >= 0.3]
+        if confident.shape[0] >= 2:
+            x_min, y_min = confident[:, 0].min(), confident[:, 1].min()
+            flipped_bbox = np.array([
+                x_min, y_min,
+                confident[:, 0].max() - x_min,
+                confident[:, 1].max() - y_min
+            ], dtype=np.float64)
+        else:
+            flipped_bbox = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float64)
+        flipped_pose = PoseResult(
+            keypoints=flipped_keypoints,
+            visibility=flipped_vis,
+            bbox=flipped_bbox,
+            overall_confidence=float(flipped_keypoints[:, 2].mean()),
+            person_id=0
+        )
+
         extractor = GeometricFeatureExtractor(
             confidence_threshold=0.3,
             normalize=True
         )
-        flipped_features = extractor.extract(flipped_keypoints)
+        flipped_features = extractor.extract(flipped_pose)
 
         # Search with flipped orientation
         flipped_results = self.search_by_feature(
             flipped_features.feature_vector,
-            query_confidence=query_confidence if query_confidence is None else query_confidence,  # TODO: flip confidence too
+            query_confidence=query_confidence,  # TODO: flip confidence row order to match swapped keypoints
             k=k_per_search,
             **search_kwargs
         )
@@ -1616,15 +1709,17 @@ class SimilarityEngine:
                 result['is_flipped_match'] = True
                 merged[pose_id] = result
             else:
-                # Pose appears in both → keep better match
-                if result['distance'] < merged[pose_id]['distance']:
+                # Pose appears in both → keep better match. Compare final similarity, not
+                # distance — the plausibility boost makes score non-monotonic in distance.
+                if result['similarity_score'] > merged[pose_id]['similarity_score']:
                     result['is_flipped_match'] = True
                     merged[pose_id] = result
 
-        # Sort by similarity score and return top k
+        # Sort by final similarity score (descending) and return top k
         final_results = sorted(
             merged.values(),
-            key=lambda x: x['distance']
+            key=lambda x: x['similarity_score'],
+            reverse=True
         )[:k]
 
         # Re-assign ranks

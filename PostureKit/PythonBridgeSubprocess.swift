@@ -529,7 +529,9 @@ class PythonBridgeSubprocess {
         deduplicateImages: Bool = false,
         minRegionConfidence: Double = 0.3,
         minSimilarity: Double = 0.0,
-        includeFlippedPoses: Bool = false
+        includeFlippedPoses: Bool = false,
+        queryKeypoints: [[Double]]? = nil,
+        queryBbox: [Double]? = nil
     ) -> [SearchResult] {
         // Debug logging
         print("[SWIFT SEARCH DEBUG] Feature vector length: \(featureVector.count)")
@@ -564,6 +566,15 @@ class PythonBridgeSubprocess {
 
         if let regions = requiredRegions, !regions.isEmpty {
             params["required_regions"] = regions
+        }
+
+        // Query pose geometry enables OKS re-ranking (and flip search) server-side;
+        // omitted for stored-vector/browse searches, where the engine falls back to L2.
+        if let keypoints = queryKeypoints, !keypoints.isEmpty {
+            params["query_keypoints"] = keypoints
+        }
+        if let bbox = queryBbox, bbox.count == 4 {
+            params["query_bbox"] = bbox
         }
 
         let command: [String: Any] = [
@@ -649,6 +660,56 @@ class PythonBridgeSubprocess {
 
         print("[BROWSE DEBUG] Received \(resultsArray.count) results from server")
         return resultsArray.compactMap { parseSearchResult(from: $0) }
+    }
+
+    // MARK: - Excluded Folders
+
+    /// One excluded folder as returned by the search server.
+    struct ExcludedFolderEntry: Identifiable {
+        let id: String
+        let folderPath: String
+        let notes: String?
+    }
+
+    func listExcludedFolders() -> [ExcludedFolderEntry] {
+        let command: [String: Any] = ["command": "list_excluded_folders", "params": [:]]
+        guard let response = sendSearchServerCommand(command),
+              response["status"] as? String == "success",
+              let folders = response["folders"] as? [[String: Any]] else {
+            print("[EXCLUDED DEBUG] Failed to list excluded folders")
+            return []
+        }
+        return folders.compactMap { entry in
+            guard let id = entry["id"] as? String,
+                  let path = entry["folder_path"] as? String else { return nil }
+            return ExcludedFolderEntry(id: id, folderPath: path, notes: entry["notes"] as? String)
+        }
+    }
+
+    func addExcludedFolder(path: String) -> Bool {
+        let command: [String: Any] = [
+            "command": "add_excluded_folder",
+            "params": ["folder_path": path]
+        ]
+        guard let response = sendSearchServerCommand(command),
+              response["status"] as? String == "success" else {
+            print("[EXCLUDED DEBUG] Failed to add excluded folder: \(path)")
+            return false
+        }
+        return true
+    }
+
+    func removeExcludedFolder(path: String) -> Bool {
+        let command: [String: Any] = [
+            "command": "remove_excluded_folder",
+            "params": ["folder_path": path]
+        ]
+        guard let response = sendSearchServerCommand(command),
+              response["status"] as? String == "success" else {
+            print("[EXCLUDED DEBUG] Failed to remove excluded folder: \(path)")
+            return false
+        }
+        return true
     }
 
     // MARK: - Index Statistics
@@ -1007,17 +1068,21 @@ class PythonBridgeSubprocess {
             for i, d in enumerate(DIRECTORIES):
                 print(f'DEBUG:   [{i+1}/{len(DIRECTORIES)}] {d}', file=sys.stderr, flush=True)
 
-            # Pre-scan: count total images across all directories for unified progress denominator
-            IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+            # Pre-scan: count total images across all directories for unified progress denominator.
+            # Uses the bridge's own enumeration (classmethod — no model loading) plus the
+            # excluded-folders list, so this count can never disagree with what
+            # index_directory actually processes.
+            from src.storage.storage_manager import StorageManager
+            _count_sm = StorageManager()
+            EXCLUDED = [f['folder_path'] for f in _count_sm.get_excluded_folders()]
             def count_images(directory_path, recursive):
                 p = Path(directory_path)
                 if not p.exists():
                     return 0
-                if recursive:
-                    files = [f for f in p.rglob('*') if f.suffix.lower() in IMAGE_EXTENSIONS]
-                else:
-                    files = [f for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS]
-                return len([f for f in files if not f.name.startswith('._') and not f.name.startswith('.')])
+                files, _, _ = PostureKitBridge._enumerate_image_files(p, recursive)
+                if EXCLUDED:
+                    files = [f for f in files if not _count_sm.is_path_excluded(str(f), EXCLUDED)]
+                return len(files)
 
             grand_total_images = 0
             for d in DIRECTORIES:
@@ -1830,7 +1895,8 @@ class PythonBridgeSubprocess {
             visibleRegionsDetailed: visibleRegionsDetailed,
             keypoints: keypoints,
             bbox: bbox,
-            personId: personId
+            personId: personId,
+            isFlipped: (json["is_flipped_match"] as? Bool) ?? false
         )
     }
 

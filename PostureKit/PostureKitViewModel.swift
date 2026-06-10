@@ -127,6 +127,7 @@ class PostureKitViewModel: ObservableObject {
     private var searchInProgress: Bool = false
     private let searchQueue = DispatchQueue(label: "com.posturekit.search", qos: .userInitiated)
     private var lastSearchFeatures: [Float]? = nil
+    private var lastSearchFlip: Bool = false  // Flip setting of the last search (part of the dup-search guard)
     private var searchDebounceTimer: DispatchWorkItem? = nil
 
     // Monotonic search generation. Bumped for every new search/browse and on cancel; the
@@ -593,32 +594,12 @@ class PostureKitViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            // Decide which image to use for detection
-            let imageToDetect: NSImage
-            let shouldUpdateDisplay = self.includeFlippedPoses
+            // Flip handling now lives server-side: "Include flipped poses" drives engine flip
+            // search (both orientations searched and merged) instead of mirroring the query
+            // image before detection, so detection always runs on the original image.
+            let imageToDetect = queryImg
 
-            if self.includeFlippedPoses {
-                print("[SEARCH DEBUG] Flip enabled - flipping image before detection")
-                guard let flipped = self.flipImageHorizontally(queryImg) else {
-                    DispatchQueue.main.async {
-                        self.isDetecting = false
-                        self.errorMessage = "Failed to flip image"
-                    }
-                    return
-                }
-                imageToDetect = flipped
-
-                // Update displayed image to show the flip
-                if shouldUpdateDisplay {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.queryImage = flipped
-                    }
-                }
-            } else {
-                imageToDetect = queryImg
-            }
-
-            print("[SEARCH DEBUG] Detecting pose on \(self.includeFlippedPoses ? "flipped" : "original") image")
+            print("[SEARCH DEBUG] Detecting pose on original image")
 
             // Detect pose on the chosen image
             guard let pose = self.pythonBridge.detectPose(in: imageToDetect) else {
@@ -657,8 +638,10 @@ class PostureKitViewModel: ObservableObject {
                 self.isDetecting = false
             }
 
-            // Now perform search with extracted features
-            self.executeSearch(features: features)
+            // Now perform search with extracted features. Pass the pose directly rather
+            // than relying on self.detectedPose, whose main-async write may not have
+            // landed yet.
+            self.executeSearch(features: features, selectedPersonPose: pose)
         }
     }
 
@@ -674,14 +657,17 @@ class PostureKitViewModel: ObservableObject {
                 return
             }
 
-            // Check if this is the same feature vector (prevents duplicate search on same pose)
-            if let lastFeatures = lastSearchFeatures, lastFeatures == features.featureVector {
+            // Check if this is the same feature vector AND the same flip setting (prevents
+            // duplicate search on same pose, while letting a flip-toggle change re-search)
+            if let lastFeatures = lastSearchFeatures, lastFeatures == features.featureVector,
+               lastSearchFlip == includeFlippedPoses {
                 print("[SEARCH DEBUG] Duplicate search request for same features, skipping")
                 return
             }
 
             searchInProgress = true
             lastSearchFeatures = features.featureVector
+            lastSearchFlip = includeFlippedPoses
             shouldProceed = true
         }
         guard shouldProceed else { return }
@@ -751,7 +737,11 @@ class PostureKitViewModel: ObservableObject {
             print("  - minFeatureConfidence: \(self.minFeatureConfidence)")
             print("  - minValidOverlap: \(Int(self.minValidOverlap))")
 
-            // Perform search with the features (already from flipped image if flip was enabled).
+            // Query pose geometry (keypoints + bbox) enables OKS re-ranking and flip search
+            // server-side. Browse/stored-vector searches have no pose — the engine then falls
+            // back to plain L2 ranking automatically.
+            let queryPose = selectedPersonPose ?? self.detectedPose
+
             // minConfidence=0.0 passed to Python so pose-detection-confidence doesn't cull candidates.
             // minSimilarity is applied IN Python: it returns every pose at/above the threshold.
             let results = self.pythonBridge.searchSimilar(
@@ -764,7 +754,10 @@ class PostureKitViewModel: ObservableObject {
                 requiredRegions: bodyPartsArray,
                 deduplicateImages: !self.showMultiplePeoplePerImage,  // Inverted: true to show multiple = false to deduplicate
                 minRegionConfidence: self.minRegionConfidence,
-                minSimilarity: queryThreshold
+                minSimilarity: queryThreshold,
+                includeFlippedPoses: self.includeFlippedPoses,
+                queryKeypoints: queryPose?.keypoints,
+                queryBbox: queryPose?.bbox
             )
 
             let elapsed = Date().timeIntervalSince(startTime)

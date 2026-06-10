@@ -45,6 +45,9 @@ struct SettingsView: View {
                     // Detection Section (NEW)
                     DetectionSection(viewModel: settingsViewModel)
 
+                    // Excluded Folders Section
+                    ExcludedFoldersSection()
+
                     // Performance Section
                     PerformanceSection(viewModel: settingsViewModel)
 
@@ -594,6 +597,143 @@ struct DisplaySection: View {
         .padding(16)
         .background(Color.gray.opacity(0.05))
         .cornerRadius(8)
+    }
+}
+
+// MARK: - Excluded Folders Section
+struct ExcludedFoldersSection: View {
+    @State private var folders: [PythonBridgeSubprocess.ExcludedFolderEntry] = []
+    @State private var isLoading = false
+    @State private var lastError: String?
+
+    private let pythonBridge = PythonBridgeSubprocess.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Excluded Folders")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Button("Add Folder...") {
+                    addFolder()
+                }
+                .font(.system(size: 12))
+            }
+
+            Text("Images in these folders are skipped during indexing and hidden from all search and browse results — including images that were already indexed. Exclusions apply to the active database profile.")
+                .font(.system(size: 11))
+                .foregroundColor(.gray)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if folders.isEmpty && !isLoading {
+                Text("No excluded folders")
+                    .font(.system(size: 12))
+                    .foregroundColor(.gray.opacity(0.7))
+                    .padding(.vertical, 4)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(folders) { folder in
+                        HStack(spacing: 8) {
+                            Image(systemName: "folder.badge.minus")
+                                .font(.system(size: 11))
+                                .foregroundColor(.orange)
+                            Text(folder.folderPath)
+                                .font(.system(size: 12))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(folder.folderPath)
+                            Spacer()
+                            Button {
+                                removeFolder(folder)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.gray)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            .help("Remove from exclusions")
+                        }
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                        .background(Color.gray.opacity(0.05))
+                        .cornerRadius(4)
+                    }
+                }
+            }
+
+            if let error = lastError {
+                Text("⚠️ \(error)")
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+            }
+        }
+        .padding(16)
+        .background(Color.gray.opacity(0.05))
+        .cornerRadius(8)
+        .onAppear {
+            reload()
+        }
+    }
+
+    private func reload() {
+        isLoading = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = pythonBridge.listExcludedFolders()
+            DispatchQueue.main.async {
+                folders = result
+                isLoading = false
+            }
+        }
+    }
+
+    private func addFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Exclude"
+        panel.message = "Select folders to exclude from indexing and search results"
+
+        guard panel.runModal() == .OK else { return }
+        let paths = panel.urls.map { $0.path }
+
+        isLoading = true
+        lastError = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            var failed: [String] = []
+            for path in paths {
+                if !pythonBridge.addExcludedFolder(path: path) {
+                    failed.append(path)
+                }
+            }
+            let result = pythonBridge.listExcludedFolders()
+            DispatchQueue.main.async {
+                folders = result
+                isLoading = false
+                if !failed.isEmpty {
+                    lastError = "Failed to exclude: \(failed.joined(separator: ", "))"
+                }
+            }
+        }
+    }
+
+    private func removeFolder(_ folder: PythonBridgeSubprocess.ExcludedFolderEntry) {
+        isLoading = true
+        lastError = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = pythonBridge.removeExcludedFolder(path: folder.folderPath)
+            let result = pythonBridge.listExcludedFolders()
+            DispatchQueue.main.async {
+                folders = result
+                isLoading = false
+                if !ok {
+                    lastError = "Failed to remove \(folder.folderPath)"
+                }
+            }
+        }
     }
 }
 

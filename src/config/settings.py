@@ -200,7 +200,12 @@ class Settings:
     JOINT_WEIGHT_MINOR: float = float(os.getenv('JOINT_WEIGHT_MINOR', '0.5'))  # Hands, feet details
 
     # OKS (Object Keypoint Similarity) Metric
-    ENABLE_OKS_METRIC: bool = os.getenv('ENABLE_OKS_METRIC', 'false').lower() == 'true'
+    ENABLE_OKS_METRIC: bool = os.getenv('ENABLE_OKS_METRIC', 'true').lower() == 'true'
+    # Cap the OKS re-rank to the top-N L2 candidates. In threshold mode the candidate list
+    # is the whole index; OKS is a pure-Python 133-keypoint loop per candidate, so an uncapped
+    # re-rank takes tens of seconds at scale. Anything outside the top N nearest L2 matches
+    # is not a meaningful result anyway.
+    OKS_RERANK_CANDIDATES: int = int(os.getenv('OKS_RERANK_CANDIDATES', '1500'))
     OKS_SIGMAS: dict = {
         # Standard COCO keypoint sigmas (κ values for uncertainty)
         # Smaller sigmas = stricter matching for that keypoint
@@ -214,12 +219,16 @@ class Settings:
     }
 
     # Mirror/Flip Search
-    ENABLE_FLIP_SEARCH: bool = os.getenv('ENABLE_FLIP_SEARCH', 'false').lower() == 'true'
+    ENABLE_FLIP_SEARCH: bool = os.getenv('ENABLE_FLIP_SEARCH', 'true').lower() == 'true'
     FLIP_SEARCH_MERGE_TOP_K: int = int(os.getenv('FLIP_SEARCH_MERGE_TOP_K', '10'))  # Merge top N from each orientation
 
     # Pose Plausibility Scoring
-    ENABLE_PLAUSIBILITY_SCORING: bool = os.getenv('ENABLE_PLAUSIBILITY_SCORING', 'false').lower() == 'true'
-    PLAUSIBILITY_WEIGHT: float = float(os.getenv('PLAUSIBILITY_WEIGHT', '0.2'))  # Boost factor (0-0.5)
+    # Note: anatomical plausibility checks assume human proportions — for stylized 2d/3d art
+    # profiles, disable globally via ENABLE_PLAUSIBILITY_SCORING=false in .env.
+    ENABLE_PLAUSIBILITY_SCORING: bool = os.getenv('ENABLE_PLAUSIBILITY_SCORING', 'true').lower() == 'true'
+    # Boost factor (0-1): final = base × (0.8 + 0.2·plausibility·weight). At 1.0, anatomically
+    # perfect poses keep their score and implausible ones sink up to 20%.
+    PLAUSIBILITY_WEIGHT: float = float(os.getenv('PLAUSIBILITY_WEIGHT', '1.0'))
     PLAUSIBILITY_MIN_LIMB_SYMMETRY: float = float(os.getenv('PLAUSIBILITY_MIN_LIMB_SYMMETRY', '0.8'))  # Left ≈ Right
 
     def validate(self) -> list[str]:

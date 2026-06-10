@@ -846,6 +846,84 @@ class PostureKitBridge:
             traceback.print_exc(file=sys.stderr)
             return []
     
+    # Extensions the pipeline can actually decode (cv2.imread). HEIC/GIF are
+    # deliberately absent — OpenCV cannot read them, so listing them would just
+    # turn every iPhone photo into a "failed image".
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif'}
+
+    @classmethod
+    def _enumerate_image_files(cls, directory: 'Path', recursive: bool):
+        """
+        Enumerate indexable images under a directory.
+
+        - skips hidden files AND files inside hidden directories ('.cache/', '.git/', ...)
+        - does not follow directory symlinks (prevents loops and double-indexing aliases)
+        - tolerates unreadable subdirectories instead of aborting the whole run
+
+        Returns:
+            (sorted image paths, hidden-filtered count, unreadable-directory paths)
+        """
+        import os
+        from pathlib import Path
+
+        image_files = []
+        hidden_filtered = 0
+        error_dirs = []
+
+        if recursive:
+            def on_error(err):
+                error_dirs.append(getattr(err, 'filename', None) or str(err))
+
+            for root, dirs, files in os.walk(directory, onerror=on_error, followlinks=False):
+                # Prune hidden directories so we never descend into them
+                hidden_dirs = [d for d in dirs if d.startswith('.')]
+                if hidden_dirs:
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for name in files:
+                    path = Path(root) / name
+                    if path.suffix.lower() not in cls.IMAGE_EXTENSIONS:
+                        continue
+                    if name.startswith('.'):  # covers '._' resource forks too
+                        hidden_filtered += 1
+                        continue
+                    image_files.append(path)
+        else:
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                error_dirs.append(str(directory))
+                entries = []
+            for path in entries:
+                if path.is_dir():
+                    continue
+                if path.suffix.lower() not in cls.IMAGE_EXTENSIONS:
+                    continue
+                if path.name.startswith('.'):
+                    hidden_filtered += 1
+                    continue
+                image_files.append(path)
+
+        image_files.sort()
+        return image_files, hidden_filtered, error_dirs
+
+    def count_indexable_images(self, directory_path: str, recursive: bool = True) -> int:
+        """
+        Count images that index_directory would actually process — same enumeration,
+        same hidden/exclusion filtering — so progress totals can't drift from reality.
+        """
+        from pathlib import Path
+        directory = Path(directory_path)
+        if not directory.exists():
+            return 0
+        image_files, _, _ = self._enumerate_image_files(directory, recursive)
+        excluded_paths = [f['folder_path'] for f in self.storage_manager.get_excluded_folders()]
+        if excluded_paths:
+            image_files = [
+                f for f in image_files
+                if not self.storage_manager.is_path_excluded(str(f), excluded_paths)
+            ]
+        return len(image_files)
+
     def index_directory(self, directory_path: str, recursive: bool = True,
                        min_confidence: float = 0.3, skip_indexed: bool = True,
                        delete_missing: bool = False) -> Dict[str, Any]:
@@ -882,24 +960,26 @@ class PostureKitBridge:
             if not directory.exists():
                 raise ValueError(f"Directory does not exist: {directory_path}")
 
-            # Find image files (exclude macOS resource forks and hidden files)
-            image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-            if recursive:
-                all_files = [f for f in directory.rglob('*') if f.suffix.lower() in image_extensions]
-                image_files = [f for f in all_files
-                              if not f.name.startswith('._')
-                              and not f.name.startswith('.')]
-            else:
-                all_files = [f for f in directory.iterdir() if f.suffix.lower() in image_extensions]
-                image_files = [f for f in all_files
-                              if not f.name.startswith('._')
-                              and not f.name.startswith('.')]
+            image_files, hidden_filtered, error_dirs = self._enumerate_image_files(directory, recursive)
 
-            # Log filtering results
-            filtered_count = len(all_files) - len(image_files)
-            if filtered_count > 0:
-                import sys
-                print(f"DEBUG: Filtered out {filtered_count} hidden/resource fork files", file=sys.stderr, flush=True)
+            import sys
+            if hidden_filtered > 0:
+                print(f"DEBUG: Filtered out {hidden_filtered} hidden/resource fork files", file=sys.stderr, flush=True)
+            for err_dir in error_dirs:
+                print(f"WARNING: Skipped unreadable directory: {err_dir}", file=sys.stderr, flush=True)
+
+            # Skip files under excluded folders (exclusions also filter search results,
+            # but skipping here avoids wasting detection time on them at all)
+            excluded_paths = [f['folder_path'] for f in self.storage_manager.get_excluded_folders()]
+            if excluded_paths:
+                before_exclusion = len(image_files)
+                image_files = [
+                    f for f in image_files
+                    if not self.storage_manager.is_path_excluded(str(f), excluded_paths)
+                ]
+                excluded_count = before_exclusion - len(image_files)
+                if excluded_count > 0:
+                    print(f"DEBUG: Skipped {excluded_count} files in excluded folders", file=sys.stderr, flush=True)
 
             total_images = len(image_files)
             processed_images = 0
@@ -1323,6 +1403,11 @@ class PostureKitBridge:
         from sqlalchemy import func, and_, or_
 
         try:
+            # Load exclusions BEFORE opening the browse session — get_excluded_folders uses
+            # its own session_scope, and nesting would close the shared scoped session and
+            # detach the rows the loop below is iterating.
+            excluded_paths = [f['folder_path'] for f in self.storage_manager.get_excluded_folders()]
+
             with self.storage_manager.session_scope() as session:
                 # Build base query
                 query = session.query(
@@ -1399,7 +1484,11 @@ class PostureKitBridge:
                 from src.core.body_part_detector import BodyPartDetector
                 import base64
 
+                # Excluded-folders filter (post-limit: browse may return slightly fewer
+                # than k when exclusions overlap the sample — acceptable for browsing)
                 for idx, (image, pose, parts, avg_conf) in enumerate(results):
+                    if excluded_paths and self.storage_manager.is_path_excluded(image.file_path, excluded_paths):
+                        continue
                     # Get canonical regions from part names
                     canonical_regions = list(set(
                         BodyPartDetector.LABEL_TO_REGION.get(p, 'unknown')

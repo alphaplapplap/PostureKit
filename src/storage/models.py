@@ -472,3 +472,32 @@ class CorrectionEvent(Base):
 
     def __repr__(self):
         return f"<CorrectionEvent(id={self.id}, pose_id={self.pose_id}, correction_number={self.correction_number})>"
+
+
+class ExcludedFolder(Base):
+    """
+    Folder excluded from indexing and search results.
+
+    Files under an excluded folder are skipped during indexing, and
+    already-indexed images inside one are filtered out of search/browse
+    results (no re-index required).
+
+    Attributes:
+        id: Primary key
+        folder_path: Absolute path to the excluded folder (unique)
+        created_at: When the exclusion was added
+        notes: Optional user notes about why the folder is excluded
+    """
+    __tablename__ = 'excluded_folders'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    folder_path = Column(Text, nullable=False, unique=True)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    notes = Column(Text)
+
+    __table_args__ = (
+        Index('idx_excluded_folders_path', 'folder_path'),
+    )
+
+    def __repr__(self):
+        return f"<ExcludedFolder(id={self.id}, folder_path={self.folder_path})>"

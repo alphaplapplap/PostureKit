@@ -20,7 +20,8 @@ from sqlalchemy.pool import QueuePool
 from src.config.settings import settings
 from src.storage.models import (
     Base, Image, PoseDetection, GeometricFeatures,
-    VisualFeatures, FusedFeatures, TrainingLabel, CorrectionStatistics, CorrectionEvent
+    VisualFeatures, FusedFeatures, TrainingLabel, CorrectionStatistics, CorrectionEvent,
+    ExcludedFolder
 )
 from src.core.pose_detector import PoseResult
 from src.core.geometric_feature_extractor import GeometricFeatures as GeometricFeaturesData
@@ -981,6 +982,121 @@ class StorageManager:
             logger.error(f"Failed to delete pose {pose_id}: {e}", exc_info=True)
             raise StorageManagerError(f"Database error: {e}") from e
     
+    # ===== Excluded Folders =====
+
+    def add_excluded_folder(self, folder_path: str, notes: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Add a folder to the exclusion list (idempotent).
+
+        Args:
+            folder_path: Absolute path to the folder to exclude
+            notes: Optional user notes about why the folder is excluded
+
+        Returns:
+            Dict with the stored exclusion (id, folder_path, notes)
+        """
+        normalized = str(Path(folder_path).expanduser().resolve())
+        try:
+            with self.session_scope() as session:
+                existing = session.execute(
+                    select(ExcludedFolder).where(ExcludedFolder.folder_path == normalized)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return {'id': str(existing.id), 'folder_path': existing.folder_path,
+                            'notes': existing.notes}
+
+                folder = ExcludedFolder(folder_path=normalized, notes=notes)
+                session.add(folder)
+                session.flush()
+                logger.info(f"Added excluded folder: {normalized}")
+                return {'id': str(folder.id), 'folder_path': folder.folder_path,
+                        'notes': folder.notes}
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to add excluded folder {normalized}: {e}", exc_info=True)
+            raise StorageManagerError(f"Database error: {e}") from e
+
+    def remove_excluded_folder(self, folder_path: str) -> bool:
+        """
+        Remove a folder from the exclusion list.
+
+        Args:
+            folder_path: Path as stored (or any path resolving to it)
+
+        Returns:
+            True if removed, False if not found
+        """
+        normalized = str(Path(folder_path).expanduser().resolve())
+        try:
+            with self.session_scope() as session:
+                folder = session.execute(
+                    select(ExcludedFolder).where(ExcludedFolder.folder_path == normalized)
+                ).scalar_one_or_none()
+                if folder is None:
+                    logger.warning(f"Excluded folder not found: {normalized}")
+                    return False
+                session.delete(folder)
+                logger.info(f"Removed excluded folder: {normalized}")
+                return True
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to remove excluded folder {normalized}: {e}", exc_info=True)
+            raise StorageManagerError(f"Database error: {e}") from e
+
+    def get_excluded_folders(self) -> List[Dict[str, Any]]:
+        """
+        List all excluded folders.
+
+        Returns:
+            List of dicts with id, folder_path, notes, created_at (ISO string)
+        """
+        try:
+            with self.session_scope() as session:
+                folders = session.execute(
+                    select(ExcludedFolder).order_by(ExcludedFolder.folder_path)
+                ).scalars().all()
+                return [
+                    {
+                        'id': str(f.id),
+                        'folder_path': f.folder_path,
+                        'notes': f.notes,
+                        'created_at': f.created_at.isoformat() if f.created_at else None,
+                    }
+                    for f in folders
+                ]
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to list excluded folders: {e}", exc_info=True)
+            raise StorageManagerError(f"Database error: {e}") from e
+
+    @staticmethod
+    def is_path_under_folder(file_path: str, folder_path: str) -> bool:
+        """
+        True if file_path is folder_path or inside it.
+
+        Compares path components, so /a/bar does NOT match an exclusion of /a/b
+        (naive prefix matching would).
+        """
+        try:
+            Path(file_path).relative_to(folder_path)
+            return True
+        except ValueError:
+            return False
+
+    def is_path_excluded(self, file_path: str,
+                         excluded_folders: Optional[List[str]] = None) -> bool:
+        """
+        Check whether a file path falls under any excluded folder.
+
+        Args:
+            file_path: Path to check
+            excluded_folders: Pre-fetched folder paths (avoids a query per file
+                              in hot loops); fetched on demand when None
+
+        Returns:
+            True if the path is inside an excluded folder
+        """
+        if excluded_folders is None:
+            excluded_folders = [f['folder_path'] for f in self.get_excluded_folders()]
+        return any(self.is_path_under_folder(file_path, folder) for folder in excluded_folders)
+
     def get_statistics(self) -> Dict[str, Any]:
         """
         Get database statistics.

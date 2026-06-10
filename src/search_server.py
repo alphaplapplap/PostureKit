@@ -153,8 +153,14 @@ def handle_search(params: Dict[str, Any]) -> Dict[str, Any]:
         min_region_confidence = params.get('min_region_confidence', 0.3)
         min_similarity = params.get('min_similarity', 0.0)  # Similarity floor (0-1); 0 = top-k mode
         deduplicate_images = params.get('deduplicate_images', False)  # Default: show all people
+        # Optional OKS / flip-search inputs (absent in older requests → unchanged behavior)
+        query_keypoints = params.get('query_keypoints')  # nested 133×3 [x, y, conf]
+        query_bbox = params.get('query_bbox')            # [x, y, w, h]
+        enable_flip_search = bool(params.get('include_flipped', False))
 
-        logger.info(f"Searching with k={k}, min_confidence={min_confidence}, min_similarity={min_similarity}, deduplicate_images={deduplicate_images}")
+        logger.info(f"Searching with k={k}, min_confidence={min_confidence}, min_similarity={min_similarity}, "
+                    f"deduplicate_images={deduplicate_images}, has_keypoints={query_keypoints is not None}, "
+                    f"has_bbox={query_bbox is not None}, flip={enable_flip_search}")
         logger.info(f"About to call bridge.search_similar()...")
 
         # Perform search
@@ -168,7 +174,10 @@ def handle_search(params: Dict[str, Any]) -> Dict[str, Any]:
             required_regions=required_regions,
             min_region_confidence=min_region_confidence,
             min_similarity=min_similarity,
-            deduplicate_images=deduplicate_images
+            deduplicate_images=deduplicate_images,
+            query_keypoints=query_keypoints,
+            query_bbox=query_bbox,
+            enable_flip_search=enable_flip_search
         )
 
         logger.info(f"Search complete, found {len(results)} results")
@@ -206,6 +215,46 @@ def handle_statistics(params: Dict[str, Any]) -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Statistics failed: {e}")
+        traceback.print_exc(file=sys.stderr)
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+
+def handle_excluded_folders(params: Dict[str, Any], action: str) -> Dict[str, Any]:
+    """Handle excluded-folder management (list / add / remove)."""
+    global bridge
+
+    # Initialize bridge if not already initialized
+    if bridge is None:
+        config = params.get('config', {})
+        init_result = initialize_bridge(config)
+        if init_result['status'] != 'success':
+            return init_result
+
+    try:
+        storage = bridge.storage_manager
+        if action == 'list':
+            folders = storage.get_excluded_folders()
+            return {'status': 'success', 'folders': folders}
+        elif action == 'add':
+            folder_path = params['folder_path']
+            entry = storage.add_excluded_folder(folder_path, notes=params.get('notes'))
+            # Cached search results may contain newly-excluded images — drop them
+            bridge.similarity_engine.clear_search_cache()
+            logger.info(f"Excluded folder added: {entry['folder_path']}")
+            return {'status': 'success', 'folder': entry}
+        elif action == 'remove':
+            folder_path = params['folder_path']
+            removed = storage.remove_excluded_folder(folder_path)
+            bridge.similarity_engine.clear_search_cache()
+            logger.info(f"Excluded folder removed: {folder_path} (found={removed})")
+            return {'status': 'success', 'removed': removed}
+        else:
+            return {'status': 'error', 'message': f'Unknown excluded-folders action: {action}'}
+    except Exception as e:
+        logger.error(f"Excluded folders {action} failed: {e}")
         traceback.print_exc(file=sys.stderr)
         return {
             'status': 'error',
@@ -311,6 +360,12 @@ def main():
                 response = handle_statistics(params)
             elif cmd_type == 'browse_body_parts':
                 response = handle_browse_body_parts(params)
+            elif cmd_type == 'list_excluded_folders':
+                response = handle_excluded_folders(params, 'list')
+            elif cmd_type == 'add_excluded_folder':
+                response = handle_excluded_folders(params, 'add')
+            elif cmd_type == 'remove_excluded_folder':
+                response = handle_excluded_folders(params, 'remove')
             elif cmd_type == 'shutdown':
                 logger.info("Shutdown command received - cleaning up gracefully")
                 cleanup_gracefully()
