@@ -443,7 +443,7 @@ class RTMOPersonDetector:
         full_cands.sort(key=lambda c: c[0], reverse=True)
         legacy: List[tuple] = []
         for cand in full_cands:
-            if self._overlaps_kept(cand[3], [k[3] for k in legacy],
+            if self._suppressed_by(cand, legacy,
                                    self.iou_dedup_thr, self.containment_thr):
                 continue
             legacy.append(cand)
@@ -460,12 +460,18 @@ class RTMOPersonDetector:
             from_tile = cand[4]
             iou_thr = self.tile_iou_dedup_thr if from_tile else self.iou_dedup_thr
             cont_thr = self.tile_containment_thr if from_tile else self.containment_thr
-            if self._overlaps_kept(cand[3], [k[3] for k in kept], iou_thr, cont_thr):
+            if self._suppressed_by(cand, kept, iou_thr, cont_thr):
                 continue
             kept.append(cand)
 
         # Materialize PersonDetection with padded bbox + crop.
-        for new_id, (_, max_score, _, (x1, y1, x2, y2), _) in enumerate(kept):
+        for new_id, (_, max_score, _, (x1, y1, x2, y2), _, kpts, sc) in enumerate(kept):
+            # The keypoint-span bbox excludes occluded body regions entirely,
+            # so downstream RTMW hallucinates them inside a truncated crop.
+            # Extend toward regions whose keypoints are missing using an
+            # anatomical prior, so the crop at least contains the area where
+            # the occluded limbs are.
+            y1, y2 = self._directional_extend(kpts, sc, y1, y2)
             bw, bh = x2 - x1, y2 - y1
             x1p = max(0.0, x1 - bw * self.bbox_pad)
             y1p = max(0.0, y1 - bh * self.bbox_pad)
@@ -493,6 +499,57 @@ class RTMOPersonDetector:
         )
         return detections
 
+    # COCO-17 keypoint groups (RTMO output) for the directional bbox prior
+    HEAD_IDXS = (0, 1, 2, 3, 4)
+    SHOULDER_IDXS = (5, 6)
+    HIP_IDXS = (11, 12)
+    KNEE_IDXS = (13, 14)
+    ANKLE_IDXS = (15, 16)
+
+    def _directional_extend(
+        self,
+        kpts: np.ndarray,
+        sc: np.ndarray,
+        y1: float,
+        y2: float,
+    ) -> tuple:
+        """Extend the bbox vertically toward missing body regions.
+
+        Anatomical prior in torso-height units (shoulder line to hip line):
+        full legs ~1.2 below the hips, shins ~0.8 below the knees, head ~0.5
+        above the shoulders. Fires only when a region's keypoints are entirely
+        missing AND the pose is upright enough to measure a positive vertical
+        torso extent (lying poses keep their span). Clamping to image bounds
+        happens at materialization, so frame-cropped people are unaffected.
+        """
+        vis = sc >= self.min_kp_score
+
+        def have(idxs):
+            return bool(np.any(vis[list(idxs)]))
+
+        def mean_y(idxs):
+            ys = [float(kpts[i, 1]) for i in idxs if vis[i]]
+            return float(np.mean(ys)) if ys else None
+
+        shoulder_y = mean_y(self.SHOULDER_IDXS)
+        hip_y = mean_y(self.HIP_IDXS)
+        if shoulder_y is None or hip_y is None:
+            return y1, y2
+        torso_h = hip_y - shoulder_y
+        if torso_h <= 0:
+            return y1, y2
+
+        if not have(self.KNEE_IDXS) and not have(self.ANKLE_IDXS):
+            y2 = max(y2, hip_y + 1.2 * torso_h)
+        elif not have(self.ANKLE_IDXS):
+            knee_y = mean_y(self.KNEE_IDXS)
+            if knee_y is not None:
+                y2 = max(y2, knee_y + 0.8 * torso_h)
+        if not have(self.HEAD_IDXS):
+            y1 = min(y1, shoulder_y - 0.5 * torso_h)
+
+        return y1, y2
+
     def _collect_candidates(
         self,
         bgr_region: np.ndarray,
@@ -503,7 +560,8 @@ class RTMOPersonDetector:
         """Run RTMO on a BGR region and return quality-gated candidates with
         bboxes translated into full-image coordinates by `offset` (x, y).
 
-        Candidate tuple: (quality, max_score, visible_count, bbox_xyxy, from_tile).
+        Candidate tuple: (quality, max_score, visible_count, bbox_xyxy,
+        from_tile, kpts_full_coords, scores).
         Tiles are pixel crops, so keypoint coords are already at full-image scale;
         the quality gates (min_kp_score, min_bbox_side) keep their pixel semantics.
         `min_visible` overrides min_visible_kps (tiles use the stricter
@@ -549,8 +607,11 @@ class RTMOPersonDetector:
 
             # quality = visible_count (primary) + max_score (tie-breaker)
             quality = n_visible * 10.0 + max_score
+            kpts_full = kpts.copy()
+            kpts_full[:, 0] += ox
+            kpts_full[:, 1] += oy
             candidates.append((quality, max_score, n_visible,
-                               (x1, y1, x2, y2), from_tile))
+                               (x1, y1, x2, y2), from_tile, kpts_full, sc))
         return candidates
 
     def _generate_tiles(self, W: int, H: int) -> List[tuple]:
@@ -574,19 +635,26 @@ class RTMOPersonDetector:
             for x in starts(W)
         ]
 
-    @staticmethod
-    def _overlaps_kept(
+    def _suppressed_by(
+        self,
         cand: tuple,
-        kept_boxes: List[tuple],
+        kept: List[tuple],
         iou_thr: float,
         containment_thr: float,
     ) -> bool:
-        """Return True if `cand` (x1,y1,x2,y2) overlaps any box in `kept_boxes`
-        by IoU >= iou_thr OR is contained (intersect/cand_area) >= containment_thr.
+        """Return True if `cand` duplicates a kept detection: IoU >= iou_thr,
+        OR contained (intersect/cand_area) >= containment_thr AND its keypoints
+        lie on the keeper's body. The keypoint test disambiguates the two cases
+        a nested bbox can mean — an RTMO NMS fragment of the keeper (keypoints
+        coincide with the keeper's: suppress) vs a distinct occluded partner
+        whose visible span falls inside the occluder's box (keypoints on a
+        different body: keep). Bbox containment alone cannot tell them apart,
+        which previously suppressed nested partners silently.
         """
-        cx1, cy1, cx2, cy2 = cand
+        _, _, _, (cx1, cy1, cx2, cy2), _, c_kpts, c_sc = cand
         cand_area = max(1e-6, (cx2 - cx1) * (cy2 - cy1))
-        for kx1, ky1, kx2, ky2 in kept_boxes:
+        for k in kept:
+            _, _, _, (kx1, ky1, kx2, ky2), _, k_kpts, k_sc = k
             ix1, iy1 = max(cx1, kx1), max(cy1, ky1)
             ix2, iy2 = min(cx2, kx2), min(cy2, ky2)
             iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
@@ -599,8 +667,40 @@ class RTMOPersonDetector:
                 return True
             containment = inter / cand_area
             if containment >= containment_thr:
-                return True
+                if self._shared_kp_fraction(
+                    c_kpts, c_sc, k_kpts, k_sc, (kx1, ky1, kx2, ky2)
+                ) >= 0.5:
+                    return True
+                # Chimeric clusters (keypoints straddling two adjacent bodies)
+                # also share few keypoints with the keeper — the revival
+                # privilege additionally requires a person-shaped span.
+                # Observed FP: a 97x790 sliver (aspect 8:1) between two bodies.
+                bw, bh = cx2 - cx1, cy2 - cy1
+                if max(bw, bh) / max(1e-6, min(bw, bh)) > 4.5:
+                    return True
         return False
+
+    def _shared_kp_fraction(
+        self,
+        c_kpts: np.ndarray,
+        c_sc: np.ndarray,
+        k_kpts: np.ndarray,
+        k_sc: np.ndarray,
+        k_box: tuple,
+    ) -> float:
+        """Fraction of the candidate's visible keypoints that coincide with a
+        visible keeper keypoint (within 5% of the keeper's bbox diagonal).
+        Duplicate NMS fragments score near 1.0 (same body, near-identical
+        coordinates); a distinct nested partner scores near 0.0."""
+        c_vis = c_kpts[c_sc >= self.min_kp_score][:, :2]
+        k_vis = k_kpts[k_sc >= self.min_kp_score][:, :2]
+        if len(c_vis) == 0 or len(k_vis) == 0:
+            return 1.0  # no signal — fall back to legacy containment behavior
+        kx1, ky1, kx2, ky2 = k_box
+        radius = 0.05 * float(np.hypot(kx2 - kx1, ky2 - ky1))
+        dists = np.linalg.norm(c_vis[:, None, :] - k_vis[None, :, :], axis=2)
+        nearest = dists.min(axis=1)
+        return float((nearest <= radius).mean())
 
     def is_model_loaded(self) -> bool:
         return self.model is not None
