@@ -943,6 +943,7 @@ class PostureKitBridge:
         self,
         min_confidence: float = 0.3,
         limit: Optional[int] = None,
+        resume_since: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Re-run detection on every indexed image with the current pipeline.
 
@@ -960,12 +961,18 @@ class PostureKitBridge:
         Args:
             min_confidence: Minimum overall pose confidence to store
             limit: Optional cap on number of images (validation runs)
+            resume_since: Optional ISO timestamp — images whose newest pose was
+                created after this moment were already re-detected by an
+                interrupted run and are skipped. Pass the original run's start
+                time to resume it. (Images that yielded zero poses leave no
+                marker and are re-processed; that is correct and cheap.)
 
         Returns:
             Summary dict with totals.
         """
         import sys
         import cv2
+        from sqlalchemy import func as sa_func
         from src.storage.models import Image as ImageModel, PoseDetection
         from src.core.image_ingestor import ImageMetadata
         from src.utils.image_utils import ImageUtils
@@ -982,6 +989,29 @@ class PostureKitBridge:
         if excluded:
             rows = [r for r in rows
                     if not self.storage_manager.is_path_excluded(r[1], excluded)]
+
+        already_done = 0
+        if resume_since:
+            from datetime import datetime
+            cutoff = datetime.fromisoformat(resume_since)
+            with self.storage_manager.session_scope() as session:
+                newest = dict(
+                    session.query(
+                        PoseDetection.image_id,
+                        sa_func.max(PoseDetection.created_at),
+                    ).group_by(PoseDetection.image_id).all()
+                )
+            before = len(rows)
+            rows = [
+                r for r in rows
+                if newest.get(r[0]) is None
+                or newest[r[0]].replace(tzinfo=None) <= cutoff
+            ]
+            already_done = before - len(rows)
+            print(f"DEBUG REDETECT: resuming — {already_done} images already "
+                  f"re-detected since {resume_since}, {len(rows)} remaining",
+                  file=sys.stderr, flush=True)
+
         if limit is not None:
             rows = rows[:limit]
 
@@ -1001,6 +1031,16 @@ class PostureKitBridge:
                 'failed_index_additions': 0,
                 'progress': processed / total_images if total_images else 0.0,
             }
+            # Stdout progress AND a paired stderr heartbeat, like
+            # index_directory. The Swift reader alternates BLOCKING reads
+            # between the two pipes; a stretch of images that writes only
+            # stdout (e.g. hundreds of missing files) starves the stderr read,
+            # fills the stdout pipe, and deadlocks both processes — observed
+            # against a 626-file evicted iCloud folder. Feeding both pipes
+            # every image keeps the reader cycling.
+            print(f"DEBUG REDETECT: processed={processed}/{total_images} "
+                  f"stored={poses_stored} failed={failed} missing={missing}",
+                  file=sys.stderr, flush=True)
             print(f"PROGRESS:{json.dumps(progress)}", flush=True)
 
             image_path = Path(file_path)

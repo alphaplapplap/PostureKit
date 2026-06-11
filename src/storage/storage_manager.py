@@ -267,7 +267,9 @@ class StorageManager:
                     session.flush()  # Get visual_features_rec.id
                     logger.debug(f"Created VisualFeatures record: {visual_features_rec.id}")
                 else:
-                    logger.warning(f"Visual features NOT provided for pose {pose_detection.id}, skipping VisualFeatures record")
+                    # Expected whenever VISUAL_MODEL=disabled — not a fault.
+                    # Extraction failures are reported loudly by the bridge.
+                    logger.debug(f"Visual features not provided for pose {pose_detection.id}, skipping VisualFeatures record")
 
                 # 5. Create FusedFeatures record if provided
                 logger.debug(f"FusedFeatures creation check: fused_features={'provided' if fused_features is not None else 'None'}, visual_features_rec={'exists' if visual_features_rec is not None else 'None'}")
@@ -284,10 +286,10 @@ class StorageManager:
                     session.add(fused_features_rec)
                     logger.debug(f"Created FusedFeatures record: {fused_features_rec.id}")
                 else:
-                    logger.warning(
-                        f"FusedFeatures NOT created for pose {pose_detection.id} - "
-                        f"fused_features={'provided' if fused_features is not None else 'MISSING'}, "
-                        f"visual_features_rec={'exists' if visual_features_rec is not None else 'MISSING'}"
+                    logger.debug(
+                        f"FusedFeatures not created for pose {pose_detection.id} - "
+                        f"fused_features={'provided' if fused_features is not None else 'missing'}, "
+                        f"visual_features_rec={'exists' if visual_features_rec is not None else 'missing'}"
                     )
 
                 # 6. Create TrainingLabel record if any labels provided
@@ -336,7 +338,11 @@ class StorageManager:
                 )
 
                 if not has_fused_record:
-                    logger.warning(f"Pose {pose_detection.id} stored WITHOUT FusedFeatures record - similarity search will fail!")
+                    # Geometric-mode search (the default) builds its index from
+                    # GeometricFeatures and is unaffected; only fused-mode
+                    # search would skip this pose. The old "similarity search
+                    # will fail!" wording predates geometric mode and was wrong.
+                    logger.debug(f"Pose {pose_detection.id} stored without FusedFeatures record (fused-mode search would skip it; geometric mode unaffected)")
 
                 return pose_detection.id
 

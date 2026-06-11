@@ -721,7 +721,10 @@ class PythonBridgeSubprocess {
     /// index at the end. Blocks until the run finishes — call from a
     /// background queue. Cancellable via cancelIndexing(); completed images
     /// keep their new detections on cancel.
-    func redetectAllImages(progressCallback: @escaping (IndexProgress) -> Void) {
+    ///
+    /// resumeSince: local-time "yyyy-MM-dd HH:mm:ss" of an interrupted run's
+    /// start — images already re-detected after that moment are skipped.
+    func redetectAllImages(resumeSince: String? = nil, progressCallback: @escaping (IndexProgress) -> Void) {
         // Read detector settings from UserDefaults (same as detectAllPoses)
         let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
         let fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
@@ -736,7 +739,8 @@ class PythonBridgeSubprocess {
             poseModelsParam = "\"\(poseModel)\""
         }
 
-        print("[REDETECT] Starting corpus re-detection: poseModel=\(poseModel), device=\(device)")
+        let resumeParam = resumeSince.map { "'\($0)'" } ?? "None"
+        print("[REDETECT] Starting corpus re-detection: poseModel=\(poseModel), device=\(device), resumeSince=\(resumeSince ?? "fresh run")")
 
         let script = """
         import sys
@@ -752,7 +756,7 @@ class PythonBridgeSubprocess {
             num_threads=\(threads),
             device='\(device)'
         )
-        result = bridge.redetect_all_images()
+        result = bridge.redetect_all_images(resume_since=\(resumeParam))
         print(f'DEBUG: Re-detection complete: {result}', file=sys.stderr, flush=True)
         """
 

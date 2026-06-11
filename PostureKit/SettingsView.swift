@@ -609,8 +609,17 @@ struct MaintenanceSection: View {
     @State private var progress: Double = 0
     @State private var statusText: String?
     @State private var showConfirm = false
+    @State private var hasPartialRun = false
 
     private let pythonBridge = PythonBridgeSubprocess.shared
+
+    /// Per-profile epoch of an in-flight (possibly interrupted) re-detection
+    /// run. Set when a fresh run starts, cleared only on full completion, so
+    /// an interrupted run resumes instead of redoing finished images.
+    private var runEpochKey: String {
+        let profile = UserDefaults.standard.string(forKey: "activeProfile") ?? "irl"
+        return "redetectRunStartedAt-\(profile)"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -624,7 +633,7 @@ struct MaintenanceSection: View {
                     }
                     .font(.system(size: 12))
                 } else {
-                    Button("Re-detect All Poses...") {
+                    Button(hasPartialRun ? "Resume Re-detection..." : "Re-detect All Poses...") {
                         showConfirm = true
                     }
                     .font(.system(size: 12))
@@ -651,28 +660,50 @@ struct MaintenanceSection: View {
         .padding(16)
         .background(Color.gray.opacity(0.05))
         .cornerRadius(8)
-        .alert("Re-detect entire library?", isPresented: $showConfirm) {
-            Button("Re-detect", role: .destructive) { startRedetection() }
+        .onAppear {
+            hasPartialRun = UserDefaults.standard.string(forKey: runEpochKey) != nil
+        }
+        .alert(hasPartialRun ? "Resume re-detection?" : "Re-detect entire library?", isPresented: $showConfirm) {
+            Button(hasPartialRun ? "Resume" : "Re-detect", role: .destructive) { startRedetection() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Every indexed image will be re-processed with the current detection models, replacing existing poses. Manual corrections are kept. This can take many hours.")
+            Text(hasPartialRun
+                 ? "An earlier run was interrupted. Already re-detected images will be skipped."
+                 : "Every indexed image will be re-processed with the current detection models, replacing existing poses. Manual corrections are kept. This can take many hours.")
         }
     }
 
     private func startRedetection() {
+        let defaults = UserDefaults.standard
+        let resumeSince = defaults.string(forKey: runEpochKey)
+        if resumeSince == nil {
+            // Fresh run: record its start so an interruption can resume.
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            defaults.set(fmt.string(from: Date()), forKey: runEpochKey)
+            hasPartialRun = true
+        }
+
         isRedetecting = true
         progress = 0
-        statusText = "Starting (loading models)..."
+        statusText = resumeSince != nil ? "Resuming (loading models)..." : "Starting (loading models)..."
 
         DispatchQueue.global(qos: .userInitiated).async {
             // Progress callbacks are dispatched to the main queue by the bridge
-            pythonBridge.redetectAllImages { p in
+            pythonBridge.redetectAllImages(resumeSince: resumeSince) { p in
                 progress = p.progress
                 statusText = "\(p.imagesProcessed)/\(p.totalImages) images — \(p.posesIndexed) poses — \(p.currentFile)"
             }
             DispatchQueue.main.async {
                 isRedetecting = false
-                statusText = "Re-detection finished. Restart the app to load the updated search index."
+                if progress >= 1.0 {
+                    UserDefaults.standard.removeObject(forKey: runEpochKey)
+                    hasPartialRun = false
+                    statusText = "Re-detection finished. Restart the app to load the updated search index."
+                } else {
+                    hasPartialRun = true
+                    statusText = "Re-detection stopped — press Resume to continue where it left off."
+                }
             }
         }
     }
