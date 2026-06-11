@@ -234,6 +234,10 @@ class SimilarityEngine:
                 os.replace(str(tmp_index), str(self.index_path))
                 os.replace(str(tmp_mapping), str(self.mapping_path))
 
+                # Our in-memory index IS this save — don't self-trigger the
+                # staleness reload on the next search.
+                self._loaded_index_mtime = self._index_files_mtime()
+
                 logger.info(f"Atomically saved index with {len(self.pose_id_map)} poses")
 
             finally:
@@ -255,6 +259,37 @@ class SimilarityEngine:
         self.index = None
         self.pose_id_map = {}
         self.next_id_counter = 0
+
+    def _index_files_mtime(self):
+        """(index mtime, mapping mtime) for staleness detection, or None."""
+        try:
+            return (self.index_path.stat().st_mtime, self.mapping_path.stat().st_mtime)
+        except OSError:
+            return None
+
+    def reload_if_stale(self) -> bool:
+        """Reload the index when another process has rebuilt it on disk.
+
+        The app's resident search server loads the index once at launch; a
+        completed re-detection (or any external rebuild) replaces the files
+        and deletes the old pose rows — after which every search against the
+        in-RAM index resolves to dead pose ids and returns nothing. One stat()
+        per search keeps the server current without restarts.
+
+        Returns True if a reload happened.
+        """
+        current = self._index_files_mtime()
+        if current is None or current == getattr(self, '_loaded_index_mtime', None):
+            return False
+        logger.info("Index files changed on disk — reloading and clearing the search cache")
+        with self._index_lock:
+            # Re-check under the lock (another thread may have reloaded)
+            current = self._index_files_mtime()
+            if current == getattr(self, '_loaded_index_mtime', None):
+                return False
+            with self._cache_lock:
+                self._search_cache.clear()
+            return self.load_index()
 
     def load_index(self) -> bool:
         """
@@ -339,6 +374,7 @@ class SimilarityEngine:
                         logger.warning("Skipping index upgrade, using existing index as-is")
                         # Can't upgrade, but old index still works
                         self._loaded_clean = True
+                        self._loaded_index_mtime = self._index_files_mtime()
                         return True
 
                     base_index = faiss.IndexFlatL2(dimension)
@@ -360,6 +396,7 @@ class SimilarityEngine:
             logger.info(f"Loaded index with dimension: {self.dimension}")
 
             self._loaded_clean = True
+            self._loaded_index_mtime = self._index_files_mtime()
             return True
         except Exception as e:
             logger.error(f"Failed to load index (likely corrupted): {e}")
@@ -425,6 +462,12 @@ class SimilarityEngine:
             If confidence-aware, also includes 'valid_dimensions' key.
             If OKS-enabled, also includes 'oks_similarity' key.
         """
+        # A re-detection or external rebuild replaces the index files and
+        # deletes the old pose rows; without this check the resident search
+        # server keeps serving an in-RAM index of dead ids (= zero results)
+        # until the app restarts.
+        self.reload_if_stale()
+
         # Check cache first (creates hash from feature vector)
         import time
         import hashlib
