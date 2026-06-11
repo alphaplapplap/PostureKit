@@ -41,10 +41,16 @@ class PostureKitViewModel: ObservableObject {
     var detectedPose: PoseDetectionResult?
     var extractedFeatures: GeometricFeatures?
 
-    // Search Parameters
-    @Published var numberOfResults: Int = 20  // Page size for the results grid (NOT a result cap)
-    @Published var numberOfResultsDouble: Double = 20.0
-    @Published var showAllResults: Bool = false  // When true, show the entire result set on one page (no paging)
+    // Search Parameters — persisted across launches (write-through on change).
+    // numberOfResults shares the Settings dialog's "resultsPerPage" key so the
+    // "Show:" menu and the Settings picker stay in sync via one source of truth.
+    @Published var numberOfResults: Int = UserDefaults.standard.object(forKey: "resultsPerPage") as? Int ?? 20 {
+        didSet { UserDefaults.standard.set(numberOfResults, forKey: "resultsPerPage") }
+    }  // Page size for the results grid (NOT a result cap)
+    @Published var numberOfResultsDouble: Double = Double(UserDefaults.standard.object(forKey: "resultsPerPage") as? Int ?? 20)
+    @Published var showAllResults: Bool = UserDefaults.standard.bool(forKey: "search.showAllResults") {
+        didSet { UserDefaults.standard.set(showAllResults, forKey: "search.showAllResults") }
+    }  // When true, show the entire result set on one page (no paging)
 
     // Pagination over the cached result set (the result SET is bounded by minSimilarity, not these)
     @Published var currentPage: Int = 1        // 1-based index of the displayed page
@@ -52,28 +58,45 @@ class PostureKitViewModel: ObservableObject {
     @Published var totalResultCount: Int = 0   // results at/above the current threshold (for "N–M of T")
     // Similarity floor — THE result-set cap. Python returns every pose ≥ this; Swift paginates.
     // Default 0.5 keeps the first search fast/complete; 0.0 means "everything" (full-index scan).
-    @Published var minSimilarity: Double = 0.5
-    @Published var includeFlippedPoses: Bool = false
+    @Published var minSimilarity: Double = UserDefaults.standard.object(forKey: "search.minSimilarity") as? Double ?? 0.5 {
+        didSet { UserDefaults.standard.set(minSimilarity, forKey: "search.minSimilarity") }
+    }
+    @Published var includeFlippedPoses: Bool = UserDefaults.standard.bool(forKey: "search.includeFlippedPoses") {
+        didSet { UserDefaults.standard.set(includeFlippedPoses, forKey: "search.includeFlippedPoses") }
+    }
 
     // Body part filtering (18 specific NudeNet classes)
-    @Published var requiredBodyParts: Set<String> = []  // Can include specific classes like "FEMALE_BREAST_EXPOSED"
+    @Published var requiredBodyParts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "search.requiredBodyParts") ?? []) {
+        didSet { UserDefaults.standard.set(Array(requiredBodyParts), forKey: "search.requiredBodyParts") }
+    }  // Can include specific classes like "FEMALE_BREAST_EXPOSED"
 
-    // Category-specific confidence thresholds (18 NudeNet classes)
-    @Published var categoryThresholds: [String: Double] = [
-        "FACE_MALE": 0.20, "FACE_FEMALE": 0.20,
-        "BELLY_EXPOSED": 0.15, "BELLY_COVERED": 0.15,
-        "FEET_EXPOSED": 0.25, "FEET_COVERED": 0.25,
-        "ARMPITS_EXPOSED": 0.15, "ARMPITS_COVERED": 0.15,
-        "FEMALE_BREAST_EXPOSED": 0.35, "FEMALE_BREAST_COVERED": 0.35,
-        "MALE_BREAST_EXPOSED": 0.25,
-        "BUTTOCKS_EXPOSED": 0.25, "BUTTOCKS_COVERED": 0.25,
-        "FEMALE_GENITALIA_EXPOSED": 0.35, "FEMALE_GENITALIA_COVERED": 0.35,
-        "MALE_GENITALIA_EXPOSED": 0.35,
-        "ANUS_EXPOSED": 0.35, "ANUS_COVERED": 0.35
-    ]
+    // Category-specific confidence thresholds (18 NudeNet classes).
+    // Saved values win; the defaults fill in any classes added after the save.
+    @Published var categoryThresholds: [String: Double] = {
+        let defaults: [String: Double] = [
+            "FACE_MALE": 0.20, "FACE_FEMALE": 0.20,
+            "BELLY_EXPOSED": 0.15, "BELLY_COVERED": 0.15,
+            "FEET_EXPOSED": 0.25, "FEET_COVERED": 0.25,
+            "ARMPITS_EXPOSED": 0.15, "ARMPITS_COVERED": 0.15,
+            "FEMALE_BREAST_EXPOSED": 0.35, "FEMALE_BREAST_COVERED": 0.35,
+            "MALE_BREAST_EXPOSED": 0.25,
+            "BUTTOCKS_EXPOSED": 0.25, "BUTTOCKS_COVERED": 0.25,
+            "FEMALE_GENITALIA_EXPOSED": 0.35, "FEMALE_GENITALIA_COVERED": 0.35,
+            "MALE_GENITALIA_EXPOSED": 0.35,
+            "ANUS_EXPOSED": 0.35, "ANUS_COVERED": 0.35
+        ]
+        if let saved = UserDefaults.standard.dictionary(forKey: "search.categoryThresholds") as? [String: Double] {
+            return defaults.merging(saved) { _, savedValue in savedValue }
+        }
+        return defaults
+    }() {
+        didSet { UserDefaults.standard.set(categoryThresholds, forKey: "search.categoryThresholds") }
+    }
 
     // Browse mode state
-    @Published var browseMode: Bool = false
+    @Published var browseMode: Bool = UserDefaults.standard.bool(forKey: "search.browseMode") {
+        didSet { UserDefaults.standard.set(browseMode, forKey: "search.browseMode") }
+    }
     @Published var showThresholdSettings: Bool = false
     @Published var expandedCategories: Set<String> = ["Face", "Feet"]  // Default expanded
 
@@ -92,10 +115,18 @@ class PostureKitViewModel: ObservableObject {
 
     // Advanced Search Parameters
     @Published var kMultiplier: Double = 1.0  // DEPRECATED: Python applies intelligent multipliers (3-10×) based on search type
-    @Published var minFeatureConfidence: Double = 0.0  // Filter rebuild: bare minimum
-    @Published var minValidOverlap: Double = 0.0  // Filter rebuild: bare minimum (0/52)
-    @Published var showMultiplePeoplePerImage: Bool = false  // Show all people from multi-person images (default: deduplicate for cleaner results)
-    @Published var minRegionConfidence: Double = 0.0  // Filter rebuild: bare minimum
+    @Published var minFeatureConfidence: Double = UserDefaults.standard.object(forKey: "search.minFeatureConfidence") as? Double ?? 0.0 {
+        didSet { UserDefaults.standard.set(minFeatureConfidence, forKey: "search.minFeatureConfidence") }
+    }  // Filter rebuild: bare minimum
+    @Published var minValidOverlap: Double = UserDefaults.standard.object(forKey: "search.minValidOverlap") as? Double ?? 0.0 {
+        didSet { UserDefaults.standard.set(minValidOverlap, forKey: "search.minValidOverlap") }
+    }  // Filter rebuild: bare minimum (0/52)
+    @Published var showMultiplePeoplePerImage: Bool = UserDefaults.standard.bool(forKey: "search.showMultiplePeoplePerImage") {
+        didSet { UserDefaults.standard.set(showMultiplePeoplePerImage, forKey: "search.showMultiplePeoplePerImage") }
+    }  // Show all people from multi-person images (default: deduplicate for cleaner results)
+    @Published var minRegionConfidence: Double = UserDefaults.standard.object(forKey: "search.minRegionConfidence") as? Double ?? 0.0 {
+        didSet { UserDefaults.standard.set(minRegionConfidence, forKey: "search.minRegionConfidence") }
+    }  // Filter rebuild: bare minimum
 
     // Search Results
     @Published var searchResults: [SearchResult] = []
@@ -114,9 +145,13 @@ class PostureKitViewModel: ObservableObject {
     @Published var selectedResultIds: Set<String> = []
     private var lastSelectedIndex: Int?
 
-    // View Settings
-    @Published var viewMode: ViewMode = .grid
-    @Published var thumbnailSize: Double = 180.0
+    // View Settings — persisted across launches
+    @Published var viewMode: ViewMode = (UserDefaults.standard.string(forKey: "view.mode") == "list" ? .list : .grid) {
+        didSet { UserDefaults.standard.set(viewMode == .list ? "list" : "grid", forKey: "view.mode") }
+    }
+    @Published var thumbnailSize: Double = UserDefaults.standard.object(forKey: "view.thumbnailSize") as? Double ?? 180.0 {
+        didSet { UserDefaults.standard.set(thumbnailSize, forKey: "view.thumbnailSize") }
+    }
 
     // Loading State
     @Published var isSearching: Bool = false
@@ -129,6 +164,11 @@ class PostureKitViewModel: ObservableObject {
     private var lastSearchFeatures: [Float]? = nil
     private var lastSearchFlip: Bool = false  // Flip setting of the last search (part of the dup-search guard)
     private var searchDebounceTimer: DispatchWorkItem? = nil
+
+    // "Find More Poses Like This": when set, the active query is a STORED pose (by id)
+    // rather than locally extracted features. Threshold-lowering re-queries route through
+    // it; any fresh feature search or browse clears it. Main-thread access only.
+    private var activeQueryPoseId: String? = nil
 
     // Monotonic search generation. Bumped for every new search/browse and on cancel; the
     // result handlers only apply results whose generation is still current, so a cancelled
@@ -151,6 +191,25 @@ class PostureKitViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .indexPreloaded)
             .sink { [weak self] _ in
                 self?.handleIndexPreloaded()
+            }
+            .store(in: &cancellables)
+
+        // Excluding a folder hides its photos from the CURRENT grid immediately;
+        // new searches already filter excluded folders server-side.
+        NotificationCenter.default.publisher(for: .folderExcluded)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let folderPath = notification.object as? String else { return }
+                self?.purgeResults(under: folderPath)
+            }
+            .store(in: &cancellables)
+
+        // The Indexed Photos folder list defines which photos may appear in
+        // results; purge the grid when the list shrinks.
+        NotificationCenter.default.publisher(for: .indexedFoldersChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.purgeResultsOutsideIndexedFolders()
             }
             .store(in: &cancellables)
 
@@ -252,7 +311,13 @@ class PostureKitViewModel: ObservableObject {
     /// No-op until a search has actually been performed: on image load `extractedFeatures` is
     /// cleared and auto-detection does not set it, so this only fires after the user has searched.
     private func rerunLastSearch() {
-        if browseMode {
+        // A pose-id query owns the grid until a feature search or browse clears it,
+        // so it wins the routing regardless of the current UI mode.
+        if let poseId = activeQueryPoseId {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.executeSearchByPoseId(poseId)
+            }
+        } else if browseMode {
             guard !requiredBodyParts.isEmpty else { return }
             performBrowse()
         } else {
@@ -286,6 +351,7 @@ class PostureKitViewModel: ObservableObject {
         detectedKeypoints = nil
         detectedPose = nil
         extractedFeatures = nil
+        activeQueryPoseId = nil
 
         // Clear multi-person state
         detectedPeople = []
@@ -679,6 +745,7 @@ class PostureKitViewModel: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.isSearching = true
             self?.errorMessage = nil
+            self?.activeQueryPoseId = nil  // A fresh feature search supersedes any pose-id query
             self?.startSearchTimer()  // Start elapsed time tracking
         }
 
@@ -791,11 +858,14 @@ class PostureKitViewModel: ObservableObject {
                     }
                 }
 
-                // Python already applied the similarity threshold; just drop any whose image
-                // file vanished from disk, then cache the full set for pagination.
+                // Python already applied the similarity threshold; drop any whose image
+                // file vanished from disk or falls outside the indexed-folders scope,
+                // then cache the full set for pagination.
+                let scope = IndexViewModel.indexedFoldersScope()
                 let existingFiles = results.filter { result in
                     guard let path = result.imagePath else { return false }
                     return FileManager.default.fileExists(atPath: path)
+                        && self.isWithinIndexedFolders(path, scope: scope)
                 }
                 print("[SEARCH DEBUG] \(existingFiles.count) results at/above \(Int(queryThreshold * 100))% (of \(results.count) returned)")
 
@@ -824,11 +894,145 @@ class PostureKitViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Find More Poses Like This (search by stored pose id)
+
+    /// Right-click action on a result: run a new search using that result's STORED
+    /// pose features as the query — no re-detection. The query panel switches to the
+    /// result's image for context (detection state is cleared, so a manual Search
+    /// would re-detect it from scratch).
+    func findMorePosesLikeThis(_ result: SearchResult) {
+        searchDebounceTimer?.cancel()
+        activeQueryPoseId = result.id
+
+        // Show the source photo as the query for context. The stored pose drives the
+        // search, so no skeleton overlay / person picker state applies to it.
+        if let path = result.imagePath {
+            queryImageName = result.filename
+            poseDetected = false
+            poseConfidence = 0.0
+            detectedKeypoints = nil
+            detectedPose = nil
+            extractedFeatures = nil
+            detectedPeople = []
+            selectedPersonIndex = 0
+            multiPersonDetectionComplete = false
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let image = NSImage(contentsOfFile: path)
+                DispatchQueue.main.async {
+                    guard let self = self, self.activeQueryPoseId == result.id else { return }
+                    self.queryImage = image
+                    self.queryImageSize = image?.pixelSize
+                }
+            }
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.executeSearchByPoseId(result.id)
+        }
+    }
+
+    /// Mirror of executeSearch for a stored-pose query: same threshold/pagination
+    /// semantics, generation-gated cancel safety, and result ingestion.
+    private func executeSearchByPoseId(_ poseId: String) {
+        var shouldProceed = false
+        searchQueue.sync {
+            if searchInProgress {
+                print("[SEARCH DEBUG] Search already in progress, skipping duplicate")
+                return
+            }
+            // Clear the feature-search dup guard: once a pose-id search replaces the
+            // grid, an identical re-search of the previous feature query must not be
+            // silently skipped.
+            lastSearchFeatures = nil
+            searchInProgress = true
+            shouldProceed = true
+        }
+        guard shouldProceed else { return }
+
+        let myGeneration = bumpSearchGeneration()
+
+        DispatchQueue.main.async { [weak self] in
+            self?.isSearching = true
+            self?.errorMessage = nil
+            self?.startSearchTimer()
+        }
+
+        let startTime = Date()
+
+        searchQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            let queryThreshold = self.minSimilarity
+            let requestCount = max(self.totalPosesIndexed, 500)
+            let bodyPartsArray = self.browseMode && !self.requiredBodyParts.isEmpty ? Array(self.requiredBodyParts) : nil
+
+            print("[SEARCH DEBUG] Search by stored pose id \(poseId): k=\(requestCount), minSimilarity=\(queryThreshold)")
+
+            let results = self.pythonBridge.searchSimilarByPoseId(
+                poseId,
+                k: requestCount,
+                minConfidence: 0.0,
+                minFeatureConfidence: self.minFeatureConfidence,
+                minValidOverlap: Int(self.minValidOverlap),
+                requiredRegions: bodyPartsArray,
+                deduplicateImages: !self.showMultiplePeoplePerImage,
+                minRegionConfidence: self.minRegionConfidence,
+                minSimilarity: queryThreshold,
+                includeFlippedPoses: self.includeFlippedPoses
+            )
+
+            let elapsed = Date().timeIntervalSince(startTime)
+            self.searchInProgress = false
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+
+                guard self.isCurrentSearchGeneration(myGeneration) else {
+                    print("[SEARCH DEBUG] Ignoring \(results.count) results from a cancelled/superseded search")
+                    return
+                }
+
+                // Python already applied the similarity threshold; drop results whose
+                // image vanished from disk or falls outside the indexed-folders
+                // scope, then cache the set for pagination.
+                let scope = IndexViewModel.indexedFoldersScope()
+                let existingFiles = results.filter { result in
+                    guard let path = result.imagePath else { return false }
+                    return FileManager.default.fileExists(atPath: path)
+                        && self.isWithinIndexedFolders(path, scope: scope)
+                }
+                print("[SEARCH DEBUG] \(existingFiles.count) results at/above \(Int(queryThreshold * 100))% (of \(results.count) returned)")
+
+                self.rawResults = existingFiles
+                self.lastQueriedThreshold = queryThreshold
+                self.currentPage = 1
+                self.applyResultWindow()
+                self.searchTime = elapsed
+                self.isSearching = false
+                self.stopSearchTimer()
+
+                if self.searchResults.isEmpty {
+                    if results.isEmpty {
+                        self.errorMessage = "No poses found at/above \(Int(queryThreshold * 100))% similarity. Try lowering the threshold."
+                    } else {
+                        self.errorMessage = "No matching files on disk."
+                    }
+                } else {
+                    self.errorMessage = nil
+                }
+            }
+        }
+    }
+
     func performBrowse() {
         guard !requiredBodyParts.isEmpty else {
             errorMessage = "Select at least one body part to browse"
             return
         }
+
+        // A fresh browse supersedes any pose-id query for threshold re-query routing
+        activeQueryPoseId = nil
 
         // Tag this browse so late results from a cancelled or superseded browse are discarded.
         let myGeneration = bumpSearchGeneration()
@@ -871,8 +1075,9 @@ class PostureKitViewModel: ObservableObject {
                 }
 
                 // Browse has no similarity threshold (sorted by detection confidence), so the
-                // whole returned set is the page-able set.
-                self.rawResults = results
+                // whole returned set is the page-able set — scoped to the indexed folders.
+                let scope = IndexViewModel.indexedFoldersScope()
+                self.rawResults = results.filter { self.isWithinIndexedFolders($0.imagePath, scope: scope) }
                 self.lastQueriedThreshold = 0.0
                 self.currentPage = 1
                 self.applyResultWindow()
@@ -974,6 +1179,80 @@ class PostureKitViewModel: ObservableObject {
         lastSelectedIndex = nil
     }
 
+    /// Drop cached/displayed results inside a newly excluded folder so the
+    /// exclusion takes effect immediately, not just on the next search.
+    /// (Un-excluding has no instant counterpart: dropped entries reappear on
+    /// the next search, which includes them again server-side.)
+    private func purgeResults(under folderPath: String) {
+        let folder = URL(fileURLWithPath: folderPath).standardizedFileURL.path
+        let prefix = folder.hasSuffix("/") ? folder : folder + "/"
+        let removedIds = Set(rawResults.filter { result in
+            guard let path = result.imagePath else { return false }
+            return path.hasPrefix(prefix)
+        }.map(\.id))
+        guard !removedIds.isEmpty else { return }
+
+        rawResults.removeAll { removedIds.contains($0.id) }
+        selectedResultIds.subtract(removedIds)
+        applyResultWindow()
+        print("[EXCLUDE] Dropped \(removedIds.count) displayed result(s) under \(folder)")
+    }
+
+    /// Membership filter for the indexed-folders scope. Empty scope means the
+    /// list was cleared — don't blank the app, show everything.
+    private func isWithinIndexedFolders(_ path: String?, scope: [String]) -> Bool {
+        guard !scope.isEmpty else { return true }
+        guard let path = path else { return false }
+        return scope.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    /// The Indexed Photos folder list changed: drop displayed results that now
+    /// fall outside it. Non-destructive — storage keeps everything; re-adding
+    /// the folder brings its photos back on the next search.
+    private func purgeResultsOutsideIndexedFolders() {
+        let scope = IndexViewModel.indexedFoldersScope()
+        guard !scope.isEmpty else { return }
+        let removedIds = Set(rawResults.filter { !isWithinIndexedFolders($0.imagePath, scope: scope) }.map(\.id))
+        guard !removedIds.isEmpty else { return }
+
+        rawResults.removeAll { removedIds.contains($0.id) }
+        selectedResultIds.subtract(removedIds)
+        applyResultWindow()
+        print("[SCOPE] Dropped \(removedIds.count) displayed result(s) outside the indexed folders")
+    }
+
+    /// Keyboard navigation: select exactly the result at `index` and make it the
+    /// anchor for subsequent arrow presses (and shift-click ranges).
+    func selectResult(at index: Int) {
+        guard index >= 0 && index < searchResults.count else { return }
+        selectedResultIds = [searchResults[index].id]
+        lastSelectedIndex = index
+    }
+
+    /// Arrow-key anchor: the most recently clicked/navigated index if it still
+    /// points at a SELECTED result (pagination rebuilds searchResults, leaving
+    /// stale indexes), else the first selected result in display order.
+    var selectionAnchorIndex: Int? {
+        if let index = lastSelectedIndex, index < searchResults.count,
+           selectedResultIds.contains(searchResults[index].id) {
+            return index
+        }
+        guard !selectedResultIds.isEmpty else { return nil }
+        return searchResults.firstIndex { selectedResultIds.contains($0.id) }
+    }
+
+    /// The result whose path the breadcrumb bar shows: the most recently
+    /// clicked selected item, falling back to the first selected result in
+    /// display order (e.g. after a shift-click range or select-all).
+    var breadcrumbResult: SearchResult? {
+        guard !selectedResultIds.isEmpty else { return nil }
+        if let index = lastSelectedIndex, index < searchResults.count,
+           selectedResultIds.contains(searchResults[index].id) {
+            return searchResults[index]
+        }
+        return searchResults.first { selectedResultIds.contains($0.id) }
+    }
+
     func selectAll() {
         selectedResultIds = Set(searchResults.map { $0.id })
     }
@@ -1010,21 +1289,49 @@ class PostureKitViewModel: ObservableObject {
         return flippedImage
     }
 
-    func moveSelectedFiles(to destinationDirectory: String) -> (success: Int, failed: Int, skipped: Int) {
-        var successCount = 0
-        var failedCount = 0
-        var skippedCount = 0
-        var movedIds: Set<String> = []
-        let fileManager = FileManager.default
-
+    func moveSelectedFiles(to destinationDirectory: String,
+                           completion: @escaping (_ success: Int, _ failed: Int, _ skipped: Int) -> Void) {
+        // Snapshot on the main thread; the file IO and the stored-path server
+        // round-trip run in the background so a large batch (or a slow search
+        // server, up to its 60s timeout) can't freeze the UI.
         let selectedResults = searchResults.filter { selectedResultIds.contains($0.id) }
 
         // Normalize destination once so we can compare parent folders reliably.
         let destFolderURL = URL(fileURLWithPath: destinationDirectory).standardizedFileURL
 
+        // A destination outside the indexed-folders scope means the moved photos'
+        // paths update fine but the next search filters them out — warn below.
+        let scope = IndexViewModel.indexedFoldersScope()
+        let destinationOutsideScope = !scope.isEmpty
+            && !scope.contains { destFolderURL.path == $0 || destFolderURL.path.hasPrefix($0 + "/") }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            self.performMove(of: selectedResults, to: destFolderURL,
+                             destinationOutsideScope: destinationOutsideScope,
+                             completion: completion)
+        }
+    }
+
+    private func performMove(of selectedResults: [SearchResult], to destFolderURL: URL,
+                             destinationOutsideScope: Bool,
+                             completion: @escaping (_ success: Int, _ failed: Int, _ skipped: Int) -> Void) {
+        var successCount = 0
+        var failedCount = 0
+        var skippedCount = 0
+        var movedPaths: [String: String] = [:]  // old absolute path -> final destination path
+        let fileManager = FileManager.default
+        let destinationDirectory = destFolderURL.path
+
         for result in selectedResults {
             guard let sourcePath = result.imagePath else {
                 failedCount += 1
+                continue
+            }
+
+            // Another selected person-result in the same photo already moved the
+            // file — the path rewrite below covers this result too.
+            if movedPaths[sourcePath] != nil {
                 continue
             }
 
@@ -1054,26 +1361,50 @@ class PostureKitViewModel: ObservableObject {
 
                 try fileManager.moveItem(at: sourceURL, to: finalDestinationURL)
                 successCount += 1
-                movedIds.insert(result.id)
+                movedPaths[sourcePath] = finalDestinationURL.path
             } catch {
                 print("Failed to move \(sourcePath): \(error)")
                 failedCount += 1
             }
         }
 
-        // Prune moved results from the grid so they don't reappear for repeat moves,
-        // and clear selection. DB still references old paths but the fileExists filter
-        // on the next search will drop them.
-        if !movedIds.isEmpty {
-            DispatchQueue.main.async {
-                // Drop from the cache too, then re-paginate so page counts stay correct.
-                self.rawResults.removeAll { movedIds.contains($0.id) }
-                self.applyResultWindow()
-                self.clearSelection()
+        // Persist the new locations: one batched transaction server-side, keyed by
+        // the final destination paths (including collision-suffixed names). Only
+        // images.file_path is path-dependent — poses/FAISS are keyed by UUIDs and
+        // thumbnails live in the DB — so this keeps moved photos searchable.
+        var pathUpdateFailed = false
+        if !movedPaths.isEmpty {
+            let moves = movedPaths.map { (oldPath: $0.key, newPath: $0.value) }
+            if let update = pythonBridge.updateImagePaths(moves) {
+                print("[MOVE] Stored paths: \(update.updated) updated, \(update.missing) missing, \(update.conflicts) conflicts")
+                pathUpdateFailed = update.updated < moves.count
+            } else {
+                pathUpdateFailed = true
             }
         }
 
-        return (successCount, failedCount, skippedCount)
+        // Rewrite the moved paths in the cached results — keyed by path, so every
+        // person-result of a moved photo updates. Moved photos stay in the grid,
+        // stay selected, and remain searchable.
+        let updateFailed = pathUpdateFailed
+        DispatchQueue.main.async {
+            for index in self.rawResults.indices {
+                if let oldPath = self.rawResults[index].imagePath,
+                   let newPath = movedPaths[oldPath] {
+                    self.rawResults[index].imagePath = newPath
+                    self.rawResults[index].filename = URL(fileURLWithPath: newPath).lastPathComponent
+                }
+            }
+            if !movedPaths.isEmpty {
+                self.applyResultWindow()
+            }
+            if updateFailed {
+                self.errorMessage = "Files moved, but updating some stored paths failed — those photos will drop from results until re-added."
+            } else if destinationOutsideScope && successCount > 0 {
+                self.errorMessage = "Moved photos are outside your Indexed Folders — they'll be hidden from new searches until you add \(destFolderURL.path) in Indexed Photos."
+            }
+            completion(successCount, failedCount, skippedCount)
+        }
     }
 
     // MARK: - Keypoint Normalization Helper
@@ -1164,10 +1495,10 @@ enum IndexStatus {
 
     var description: String {
         switch self {
-        case .loading: return "Loading index..."
-        case .ready: return "Index ready"
-        case .building: return "Building index..."
-        case .error: return "Index error"
+        case .loading: return "Loading search index..."
+        case .ready: return "Search index ready"
+        case .building: return "Building search index..."
+        case .error: return "Search index error"
         }
     }
 
@@ -1185,7 +1516,7 @@ enum IndexStatus {
 struct SearchResult: Identifiable {
     let id: String
     let similarity: Int
-    let filename: String
+    var filename: String  // var: rewritten when a move renames the file (collision suffix)
     let confidence: Double
     var imagePath: String?
     var detectedAt: Date?

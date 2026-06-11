@@ -610,6 +610,116 @@ class PythonBridgeSubprocess {
         return resultsArray.compactMap { parseSearchResult(from: $0) }
     }
 
+    /// "Find more poses like this": search using a STORED pose's feature vector,
+    /// identified by its pose id. Python loads the stored vector/confidence and the
+    /// pose's keypoints/bbox (for OKS re-ranking and flip search), so the search
+    /// behaves exactly like a fresh query on that pose; the pose itself is excluded.
+    func searchSimilarByPoseId(
+        _ poseId: String,
+        k: Int = 20,
+        minConfidence: Double = 0.5,
+        minFeatureConfidence: Double = 0.35,
+        minValidOverlap: Int = 12,
+        requiredRegions: [String]? = nil,
+        deduplicateImages: Bool = false,
+        minRegionConfidence: Double = 0.3,
+        minSimilarity: Double = 0.0,
+        includeFlippedPoses: Bool = false
+    ) -> [SearchResult] {
+        print("[SWIFT SEARCH DEBUG] Search by pose id: \(poseId), k=\(k), minSimilarity=\(minSimilarity)")
+
+        let (threads, useGPU) = getThreadSettings()
+        let device = useGPU ? "mps" : "cpu"
+
+        var params: [String: Any] = [
+            "pose_id": poseId,
+            "k": k,
+            "min_confidence": minConfidence,
+            "min_feature_confidence": minFeatureConfidence,
+            "min_valid_overlap": minValidOverlap,
+            "deduplicate_images": deduplicateImages,
+            "min_region_confidence": minRegionConfidence,
+            "min_similarity": minSimilarity,
+            "include_flipped": includeFlippedPoses,
+            "config": [
+                "num_threads": threads,
+                "device": device
+            ]
+        ]
+
+        if let regions = requiredRegions, !regions.isEmpty {
+            params["required_regions"] = regions
+        }
+
+        let command: [String: Any] = [
+            "command": "search_by_pose_id",
+            "params": params
+        ]
+
+        guard let response = sendSearchServerCommand(command) else {
+            print("[SEARCH DEBUG] Failed to communicate with search server")
+            return []
+        }
+
+        guard let status = response["status"] as? String else {
+            print("[SEARCH DEBUG] Invalid response: missing status")
+            return []
+        }
+
+        if status != "success" {
+            let message = response["message"] as? String ?? "Unknown error"
+            print("[SEARCH DEBUG] Search by pose id failed: \(message)")
+            return []
+        }
+
+        guard let resultsArray = response["results"] as? [[String: Any]] else {
+            print("[SEARCH DEBUG] Invalid response: missing or invalid results array")
+            return []
+        }
+
+        print("[SEARCH DEBUG] Received \(resultsArray.count) results from server")
+        return resultsArray.compactMap { parseSearchResult(from: $0) }
+    }
+
+    // MARK: - Update Image Paths (after moving files)
+
+    struct PathUpdateResult {
+        let updated: Int
+        let missing: Int
+        let conflicts: Int
+    }
+
+    /// Batch-update stored image paths after files were moved on disk. Applied in
+    /// one transaction server-side, keyed by the old (unique) path. Returns nil if
+    /// the server call itself failed.
+    func updateImagePaths(_ moves: [(oldPath: String, newPath: String)]) -> PathUpdateResult? {
+        guard !moves.isEmpty else { return PathUpdateResult(updated: 0, missing: 0, conflicts: 0) }
+
+        let (threads, useGPU) = getThreadSettings()
+        let params: [String: Any] = [
+            "moves": moves.map { ["old_path": $0.oldPath, "new_path": $0.newPath] },
+            "config": [
+                "num_threads": threads,
+                "device": useGPU ? "mps" : "cpu"
+            ]
+        ]
+        let command: [String: Any] = [
+            "command": "update_image_paths",
+            "params": params
+        ]
+
+        guard let response = sendSearchServerCommand(command),
+              let status = response["status"] as? String, status == "success" else {
+            print("[MOVE DEBUG] Stored-path update failed to reach the search server")
+            return nil
+        }
+        return PathUpdateResult(
+            updated: response["updated"] as? Int ?? 0,
+            missing: response["missing"] as? Int ?? 0,
+            conflicts: response["conflicts"] as? Int ?? 0
+        )
+    }
+
     // MARK: - Browse by Body Parts
     func browseByBodyParts(
         requiredRegions: [String],
@@ -1245,9 +1355,10 @@ class PythonBridgeSubprocess {
                 'per_directory_results': [],
             }
 
-            # delete_missing should only run once, before the first directory
-            first_dir = True
-            for d in DIRECTORIES:
+            # delete_missing runs once, armed on the LAST directory: the cleanup is
+            # post-scan inside index_directory, so by then every listed folder has
+            # been scanned and the content-hash self-heal has repointed moved files.
+            for dir_index, d in enumerate(DIRECTORIES):
                 print(f'DEBUG: === Indexing directory: {d} ===', file=sys.stderr, flush=True)
                 interceptor = ProgressInterceptor(real_stdout)
                 sys.stdout = interceptor
@@ -1257,11 +1368,10 @@ class PythonBridgeSubprocess {
                         recursive=RECURSIVE,
                         min_confidence=MIN_CONFIDENCE,
                         skip_indexed=SKIP_INDEXED,
-                        delete_missing=DELETE_MISSING if first_dir else False,
+                        delete_missing=DELETE_MISSING if dir_index == len(DIRECTORIES) - 1 else False,
                     )
                 finally:
                     sys.stdout = real_stdout
-                first_dir = False
 
                 if not result.get('success', False):
                     err_msg = result.get('error', 'unknown')

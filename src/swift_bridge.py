@@ -698,7 +698,8 @@ class PostureKitBridge:
                       deduplicate_images: bool = True,
                       query_keypoints: Optional[List[float]] = None,
                       query_bbox: Optional[List[float]] = None,
-                      enable_flip_search: bool = False) -> List[Dict[str, Any]]:
+                      enable_flip_search: bool = False,
+                      exclude_pose_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Search for similar poses with optional body part filtering and confidence-aware matching.
 
@@ -756,7 +757,8 @@ class PostureKitBridge:
                 'min_region_confidence': min_region_confidence,
                 'min_similarity': min_similarity,
                 'query_keypoints': query_kp_array,
-                'query_bbox': query_bbox_array
+                'query_bbox': query_bbox_array,
+                'exclude_pose_id': exclude_pose_id
             }
 
             # Choose search method based on flip search setting
@@ -849,7 +851,175 @@ class PostureKitBridge:
             print(f'SEARCH ERROR: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
             return []
-    
+
+    def search_similar_by_pose_id(self, pose_id: str, k: int = 20,
+                                  min_confidence: float = 0.5,
+                                  min_feature_confidence: float = 0.35,
+                                  min_valid_overlap: int = 12,
+                                  required_regions: Optional[List[str]] = None,
+                                  min_region_confidence: float = 0.3,
+                                  min_similarity: float = 0.0,
+                                  deduplicate_images: bool = True,
+                                  enable_flip_search: bool = False) -> List[Dict[str, Any]]:
+        """
+        "Find more poses like this": search using an already-stored pose as the query.
+
+        Loads the stored feature vector (geometric or fused, per the active search
+        feature mode) plus the pose's stored keypoints/bbox so OKS re-ranking and
+        flip search behave exactly like a fresh query, then delegates to
+        search_similar(). The query pose itself is excluded from the results.
+        """
+        try:
+            from uuid import UUID
+            from src.config.model_config import SearchFeatureMode
+            from src.storage.models import PoseDetection as PoseDetectionModel, FusedFeatures
+
+            pose_uuid = UUID(pose_id)
+            with self.storage_manager.session_scope() as session:
+                if self.search_feature_mode == SearchFeatureMode.FUSED_MULTIMODAL:
+                    features = session.query(FusedFeatures).filter(
+                        FusedFeatures.pose_id == pose_uuid).first()
+                    if not features:
+                        logger.error(f"No fused features stored for pose {pose_id}")
+                        return []
+                    feature_vector = list(features.fused_vector)
+                    query_confidence = None  # Fused features carry no confidence channel
+                else:
+                    features = session.query(GeometricFeaturesModel).filter(
+                        GeometricFeaturesModel.pose_id == pose_uuid).first()
+                    if not features:
+                        logger.error(f"No geometric features stored for pose {pose_id}")
+                        return []
+                    feature_vector = list(features.feature_vector)
+                    query_confidence = (list(features.feature_confidence)
+                                        if features.feature_confidence is not None else None)
+
+                pose_row = session.query(PoseDetectionModel).filter(
+                    PoseDetectionModel.id == pose_uuid).first()
+                query_keypoints = (list(pose_row.keypoints)
+                                   if pose_row is not None and pose_row.keypoints else None)
+                query_bbox = (list(pose_row.bbox)
+                              if pose_row is not None and pose_row.bbox else None)
+
+            results = self.search_similar(
+                feature_vector=feature_vector,
+                k=k,
+                min_confidence=min_confidence,
+                query_confidence=query_confidence,
+                min_feature_confidence=min_feature_confidence,
+                min_valid_overlap=min_valid_overlap,
+                required_regions=required_regions,
+                min_region_confidence=min_region_confidence,
+                min_similarity=min_similarity,
+                deduplicate_images=deduplicate_images,
+                query_keypoints=query_keypoints,
+                query_bbox=query_bbox,
+                enable_flip_search=enable_flip_search,
+                # Excluded inside the engine BEFORE per-image dedup, so the query
+                # image's slot goes to its next-best pose instead of vanishing.
+                exclude_pose_id=pose_id,
+            )
+            return results
+
+        except Exception as e:
+            import sys
+            import traceback
+            logger.error(f"Search by pose id failed: {e}", exc_info=True)
+            print(f'SEARCH ERROR: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            return []
+
+    def update_image_paths(self, moves: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        Batch-update stored image paths after files were moved on disk.
+
+        Each entry is {'old_path': ..., 'new_path': ...}; the whole batch is applied
+        in a single transaction, keyed by the (unique) old path. Only
+        images.file_path is path-dependent — poses/features/FAISS are keyed by
+        UUIDs and thumbnails live in the database — so nothing else changes.
+        """
+        updated = 0
+        missing = 0
+        conflicts = 0
+        try:
+            with self.storage_manager.session_scope() as session:
+                for move in moves:
+                    old_path = move.get('old_path')
+                    new_path = move.get('new_path')
+                    if not old_path or not new_path or old_path == new_path:
+                        missing += 1
+                        continue
+
+                    row = session.query(Image).filter(Image.file_path == old_path).first()
+                    if row is None:
+                        missing += 1
+                        continue
+
+                    # file_path is unique — refuse to steal a path another image owns
+                    clash = session.query(Image).filter(
+                        Image.file_path == new_path, Image.id != row.id
+                    ).first()
+                    if clash is not None:
+                        conflicts += 1
+                        continue
+
+                    row.file_path = new_path
+                    updated += 1
+
+            if updated:
+                # Cached search results embed image_path captured at query time —
+                # drop them so post-move searches don't serve the dead paths.
+                self.similarity_engine.clear_search_cache()
+
+            logger.info(f"Path update: {updated} updated, {missing} missing, {conflicts} conflicts")
+            return {'updated': updated, 'missing': missing, 'conflicts': conflicts}
+
+        except Exception as e:
+            import sys
+            logger.error(f"Batch path update failed: {e}", exc_info=True)
+            print(f'PATH UPDATE ERROR: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
+            return {'updated': 0, 'missing': 0, 'conflicts': 0, 'error': str(e)}
+
+    def cleanup_missing_images(self) -> tuple:
+        """
+        Delete database rows for images whose file no longer exists on disk.
+
+        Runs AFTER a scan so the content-hash self-heal has already repointed
+        rows for files that were merely moved — anything still missing is
+        genuinely gone. FAISS is intentionally not touched here: the caller
+        (index_directory) force-rebuilds the index immediately afterwards, and
+        until then stale ids degrade gracefully (the engine drops candidates
+        whose database rows are gone).
+
+        Returns (deleted_images, deleted_poses, deleted_from_index).
+        """
+        import sys
+        from src.storage.models import PoseDetection as PoseDetectionModel
+
+        deleted_images = 0
+        deleted_poses = 0
+
+        with self.storage_manager.session_scope() as session:
+            rows = session.query(Image.id, Image.file_path).all()
+        missing = [(image_id, path) for image_id, path in rows if not Path(path).exists()]
+        logger.info(f"Missing-file cleanup: {len(missing)} of {len(rows)} stored images are gone from disk")
+
+        for image_id, file_path in missing:
+            with self.storage_manager.session_scope() as session:
+                pose_ids = [pid for (pid,) in session.query(PoseDetectionModel.id).filter(
+                    PoseDetectionModel.image_id == image_id).all()]
+            for pid in pose_ids:
+                if self.storage_manager.delete_pose(pid):
+                    deleted_poses += 1
+            with self.storage_manager.session_scope() as session:
+                image_row = session.get(Image, image_id)
+                if image_row is not None:
+                    session.delete(image_row)  # cascades BodyPart etc.
+                    deleted_images += 1
+            print(f"CLEANUP: removed missing {file_path}", file=sys.stderr, flush=True)
+
+        return deleted_images, deleted_poses, 0
+
     # Extensions the pipeline can actually decode (cv2.imread). HEIC/GIF are
     # deliberately absent — OpenCV cannot read them, so listing them would just
     # turn every iPhone photo into a "failed image".
@@ -1488,17 +1658,12 @@ class PostureKitBridge:
             from pathlib import Path
             import cv2
 
-            # Cleanup missing files first if requested
+            # Missing-file cleanup is deferred until AFTER the scan (see below) so
+            # the scan's content-hash self-heal can repoint rows for files moved
+            # outside the app before the sweep decides they are "missing".
             deleted_images = 0
             deleted_poses = 0
             deleted_from_index = 0
-            if delete_missing:
-                logger.info("Cleaning up missing files before indexing...")
-                from cleanup_missing_files import cleanup_missing_files
-                deleted_images, deleted_poses, deleted_from_index = cleanup_missing_files(
-                    self.storage_manager, self.similarity_engine
-                )
-                logger.info(f"Cleanup complete: {deleted_images} images, {deleted_poses} poses, {deleted_from_index} from index")
 
             directory = Path(directory_path)
             if not directory.exists():
@@ -1556,6 +1721,17 @@ class PostureKitBridge:
                             ).first()
 
                         if existing:
+                            # Self-heal moved files: the same content at a NEW path while
+                            # the stored path is gone from disk means the file was moved
+                            # outside the app (Finder etc.) — repoint the stored row
+                            # instead of leaving it orphaned (invisible to search and
+                            # un-re-addable). If the stored path still exists, this is a
+                            # genuine duplicate copy: skip without touching the row.
+                            if (existing.file_path != str(image_path)
+                                    and not Path(existing.file_path).exists()):
+                                print(f"PATH HEAL: {existing.file_path} -> {image_path}",
+                                      file=sys.stderr, flush=True)
+                                existing.file_path = str(image_path)
                             skipped_images += 1
                             processed_images += 1
 
@@ -1654,6 +1830,83 @@ class PostureKitBridge:
 
                     # Filter poses by confidence BEFORE processing
                     valid_poses = [p for p in poses if p.overall_confidence >= min_confidence]
+
+                    # Replace-not-append for photos already in the library (reached
+                    # with skip_indexed=False, which re-processes known photos):
+                    # mirror re-detection's per-image semantics — preserve manually
+                    # corrected poses, drop new detections overlapping them
+                    # (IoU >= 0.45), and delete the old uncorrected poses + their
+                    # body-part rows only now that detection has succeeded. Without
+                    # this, every no-skip run would APPEND a duplicate set of poses
+                    # alongside the old ones. For new photos the lookup finds
+                    # nothing and this is a no-op.
+                    existing_image_id = None
+                    with self.storage_manager.session_scope() as session:
+                        existing_row = session.query(Image).filter(
+                            Image.file_path == str(image_path)
+                        ).first()
+                        if existing_row is None and content_hash:
+                            existing_row = session.query(Image).filter(
+                                Image.content_hash == content_hash
+                            ).first()
+                        if existing_row is not None:
+                            existing_image_id = existing_row.id
+                            # Found by content hash at a NEW path with the stored
+                            # path gone from disk => the file was moved outside the
+                            # app. Repoint NOW (inside this session) so the
+                            # store_detection below — which matches by file_path —
+                            # reuses THIS row instead of creating a second Image
+                            # row and stranding corrected poses on a dead path.
+                            if (existing_row.file_path != str(image_path)
+                                    and not Path(existing_row.file_path).exists()):
+                                print(f"PATH HEAL: {existing_row.file_path} -> {image_path}",
+                                      file=sys.stderr, flush=True)
+                                existing_row.file_path = str(image_path)
+
+                    if existing_image_id is not None:
+                        from src.storage.models import PoseDetection, BodyPart
+                        with self.storage_manager.session_scope() as session:
+                            existing_poses = session.query(
+                                PoseDetection.id,
+                                PoseDetection.bbox,
+                                PoseDetection.is_corrected,
+                                PoseDetection.person_id,
+                            ).filter(PoseDetection.image_id == existing_image_id).all()
+                        corrected_bboxes = [e[1] for e in existing_poses if e[2] and e[1] is not None]
+                        corrected_person_ids = [e[3] for e in existing_poses if e[2]]
+                        replace_ids = [e[0] for e in existing_poses if not e[2]]
+
+                        if corrected_bboxes:
+                            valid_poses = [
+                                p for p in valid_poses
+                                if all(self._bbox_iou_xywh(p.bbox, cb) < 0.45
+                                       for cb in corrected_bboxes)
+                            ]
+                        # Conservative replace: only delete old data when there is
+                        # something valid to store in its place. Deliberately
+                        # stricter than _redetect_one_image (which trusts a
+                        # successful zero-pose detection): an all-below-threshold
+                        # or all-overlapping-corrected result here keeps the old
+                        # poses rather than leaving the photo empty.
+                        if valid_poses and replace_ids:
+                            for pid in replace_ids:
+                                if self.storage_manager.delete_pose(pid):
+                                    # Keep the on-disk FAISS index consistent
+                                    # mid-run: new poses are saved to it
+                                    # incrementally below, so removals must be too
+                                    # (a cancelled run never reaches the final
+                                    # rebuild).
+                                    try:
+                                        self.similarity_engine.remove_pose(pid)
+                                    except Exception as e:
+                                        logger.warning(f"FAISS removal failed for {pid}: {e}")
+                            with self.storage_manager.session_scope() as session:
+                                q = session.query(BodyPart).filter(BodyPart.image_id == existing_image_id)
+                                if corrected_person_ids:
+                                    q = q.filter(~BodyPart.person_index.in_(corrected_person_ids))
+                                q.delete(synchronize_session=False)
+                            logger.info(f"Replaced {len(replace_ids)} old pose(s) for re-processed {image_path.name}")
+
                     if not valid_poses:
                         logger.debug(f"No poses above confidence threshold ({min_confidence}) in {image_path.name}")
                         processed_images += 1
@@ -1762,6 +2015,16 @@ class PostureKitBridge:
                     processed_images += 1
                     continue
             
+            # Cleanup missing files AFTER the scan: by now the content-hash
+            # self-heal has repointed rows for files that were merely moved, so
+            # anything still missing is genuinely gone. (Running this first used
+            # to purge moved files' rows and re-detect them from scratch,
+            # losing manual corrections.)
+            if delete_missing:
+                logger.info("Cleaning up missing files after indexing...")
+                deleted_images, deleted_poses, deleted_from_index = self.cleanup_missing_images()
+                logger.info(f"Cleanup complete: {deleted_images} images, {deleted_poses} poses, {deleted_from_index} from index")
+
             # Build final index
             self.similarity_engine.build_index(force_rebuild=True)
 

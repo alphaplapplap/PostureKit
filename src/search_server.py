@@ -196,6 +196,87 @@ def handle_search(params: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def handle_search_by_pose_id(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle a search-by-stored-pose request ("Find more poses like this")."""
+    global bridge
+
+    # Initialize bridge on first search if not already initialized
+    if bridge is None:
+        config = params.get('config', {})
+        init_result = initialize_bridge(config)
+        if init_result['status'] != 'success':
+            return init_result
+
+    try:
+        pose_id = params['pose_id']
+        k = params.get('k', 20)
+        min_confidence = params.get('min_confidence', 0.5)
+        min_feature_confidence = params.get('min_feature_confidence', 0.35)
+        min_valid_overlap = params.get('min_valid_overlap', 12)
+        required_regions = params.get('required_regions')
+        min_region_confidence = params.get('min_region_confidence', 0.3)
+        min_similarity = params.get('min_similarity', 0.0)  # Similarity floor (0-1); 0 = top-k mode
+        deduplicate_images = params.get('deduplicate_images', False)
+        enable_flip_search = bool(params.get('include_flipped', False))
+
+        logger.info(f"Searching by pose id {pose_id} with k={k}, min_similarity={min_similarity}, "
+                    f"deduplicate_images={deduplicate_images}, flip={enable_flip_search}")
+
+        results = bridge.search_similar_by_pose_id(
+            pose_id=pose_id,
+            k=k,
+            min_confidence=min_confidence,
+            min_feature_confidence=min_feature_confidence,
+            min_valid_overlap=min_valid_overlap,
+            required_regions=required_regions,
+            min_region_confidence=min_region_confidence,
+            min_similarity=min_similarity,
+            deduplicate_images=deduplicate_images,
+            enable_flip_search=enable_flip_search
+        )
+
+        logger.info(f"Search by pose id complete, found {len(results)} results")
+
+        return {
+            'status': 'success',
+            'results': results
+        }
+
+    except Exception as e:
+        logger.error(f"Search by pose id failed: {e}")
+        traceback.print_exc(file=sys.stderr)
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+
+def handle_update_image_paths(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle a batched stored-path update after files were moved on disk."""
+    global bridge
+
+    if bridge is None:
+        config = params.get('config', {})
+        init_result = initialize_bridge(config)
+        if init_result['status'] != 'success':
+            return init_result
+
+    try:
+        moves = params.get('moves', [])
+        result = bridge.update_image_paths(moves)
+        if result.get('error'):
+            return {'status': 'error', 'message': result['error']}
+        return {'status': 'success', **result}
+
+    except Exception as e:
+        logger.error(f"Path update failed: {e}")
+        traceback.print_exc(file=sys.stderr)
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+
 def handle_statistics(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle a statistics request."""
     global bridge
@@ -356,6 +437,10 @@ def main():
 
             if cmd_type == 'search':
                 response = handle_search(params)
+            elif cmd_type == 'search_by_pose_id':
+                response = handle_search_by_pose_id(params)
+            elif cmd_type == 'update_image_paths':
+                response = handle_update_image_paths(params)
             elif cmd_type == 'statistics':
                 response = handle_statistics(params)
             elif cmd_type == 'browse_body_parts':

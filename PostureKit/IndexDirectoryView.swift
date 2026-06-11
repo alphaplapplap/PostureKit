@@ -10,7 +10,7 @@ struct IndexDirectoryView: View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("Index Directory")
+                Text("Indexed Photos")
                     .font(.system(size: 18, weight: .semibold))
                 
                 Spacer()
@@ -40,7 +40,7 @@ struct IndexDirectoryView: View {
                     // Directory Selection
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Directories to Index")
+                            Text("Indexed Folders")
                                 .font(.system(size: 13, weight: .semibold))
                             Spacer()
                             Text("\(indexViewModel.selectedDirectories.count) selected")
@@ -54,7 +54,7 @@ struct IndexDirectoryView: View {
                                 HStack {
                                     Image(systemName: "folder.badge.plus")
                                         .foregroundColor(.gray)
-                                    Text("No directories selected. Click Add to choose folders.")
+                                    Text("No folders selected. Click Add Folder to choose.")
                                         .font(.system(size: 12))
                                         .foregroundColor(.gray)
                                     Spacer()
@@ -69,12 +69,14 @@ struct IndexDirectoryView: View {
                                 )
                             } else {
                                 ForEach(Array(indexViewModel.selectedDirectories.enumerated()), id: \.offset) { index, path in
+                                    let isOffline = !FileManager.default.fileExists(atPath: path)
                                     HStack(spacing: 8) {
-                                        Image(systemName: "folder.fill")
-                                            .foregroundColor(.blue)
+                                        Image(systemName: isOffline ? "externaldrive.badge.questionmark" : "folder.fill")
+                                            .foregroundColor(isOffline ? .gray : .blue)
                                             .font(.system(size: 12))
-                                        Text(path)
+                                        Text(isOffline ? "\(path) (offline)" : path)
                                             .font(.system(size: 12))
+                                            .foregroundColor(isOffline ? .gray : .primary)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
                                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -104,7 +106,7 @@ struct IndexDirectoryView: View {
                             Button(action: { selectDirectories() }) {
                                 HStack(spacing: 6) {
                                     Image(systemName: "plus.circle.fill")
-                                    Text("Add Directory")
+                                    Text("Add Folder")
                                 }
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundColor(.white)
@@ -144,15 +146,25 @@ struct IndexDirectoryView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Include subdirectories", isOn: $indexViewModel.includeSubdirectories)
                                 .font(.system(size: 13))
-                            Toggle("Skip already indexed images", isOn: $indexViewModel.skipIndexed)
+                            Toggle("Skip photos already in library", isOn: $indexViewModel.skipIndexed)
                                 .font(.system(size: 13))
-                            Toggle("Delete missing images from index", isOn: $indexViewModel.deleteMissing)
+                            Toggle("Remove missing photos from library", isOn: $indexViewModel.deleteMissing)
                                 .font(.system(size: 13))
                         }
+
+                        Text("These folders define what appears in search results: removing a folder hides its photos (nothing is deleted — re-add the folder to bring them back). Updating is incremental: with “Skip photos already in library” on, only new photos are processed; with it off, photos already in the library are re-processed with the current pipeline (old poses replaced, manual corrections kept) — a scoped re-detect for just these folders. To re-process the entire library, use Re-detect below.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.gray)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(16)
                     .background(Color.gray.opacity(0.05))
                     .cornerRadius(8)
+
+                    // Whole-library re-detection (same section that used to live in
+                    // Settings > Maintenance) — grouped here with the other library
+                    // operations.
+                    MaintenanceSection()
                     
                     // Progress
                     if indexViewModel.isIndexing {
@@ -170,7 +182,7 @@ struct IndexDirectoryView: View {
                         }) {
                             HStack {
                                 Image(systemName: indexViewModel.isIndexing ? (indexViewModel.isPaused ? "play.fill" : "pause.fill") : "play.fill")
-                                Text(indexViewModel.isIndexing ? (indexViewModel.isPaused ? "Resume Indexing" : "Pause Indexing") : "Start Indexing")
+                                Text(indexViewModel.isIndexing ? (indexViewModel.isPaused ? "Resume" : "Pause") : "Update")
                             }
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(.white)
@@ -216,7 +228,7 @@ struct IndexDirectoryView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "Add"
-        panel.message = "Select one or more directories to index"
+        panel.message = "Select one or more folders to add to the library"
 
         if panel.runModal() == .OK {
             indexViewModel.addDirectories(panel.urls.map { $0.path })
@@ -231,7 +243,7 @@ struct IndexProgressView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(indexViewModel.isPaused ? "Indexing paused..." : "Indexing in progress...")
+                Text(indexViewModel.isPaused ? "Paused..." : "Updating...")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(indexViewModel.isPaused ? .orange : .primary)
 
@@ -276,7 +288,7 @@ struct IndexProgressView: View {
                 .foregroundColor(.primary)
 
                 HStack {
-                    Text("Poses indexed: \(indexViewModel.posesIndexed)")
+                    Text("Poses added: \(indexViewModel.posesIndexed)")
                     Spacer()
                     if indexViewModel.failedImages > 0 {
                         Text("Failed: \(indexViewModel.failedImages)")
@@ -287,7 +299,7 @@ struct IndexProgressView: View {
                 .foregroundColor(.gray)
 
                 if indexViewModel.skippedImages > 0 {
-                    Text("Skipped (already indexed): \(indexViewModel.skippedImages)")
+                    Text("Skipped (already in library): \(indexViewModel.skippedImages)")
                         .font(.system(size: 12))
                         .foregroundColor(.orange)
                 }
@@ -313,7 +325,25 @@ struct IndexProgressView: View {
 
 // MARK: - Index View Model
 class IndexViewModel: ObservableObject {
-    private static let directoriesKey = "IndexDirectoryView.selectedDirectories"
+    private static let legacyDirectoriesKey = "IndexDirectoryView.selectedDirectories"
+
+    /// Per-profile key: each DB profile keeps its own indexed-folder set, because
+    /// the list now scopes search results — a global list would hide everything
+    /// after a profile switch.
+    private static var directoriesKey: String {
+        let profile = UserDefaults.standard.string(forKey: "activeProfile") ?? "irl"
+        return "IndexDirectoryView.selectedDirectories-\(profile)"
+    }
+
+    /// The library scope used to filter results: standardized indexed-folder paths
+    /// for the active profile. Empty = no scope defined (show everything), so
+    /// "Clear All" can't blank the app.
+    static func indexedFoldersScope() -> [String] {
+        let saved = UserDefaults.standard.stringArray(forKey: directoriesKey)
+            ?? UserDefaults.standard.stringArray(forKey: legacyDirectoriesKey)  // pre-profile fallback
+            ?? []
+        return saved.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+    }
 
     private let pythonBridge = PythonBridgeSubprocess.shared
     private var startTime: Date?
@@ -322,10 +352,19 @@ class IndexViewModel: ObservableObject {
     @Published var selectedDirectories: [String] {
         didSet {
             UserDefaults.standard.set(selectedDirectories, forKey: Self.directoriesKey)
+            // The list defines which photos may appear in results — let the grid react.
+            NotificationCenter.default.post(name: .indexedFoldersChanged, object: nil)
         }
     }
-    @Published var includeSubdirectories: Bool = true
-    @Published var skipIndexed: Bool = true
+    // Options persist across launches (write-through on change)
+    @Published var includeSubdirectories: Bool = UserDefaults.standard.object(forKey: "IndexDirectoryView.includeSubdirectories") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(includeSubdirectories, forKey: "IndexDirectoryView.includeSubdirectories") }
+    }
+    @Published var skipIndexed: Bool = UserDefaults.standard.object(forKey: "IndexDirectoryView.skipIndexed") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(skipIndexed, forKey: "IndexDirectoryView.skipIndexed") }
+    }
+    // Deliberately NOT persisted: this arms a destructive whole-database sweep,
+    // so it requires explicit opt-in on every launch.
     @Published var deleteMissing: Bool = false
 
     @Published var isIndexing: Bool = false
@@ -341,11 +380,14 @@ class IndexViewModel: ObservableObject {
     @Published var timeRemaining: String = "00:00:00"
 
     init() {
-        // Restore previously selected directories from UserDefaults.
-        // Filter out any paths that no longer exist on disk so the UI doesn't
-        // show stale entries (e.g. unmounted external drives, deleted folders).
-        let saved = UserDefaults.standard.stringArray(forKey: Self.directoriesKey) ?? []
-        self.selectedDirectories = saved.filter { FileManager.default.fileExists(atPath: $0) }
+        // Restore previously selected directories from UserDefaults — INCLUDING
+        // paths that don't currently exist on disk (unmounted external drives).
+        // The list now scopes search results, so dropping an offline volume here
+        // (and persisting that on the next edit) would permanently amputate its
+        // photos from the library. Offline folders render greyed-out instead.
+        self.selectedDirectories = UserDefaults.standard.stringArray(forKey: Self.directoriesKey)
+            ?? UserDefaults.standard.stringArray(forKey: Self.legacyDirectoriesKey)  // pre-profile fallback
+            ?? []
     }
 
     func addDirectories(_ paths: [String]) {

@@ -48,8 +48,9 @@ struct SettingsView: View {
                     // Excluded Folders Section
                     ExcludedFoldersSection()
 
-                    // Maintenance Section (corpus re-detection)
-                    MaintenanceSection()
+                    // (Re-detection lives in the Indexed Photos dialog, alongside
+                    // the other library operations — MaintenanceSection is defined
+                    // below but instantiated there.)
 
                     // Performance Section
                     PerformanceSection(viewModel: settingsViewModel)
@@ -178,7 +179,7 @@ struct StorageSection: View {
                             Spacer()
 
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Index")
+                                Text("Search Index")
                                     .font(.system(size: 11))
                                     .foregroundColor(.gray)
                                 HStack(spacing: 4) {
@@ -204,7 +205,7 @@ struct StorageSection: View {
                         }
 
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Index Path")
+                            Text("Search Index Path")
                                 .font(.system(size: 11))
                                 .foregroundColor(.gray)
                             Text(stats.indexPath)
@@ -269,7 +270,7 @@ struct ThumbnailsSection: View {
                             .frame(width: 8, height: 8)
 
                         if viewModel.totalImagesCount == 0 {
-                            Text("No images indexed yet")
+                            Text("No photos in library yet")
                                 .font(.system(size: 13))
                                 .foregroundColor(.gray)
                         } else if viewModel.imagesMissingThumbnails > 0 {
@@ -532,7 +533,7 @@ struct PerformanceSection: View {
                 Toggle("Enable GPU for interactive detection", isOn: $viewModel.useGPU)
                     .font(.system(size: 13))
 
-                Text("ℹ️ GPU is ALWAYS enabled for batch operations (indexing) where it's 11× faster. This toggle only affects single-image interactive detection, where CPU is currently faster due to transfer overhead.")
+                Text("ℹ️ GPU is ALWAYS enabled for batch operations (adding photos, re-detection) where it's 11× faster. This toggle only affects single-image interactive detection, where CPU is currently faster due to transfer overhead.")
                     .font(.system(size: 11))
                     .foregroundColor(.blue)
                     .fixedSize(horizontal: false, vertical: true)
@@ -624,7 +625,7 @@ struct MaintenanceSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Maintenance")
+                Text("Re-detection")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if isRedetecting {
@@ -640,7 +641,7 @@ struct MaintenanceSection: View {
                 }
             }
 
-            Text("Re-runs pose detection on every indexed image with the current detection pipeline and rebuilds the search index. Manually corrected poses are preserved. Processes the entire library — this can take many hours, and can be cancelled at any time (completed images keep their new detections).")
+            Text("Re-runs pose detection on every photo in the library with the current detection pipeline, then rebuilds the search index. Use this after changing detection models or feature extraction — it does not look for new photos (use Update above for that). Manually corrected poses are preserved. Processing the whole library can take many hours and can be cancelled at any time (completed images keep their new detections).")
                 .font(.system(size: 11))
                 .foregroundColor(.gray)
                 .fixedSize(horizontal: false, vertical: true)
@@ -669,7 +670,7 @@ struct MaintenanceSection: View {
         } message: {
             Text(hasPartialRun
                  ? "An earlier run was interrupted. Already re-detected images will be skipped."
-                 : "Every indexed image will be re-processed with the current detection models, replacing existing poses. Manual corrections are kept. This can take many hours.")
+                 : "Every photo in the library will be re-processed with the current detection models, replacing existing poses. Manual corrections are kept. New photos are not added — use Indexed Photos for that. This can take many hours.")
         }
     }
 
@@ -699,7 +700,7 @@ struct MaintenanceSection: View {
                 if progress >= 1.0 {
                     UserDefaults.standard.removeObject(forKey: runEpochKey)
                     hasPartialRun = false
-                    statusText = "Re-detection finished. Restart the app to load the updated search index."
+                    statusText = "Re-detection finished. The search index has been rebuilt."
                 } else {
                     hasPartialRun = true
                     statusText = "Re-detection stopped — press Resume to continue where it left off."
@@ -733,7 +734,7 @@ struct ExcludedFoldersSection: View {
                 .font(.system(size: 12))
             }
 
-            Text("Images in these folders are skipped during indexing and hidden from all search and browse results — including images that were already indexed. Exclusions apply to the active database profile.")
+            Text("Photos in these folders are skipped when updating the library and hidden from all search and browse results — including photos already in the library. Exclusions apply to the active database profile.")
                 .font(.system(size: 11))
                 .foregroundColor(.gray)
                 .fixedSize(horizontal: false, vertical: true)
@@ -804,7 +805,7 @@ struct ExcludedFoldersSection: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "Exclude"
-        panel.message = "Select folders to exclude from indexing and search results"
+        panel.message = "Select folders to exclude from the library and search results"
 
         guard panel.runModal() == .OK else { return }
         let paths = panel.urls.map { $0.path }
@@ -813,8 +814,11 @@ struct ExcludedFoldersSection: View {
         lastError = nil
         DispatchQueue.global(qos: .userInitiated).async {
             var failed: [String] = []
+            var excluded: [String] = []
             for path in paths {
-                if !pythonBridge.addExcludedFolder(path: path) {
+                if pythonBridge.addExcludedFolder(path: path) {
+                    excluded.append(path)
+                } else {
                     failed.append(path)
                 }
             }
@@ -824,6 +828,11 @@ struct ExcludedFoldersSection: View {
                 isLoading = false
                 if !failed.isEmpty {
                     lastError = "Failed to exclude: \(failed.joined(separator: ", "))"
+                }
+                // Let the results grid drop now-excluded photos immediately
+                // (new searches already filter them server-side).
+                for path in excluded {
+                    NotificationCenter.default.post(name: .folderExcluded, object: path)
                 }
             }
         }
@@ -848,23 +857,47 @@ struct ExcludedFoldersSection: View {
 
 // MARK: - Settings View Model
 class SettingsViewModel: ObservableObject {
+    // All user-facing settings write through to UserDefaults on change, so edits
+    // persist even if the window closes without Save. (loadSettings re-assigns
+    // these in init, which echoes the same values back — harmless. The Save
+    // button remains as an explicit confirm and re-writes identical values.)
+
     // Profile settings
-    @Published var activeProfile: String = "irl"
+    @Published var activeProfile: String = "irl" {
+        didSet { UserDefaults.standard.set(activeProfile, forKey: "activeProfile") }
+    }
     @Published var profileStats: [String: ProfileStats] = [:]
     @Published var isLoadingProfileStats: Bool = false
 
     // Detection settings
-    @Published var poseModel: String = "ensemble"
-    @Published var fusionMethod: String = "confidence_weighted"
-    @Published var useTwoStage: Bool = true
+    @Published var poseModel: String = "ensemble" {
+        didSet { UserDefaults.standard.set(poseModel, forKey: "poseModel") }
+    }
+    @Published var fusionMethod: String = "confidence_weighted" {
+        didSet { UserDefaults.standard.set(fusionMethod, forKey: "fusionMethod") }
+    }
+    @Published var useTwoStage: Bool = true {
+        didSet {
+            UserDefaults.standard.set(useTwoStage, forKey: "useTwoStage")
+            setenv("USE_TWO_STAGE_DETECTION", useTwoStage ? "true" : "false", 1)
+        }
+    }
 
     // Performance settings
-    @Published var detectionThreads: Int = 16
-    @Published var useGPU: Bool = true
+    @Published var detectionThreads: Int = 16 {
+        didSet { UserDefaults.standard.set(detectionThreads, forKey: "detectionThreads") }
+    }
+    @Published var useGPU: Bool = true {
+        didSet { UserDefaults.standard.set(useGPU, forKey: "useGPU") }
+    }
 
     // Display settings
-    @Published var theme: String = "auto"
-    @Published var resultsPerPage: Int = 20
+    @Published var theme: String = "auto" {
+        didSet { UserDefaults.standard.set(theme, forKey: "theme") }
+    }
+    @Published var resultsPerPage: Int = 20 {
+        didSet { UserDefaults.standard.set(resultsPerPage, forKey: "resultsPerPage") }
+    }
 
     // Thumbnail generation state
     @Published var totalImagesCount: Int = 0

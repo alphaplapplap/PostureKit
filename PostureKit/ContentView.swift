@@ -332,7 +332,7 @@ struct HeaderView: View {
                 Button(action: { showIndexModal = true }) {
                     HStack(spacing: 6) {
                         Image(systemName: "folder")
-                        Text("Index Directory")
+                        Text("Indexed Photos...")
                     }
                     .font(.system(size: 14, weight: .medium))
                     .foregroundColor(.white)
@@ -1278,6 +1278,9 @@ struct ResultsGridView: View {
     @State private var autoScrollTimer: Timer? = nil
     @State private var resultsScrollView: NSScrollView? = nil
 
+    // Arrow-key navigation
+    @State private var keyMonitor: Any? = nil
+
     private enum AutoScrollDirection { case up, down }
 
     private var scrollAreaHeight: CGFloat {
@@ -1418,6 +1421,104 @@ struct ResultsGridView: View {
         }
     }
 
+    // MARK: Arrow-key navigation
+
+    /// The grid's current column count: cell count of the topmost realized row.
+    /// (Lazy containers only realize visible rows, but a realized row is complete.)
+    private func currentColumnCount() -> Int {
+        guard viewModel.viewMode == .grid, !resultFrames.isEmpty,
+              let topY = resultFrames.values.map(\.minY).min() else { return 1 }
+        return max(1, resultFrames.values.filter { abs($0.minY - topY) < 1 }.count)
+    }
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleArrowKey(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+    }
+
+    /// Returns true (event consumed) when the arrow key moved the result selection.
+    private func handleArrowKey(_ event: NSEvent) -> Bool {
+        let leftArrow: UInt16 = 123, rightArrow: UInt16 = 124
+        let downArrow: UInt16 = 125, upArrow: UInt16 = 126
+        guard [leftArrow, rightArrow, downArrow, upArrow].contains(event.keyCode) else { return false }
+        // Plain arrows only — leave chorded arrows to the system
+        guard event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return false }
+        // Only in our window (not Settings or other panels), and never while any
+        // keyboard-focused control (text field, slider, popup, stepper) owns the
+        // arrow keys.
+        guard let window = resultsScrollView?.window, event.window === window else { return false }
+        if let responder = window.firstResponder,
+           responder is NSText || responder is NSTextField || responder is NSControl { return false }
+        guard !viewModel.searchResults.isEmpty else { return false }
+
+        let rowStep = viewModel.viewMode == .grid ? currentColumnCount() : 1
+        let step: Int
+        switch event.keyCode {
+        case leftArrow: step = -1
+        case rightArrow: step = 1
+        case downArrow: step = rowStep
+        case upArrow: step = -rowStep
+        default: return false
+        }
+
+        let count = viewModel.searchResults.count
+        let target: Int
+        if let anchor = viewModel.selectionAnchorIndex {
+            target = max(0, min(count - 1, anchor + step))
+        } else {
+            target = 0  // nothing selected yet: first arrow press lands on the first result
+        }
+
+        viewModel.selectResult(at: target)
+        scrollToResult(at: target, direction: step)
+        return true
+    }
+
+    /// Keep the navigated cell visible. Mirrors autoScrollTick's coordinate model:
+    /// "resultsContent" y equals the clip view's scroll offset y.
+    private func scrollToResult(at index: Int, direction: Int) {
+        guard let scrollView = resultsScrollView else { return }
+        let clipView = scrollView.contentView
+        let visibleHeight = clipView.bounds.height
+        var origin = clipView.bounds.origin
+        let id = viewModel.searchResults[index].id
+
+        if let frame = resultFrames[id] {
+            if frame.minY < origin.y + 12 {
+                origin.y = frame.minY - 12
+            } else if frame.maxY > origin.y + visibleHeight - 12 {
+                origin.y = frame.maxY - visibleHeight + 12
+            } else {
+                return  // already fully visible
+            }
+        } else if let sample = resultFrames.values.first {
+            // Target cell not realized yet (lazy container): nudge one row in the
+            // travel direction; the cell realizes after the scroll and the next
+            // press lines it up exactly.
+            let rowHeight = sample.height + 24
+            origin.y += direction > 0 ? rowHeight : -rowHeight
+        } else {
+            return
+        }
+
+        origin.y = max(0, origin.y)
+        if let documentView = scrollView.documentView {
+            origin.y = min(origin.y, max(0, documentView.frame.height - visibleHeight))
+        }
+        guard origin != clipView.bounds.origin else { return }
+        clipView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(clipView)
+    }
+
     private func resultFrameReader(for id: String) -> some View {
         GeometryReader { geo in
             Color.clear.preference(
@@ -1544,18 +1645,20 @@ struct ResultsGridView: View {
 
                     Spacer()
 
-                    if !viewModel.selectedResultIds.isEmpty {
-                        Button("Move Selected...") {
-                            moveSelectedFiles()
-                        }
-                        .buttonStyle(PlainButtonStyle())
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.blue)
-                        .cornerRadius(6)
+                    // Always in the layout (invisible when nothing is selected) so its
+                    // appearance doesn't change the controls row height and resize the box.
+                    Button("Move Selected...") {
+                        moveSelectedFiles()
                     }
+                    .buttonStyle(PlainButtonStyle())
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.blue)
+                    .cornerRadius(6)
+                    .opacity(viewModel.selectedResultIds.isEmpty ? 0 : 1)
+                    .disabled(viewModel.selectedResultIds.isEmpty)
                 }
             }
             .padding(.horizontal, 24)
@@ -1590,6 +1693,35 @@ struct ResultsGridView: View {
             .onPreferenceChange(ResultsContentOriginPreferenceKey.self) { contentOrigin = $0 }
             .onDisappear { stopAutoScroll() }
             .frame(height: scrollAreaHeight)
+
+            // Finder-style path bar pinned below the results. Always present at a
+            // fixed height so selecting/deselecting never resizes the results box.
+            HStack(spacing: 8) {
+                if let selected = viewModel.breadcrumbResult, let selectedPath = selected.imagePath {
+                    FilePathBreadcrumbView(path: selectedPath)
+                    if viewModel.selectedResultIds.count > 1 {
+                        Text("(\(viewModel.selectedResultIds.count) selected)")
+                            .font(.system(size: 11))
+                            .foregroundColor(.gray)
+                            .fixedSize()
+                    }
+                } else {
+                    Text("No selection")
+                        .font(.system(size: 11))
+                        .foregroundColor(.gray.opacity(0.5))
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(height: 16)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 6)
+            .background(Color.gray.opacity(0.05))
+            .overlay(
+                Rectangle()
+                    .frame(height: 1)
+                    .foregroundColor(Color.gray.opacity(0.15)),
+                alignment: .top
+            )
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 24)
@@ -1599,6 +1731,8 @@ struct ResultsGridView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.gray.opacity(0.2), lineWidth: 1)
         )
+        .onAppear { installKeyMonitor() }
+        .onDisappear { removeKeyMonitor() }
     }
 
     @ViewBuilder
@@ -1637,23 +1771,68 @@ struct ResultsGridView: View {
         panel.message = "Select destination directory for selected files"
 
         if panel.runModal() == .OK, let url = panel.url {
-            let result = viewModel.moveSelectedFiles(to: url.path)
+            viewModel.moveSelectedFiles(to: url.path) { success, failed, skipped in
+                var details = "Successfully moved \(success) file(s)."
+                if skipped > 0 {
+                    details += "\nSkipped \(skipped) file(s) already in that folder."
+                }
+                if failed > 0 {
+                    details += "\nFailed to move \(failed) file(s)."
+                }
 
-            var details = "Successfully moved \(result.success) file(s)."
-            if result.skipped > 0 {
-                details += "\nSkipped \(result.skipped) file(s) already in that folder."
+                let alert = NSAlert()
+                alert.messageText = "Files Moved"
+                alert.informativeText = details
+                alert.alertStyle = failed > 0 ? .warning : .informational
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
             }
-            if result.failed > 0 {
-                details += "\nFailed to move \(result.failed) file(s)."
-            }
-
-            let alert = NSAlert()
-            alert.messageText = "Files Moved"
-            alert.informativeText = details
-            alert.alertStyle = result.failed > 0 ? .warning : .informational
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
         }
+    }
+}
+
+// MARK: - File Path Breadcrumb (Finder-style path bar for the selected photo)
+struct FilePathBreadcrumbView: View {
+    let path: String
+
+    /// Path components with the leading "/Users" dropped so the first crumb
+    /// is the home folder, mirroring Finder's path bar.
+    private var components: [String] {
+        var parts = (path as NSString).pathComponents.filter { $0 != "/" }
+        if parts.first == "Users", parts.count > 1 {
+            parts.removeFirst()
+        }
+        return parts
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(Array(components.enumerated()), id: \.offset) { index, component in
+                    if index > 0 {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(.gray.opacity(0.6))
+                    }
+                    HStack(spacing: 4) {
+                        Image(systemName: icon(at: index))
+                            .font(.system(size: 10))
+                            .foregroundColor(index == components.count - 1 ? .gray : .blue)
+                        Text(component)
+                            .font(.system(size: 11))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .help(path)
+    }
+
+    private func icon(at index: Int) -> String {
+        if index == components.count - 1 { return "photo" }
+        if index == 0 && path.hasPrefix("/Users/") { return "house.fill" }
+        return "folder.fill"
     }
 }
 
@@ -1674,6 +1853,13 @@ struct ResultContextMenu: View {
     var body: some View {
         let items = targets
         let count = items.count
+
+        // Single-pose semantic: always acts on the clicked result, not the selection
+        Button("Find More Poses Like This") {
+            viewModel.findMorePosesLikeThis(result)
+        }
+
+        Divider()
 
         Button(count > 1 ? "Open \(count) Items" : "Open") {
             for path in items.compactMap(\.imagePath) {
@@ -1726,22 +1912,22 @@ struct ResultContextMenu: View {
         panel.message = "Select destination directory for selected files"
 
         if panel.runModal() == .OK, let url = panel.url {
-            let result = viewModel.moveSelectedFiles(to: url.path)
+            viewModel.moveSelectedFiles(to: url.path) { success, failed, skipped in
+                var details = "Successfully moved \(success) file(s)."
+                if skipped > 0 {
+                    details += "\nSkipped \(skipped) file(s) already in that folder."
+                }
+                if failed > 0 {
+                    details += "\nFailed to move \(failed) file(s)."
+                }
 
-            var details = "Successfully moved \(result.success) file(s)."
-            if result.skipped > 0 {
-                details += "\nSkipped \(result.skipped) file(s) already in that folder."
+                let alert = NSAlert()
+                alert.messageText = "Files Moved"
+                alert.informativeText = details
+                alert.alertStyle = failed > 0 ? .warning : .informational
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
             }
-            if result.failed > 0 {
-                details += "\nFailed to move \(result.failed) file(s)."
-            }
-
-            let alert = NSAlert()
-            alert.messageText = "Files Moved"
-            alert.informativeText = details
-            alert.alertStyle = result.failed > 0 ? .warning : .informational
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
         }
     }
 }
@@ -2274,13 +2460,13 @@ struct SearchingOverlayView: View {
     var statusText: String {
         let elapsed = viewModel.searchElapsed
         if elapsed < 2.0 {
-            return "Loading index from disk..."
+            return "Loading search index..."
         } else if elapsed < 10.0 {
             return "Searching \(viewModel.totalPosesIndexed > 0 ? "\(viewModel.totalPosesIndexed)" : "50,000+") poses..."
         } else if elapsed < 60.0 {
             return "Comparing geometric features..."
         } else {
-            return "Still searching (large index or first-time build)..."
+            return "Still searching (large search index or first-time build)..."
         }
     }
 
@@ -2386,15 +2572,15 @@ struct StatusBarView: View {
     var indexStatusText: String {
         switch viewModel.indexStatus {
         case .loading:
-            return "Loading index..."
+            return "Loading search index..."
         case .ready:
             return viewModel.totalPosesIndexed > 0
-                ? "Index ready - \(formattedPoseCount) poses"
-                : "Index ready - empty"
+                ? "Search index ready - \(formattedPoseCount) poses"
+                : "Search index ready (empty)"
         case .building:
-            return "Building index..."
+            return "Building search index..."
         case .error:
-            return "Index error"
+            return "Search index error"
         }
     }
 

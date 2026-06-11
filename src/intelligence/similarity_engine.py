@@ -429,7 +429,8 @@ class SimilarityEngine:
         min_region_confidence: float = 0.3,
         min_similarity: float = 0.0,
         query_keypoints: Optional[np.ndarray] = None,
-        query_bbox: Optional[np.ndarray] = None
+        query_bbox: Optional[np.ndarray] = None,
+        exclude_pose_id: Optional[str] = None
     ) -> List[Dict]:
         """
         Find k most similar poses to given feature vector with caching.
@@ -511,7 +512,8 @@ class SimilarityEngine:
             deduplicate_images,
             regions_tuple,
             min_region_confidence,
-            min_similarity
+            min_similarity,
+            exclude_pose_id
         )
 
         # Thread-safe cache check
@@ -851,6 +853,12 @@ class SimilarityEngine:
 
                 # Phase 3: iterate candidates in ranked order, filter, score, cap at k.
                 for faiss_idx, dist_f, pose_id, base_sim in candidates:
+                    # Exclude the query pose itself (search-by-pose-id) BEFORE the
+                    # dedup check below, so its image's dedup slot goes to the
+                    # next-best pose in that image instead of being consumed by the
+                    # query pose and then filtered out downstream.
+                    if exclude_pose_id is not None and str(pose_id) == exclude_pose_id:
+                        continue
                     rec = record_map.get(pose_id)
                     if rec is None:
                         continue

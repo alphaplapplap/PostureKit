@@ -65,6 +65,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Notification Names
 extension Notification.Name {
     static let indexPreloaded = Notification.Name("indexPreloaded")
+    static let folderExcluded = Notification.Name("folderExcluded")  // object: excluded folder path (String)
+    static let indexedFoldersChanged = Notification.Name("indexedFoldersChanged")
 }
 
 @main
