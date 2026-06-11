@@ -84,9 +84,24 @@ class GeometricFeatureExtractor:
 
     # Weight of the binary occlusion-pattern dims (45-51) in the normalized
     # vector. At 1.0 a single flipped flag contributes the same squared L2 as a
-    # 180-degree joint-angle error and dominates the metric; 0.25 makes it
-    # equivalent to a 45-degree difference — informative, not dominant.
-    OCCLUSION_FLAG_WEIGHT = 0.25
+    # 180-degree joint-angle error and dominates the metric. 0.25 was meant to
+    # be "informative, not dominant", but on occluded pairs — where half the
+    # positional dims are masked while flags never are — the 7 flags still
+    # accounted for ~23% of pair divergence (measured on 94 real near-neighbor
+    # occluded pairs, sim_occlusion_params.py 2026-06-12). 0.15 (~27-degree
+    # equivalent) keeps visibility informative without outvoting positioning.
+    OCCLUSION_FLAG_WEIGHT = 0.15
+
+    # Exponent of the visibility-trust curve in _get_keypoint_confidence.
+    # 2.0 (the 2026-06-10 occlusion-repair keystone) crushed vis=1 keypoints
+    # below every masked-search gate — which also erased LEGS, the most
+    # frequently occluded body part, from comparison: occluded pairs matched on
+    # a median of 4/17 leg dims. Linear (1.0) admits the model's high-confidence
+    # occluded estimates (conf*0.5, so >= 0.70 raw passes a 0.35 gate) and
+    # doubles leg coverage to 8/17 while still halving the trust of estimated
+    # positions. Validated against the synthetic-occlusion self-similarity
+    # benchmark before adoption.
+    VIS_TRUST_EXPONENT = 1.0
 
     # Keypoint indices (RTMW-L 133-keypoint model)
     KEYPOINT_NOSE = 0
@@ -252,14 +267,14 @@ class GeometricFeatureExtractor:
                 conf = keypoints[idx, 2]
 
                 # Scale trust by visibility: an occluded-but-inferred keypoint
-                # (vis=1) keeps its geometry in the feature VALUE but loses most
-                # of its confidence — the model's raw score on hallucinated
-                # keypoints stays high under occlusion (measured ~0.9), so
-                # confidence alone cannot gate them; visibility is the more
-                # sensitive signal. Squared so vis=1 gives trust 0.25: a typical
-                # 0.9-confidence hallucination lands at ~0.22, below the default
-                # 0.35 masked-search gate, while vis=2 keypoints are untouched.
-                vis_trust = (min(vis, 2.0) / 2.0) ** 2
+                # (vis=1) keeps its geometry in the feature VALUE but loses
+                # confidence — the model's raw score stays high under occlusion
+                # (~0.9), so visibility is the more sensitive signal. The curve
+                # exponent is the policy knob (see VIS_TRUST_EXPONENT): linear
+                # gives vis=1 trust 0.5, so only the model's most confident
+                # occluded estimates (raw >= 0.70) cross the default 0.35
+                # masked-search gate; vis=2 keypoints are untouched either way.
+                vis_trust = (min(vis, 2.0) / 2.0) ** self.VIS_TRUST_EXPONENT
 
                 if self.use_occluded_keypoints:
                     # Accept occluded or better (vis >= 1.0)

@@ -115,12 +115,16 @@ class PostureKitViewModel: ObservableObject {
 
     // Advanced Search Parameters
     @Published var kMultiplier: Double = 1.0  // DEPRECATED: Python applies intelligent multipliers (3-10×) based on search type
-    @Published var minFeatureConfidence: Double = UserDefaults.standard.object(forKey: "search.minFeatureConfidence") as? Double ?? 0.0 {
+    // Defaults 0.35/12 match the engine's masked-search design. At 0.0 the
+    // confidence masking never engages: occluded keypoints' DEFAULT placeholder
+    // values (90-degree angles etc.) get compared as real positioning, which is
+    // exactly the "leg posture looks wrong" failure mode. Sliders still go to 0.
+    @Published var minFeatureConfidence: Double = UserDefaults.standard.object(forKey: "search.minFeatureConfidence") as? Double ?? 0.35 {
         didSet { UserDefaults.standard.set(minFeatureConfidence, forKey: "search.minFeatureConfidence") }
-    }  // Filter rebuild: bare minimum
-    @Published var minValidOverlap: Double = UserDefaults.standard.object(forKey: "search.minValidOverlap") as? Double ?? 0.0 {
+    }
+    @Published var minValidOverlap: Double = UserDefaults.standard.object(forKey: "search.minValidOverlap") as? Double ?? 12.0 {
         didSet { UserDefaults.standard.set(minValidOverlap, forKey: "search.minValidOverlap") }
-    }  // Filter rebuild: bare minimum (0/52)
+    }
     @Published var showMultiplePeoplePerImage: Bool = UserDefaults.standard.bool(forKey: "search.showMultiplePeoplePerImage") {
         didSet { UserDefaults.standard.set(showMultiplePeoplePerImage, forKey: "search.showMultiplePeoplePerImage") }
     }  // Show all people from multi-person images (default: deduplicate for cleaner results)

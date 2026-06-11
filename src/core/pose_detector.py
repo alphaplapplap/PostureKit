@@ -628,7 +628,7 @@ class RTMWCocktail14Detector:
         img_h, img_w = image_shape
 
         # 1. Reject tiny bounding boxes (hands/feet mistaken as bodies)
-        MIN_BBOX_SIZE = 50  # pixels
+        MIN_BBOX_SIZE = 32  # pixels (was 50; partial figures and distant people are valid poses)
         if bbox[2] < MIN_BBOX_SIZE or bbox[3] < MIN_BBOX_SIZE:
             logger.debug(f"Rejected detection: bbox too small ({bbox[2]}x{bbox[3]})")
             return False
@@ -640,20 +640,26 @@ class RTMWCocktail14Detector:
             return False
 
         # 3. Require minimum visible keypoints
-        MIN_VISIBLE_KEYPOINTS = 8  # At least torso visible
+        # 5 (was 8): not every photo holds a full figure — torso-only and
+        # lower-body crops are legitimate, matchable poses. The masked search
+        # compares only mutually-confident dims, so sparse poses are handled.
+        MIN_VISIBLE_KEYPOINTS = 5
         visible_count = (keypoints[:, 2] > self.detection_threshold).sum()
         if visible_count < MIN_VISIBLE_KEYPOINTS:
             logger.debug(f"Rejected detection: only {visible_count} visible keypoints")
             return False
 
-        # 4. Check for plausible body structure (shoulders exist)
+        # 4. Check for plausible body structure: shoulders OR hips anchor a
+        # body (was shoulders-only, which made lower-body crops undetectable).
         l_shoulder_conf = keypoints[5, 2]
         r_shoulder_conf = keypoints[6, 2]
         has_shoulders = (l_shoulder_conf > self.detection_threshold or
                          r_shoulder_conf > self.detection_threshold)
+        has_hips = (keypoints[11, 2] > self.detection_threshold or
+                    keypoints[12, 2] > self.detection_threshold)
 
-        if not has_shoulders:
-            logger.debug("Rejected detection: no shoulders detected")
+        if not (has_shoulders or has_hips):
+            logger.debug("Rejected detection: neither shoulders nor hips detected")
             return False
 
         # 5. Check shoulder width is reasonable (not a hand)
