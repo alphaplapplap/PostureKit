@@ -1823,10 +1823,9 @@ class PostureKitBridge:
                         processed_images += 1
                         continue
 
-                    if not poses:
-                        logger.debug(f"No poses detected in {image_path.name}")
-                        processed_images += 1
-                        continue
+                    # Zero detections fall through: the empty valid_poses branch
+                    # below records the photo as a pose-less library row (and the
+                    # replace block's path self-heal still runs for moved files).
 
                     # Filter poses by confidence BEFORE processing
                     valid_poses = [p for p in poses if p.overall_confidence >= min_confidence]
@@ -1907,14 +1906,9 @@ class PostureKitBridge:
                                 q.delete(synchronize_session=False)
                             logger.info(f"Replaced {len(replace_ids)} old pose(s) for re-processed {image_path.name}")
 
-                    if not valid_poses:
-                        logger.debug(f"No poses above confidence threshold ({min_confidence}) in {image_path.name}")
-                        processed_images += 1
-                        continue
-
-                    logger.info(f"Processing {len(valid_poses)} person(s) in {image_path.name}")
-
-                    # Generate thumbnail ONCE per image (not per person)
+                    # Generate thumbnail ONCE per image (not per person); also kept
+                    # for pose-less photos so a later re-detection that finds poses
+                    # has a thumbnail waiting.
                     thumbnail_bytes = None
                     try:
                         from src.utils.thumbnail_generator import ThumbnailGenerator
@@ -1939,6 +1933,25 @@ class PostureKitBridge:
                         dtype=str(image.dtype),
                         content_hash=content_hash
                     )
+
+                    if not valid_poses:
+                        # Detection ran successfully and found nothing usable:
+                        # record a pose-less library row so the next incremental
+                        # Update skips this photo instead of re-detecting it on
+                        # every run. Re-detection and skip-off Updates still
+                        # re-attempt it (the row lives in the images table), so
+                        # pipeline upgrades aren't lost. Load/detection FAILURES
+                        # deliberately leave no row so they retry next run.
+                        try:
+                            self.storage_manager.store_image_only(image_path, image_metadata, thumbnail_bytes)
+                        except Exception as e:
+                            logger.error(f"Pose-less image record failed for {image_path.name}: {e}", exc_info=True)
+                            print(f"ERROR [Poseless Record]: {image_path.name}: {e}", file=sys.stderr, flush=True)
+                        logger.debug(f"No poses above confidence threshold ({min_confidence}) in {image_path.name}")
+                        processed_images += 1
+                        continue
+
+                    logger.info(f"Processing {len(valid_poses)} person(s) in {image_path.name}")
 
                     # Process each person
                     for pose in valid_poses:

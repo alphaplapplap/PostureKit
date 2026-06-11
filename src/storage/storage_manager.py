@@ -156,6 +156,44 @@ class StorageManager:
                 session.close()
                 # Connection automatically returned to pool
     
+    def store_image_only(
+        self,
+        image_path: Path,
+        image_metadata: ImageMetadata,
+        thumbnail_bytes: Optional[bytes] = None
+    ) -> UUID:
+        """
+        Get-or-create an Image record with no pose rows.
+
+        Records a photo that was successfully scanned but yielded zero valid
+        poses, so incremental updates can skip it instead of re-detecting it
+        on every run. Re-detection (and skip-off updates) still re-attempt
+        these photos since the row lives in the images table.
+
+        Returns the image id.
+        """
+        with self.session_scope() as session:
+            image = session.execute(
+                select(Image).where(Image.file_path == str(image_path))
+            ).scalar_one_or_none()
+
+            if image is None:
+                image = Image(
+                    file_path=str(image_path),
+                    content_hash=image_metadata.content_hash,
+                    width=image_metadata.original_width,
+                    height=image_metadata.original_height,
+                    file_size_bytes=image_metadata.file_size_bytes,
+                    thumbnail=thumbnail_bytes
+                )
+                session.add(image)
+                session.flush()  # Get image.id
+                logger.debug(f"Created pose-less Image record: {image.id}")
+            elif thumbnail_bytes and not image.thumbnail:
+                image.thumbnail = thumbnail_bytes
+
+            return image.id
+
     def store_detection(
         self,
         image_path: Path,
