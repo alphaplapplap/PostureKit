@@ -740,7 +740,15 @@ class PythonBridgeSubprocess {
         }
 
         let resumeParam = resumeSince.map { "'\($0)'" } ?? "None"
-        print("[REDETECT] Starting corpus re-detection: poseModel=\(poseModel), device=\(device), resumeSince=\(resumeSince ?? "fresh run")")
+
+        // Worker processes parallelize detection (each loads its own model
+        // stack; the GPU is not saturated by one process). Benchmarked on the
+        // M5 Max: 2 workers = 1.9x pose throughput; 3 workers REGRESSES below
+        // 2 (GPU/ANE contention). Override via `defaults write ... redetectWorkers N`.
+        let storedWorkers = UserDefaults.standard.integer(forKey: "redetectWorkers")
+        let workers = storedWorkers > 0 ? storedWorkers : 2
+
+        print("[REDETECT] Starting corpus re-detection: poseModel=\(poseModel), device=\(device), workers=\(workers), resumeSince=\(resumeSince ?? "fresh run")")
 
         let script = """
         import sys
@@ -749,14 +757,19 @@ class PythonBridgeSubprocess {
         from src.swift_bridge import PostureKitBridge
 
         print('DEBUG: Initializing bridge for corpus re-detection', file=sys.stderr, flush=True)
-        bridge = PostureKitBridge(
+        KW = dict(
             pose_models=\(poseModelsParam),
             fusion_method='\(fusionMethod)',
             use_two_stage=\(pythonBool(useTwoStage)),
             num_threads=\(threads),
             device='\(device)'
         )
-        result = bridge.redetect_all_images(resume_since=\(resumeParam))
+        bridge = PostureKitBridge(**KW)
+        result = bridge.redetect_all_images(
+            resume_since=\(resumeParam),
+            workers=\(workers),
+            worker_init_kwargs=KW,
+        )
         print(f'DEBUG: Re-detection complete: {result}', file=sys.stderr, flush=True)
         """
 

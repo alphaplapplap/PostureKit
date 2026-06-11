@@ -944,38 +944,48 @@ class PostureKitBridge:
         min_confidence: float = 0.3,
         limit: Optional[int] = None,
         resume_since: Optional[str] = None,
+        offset: int = 0,
+        workers: int = 1,
+        worker_init_kwargs: Optional[Dict[str, Any]] = None,
+        rebuild_index: bool = True,
     ) -> Dict[str, Any]:
         """Re-run detection on every indexed image with the current pipeline.
 
-        Replaces each image's existing poses with fresh detections, EXCEPT
-        manually corrected poses (is_corrected=True), which are preserved —
-        new detections overlapping a preserved pose (IoU >= 0.45) are dropped
-        so corrected people aren't duplicated. An image's old poses are only
-        deleted after detection on it succeeds, so a crash mid-run leaves
-        every image either fully old or fully new, never empty.
+        Replaces each image's existing poses (and their body-part rows) with
+        fresh detections, EXCEPT manually corrected poses (is_corrected=True),
+        which are preserved — new detections overlapping a preserved pose
+        (IoU >= 0.45) are dropped. An image's old records are deleted only
+        after detection on it succeeds, so an interruption leaves every image
+        either fully old or fully new, never empty.
 
-        Emits the same PROGRESS stdout protocol as index_directory (Swift
-        parses it with the existing IndexProgress machinery) and rebuilds the
-        FAISS index once at the end.
+        Emits the same PROGRESS stdout protocol as index_directory, with a
+        paired stderr heartbeat per image (the Swift reader alternates
+        blocking reads between the two pipes; feeding both every image
+        prevents the pipe-fill deadlock observed against a 626-file evicted
+        iCloud folder). Rebuilds the FAISS index once at the end.
 
         Args:
             min_confidence: Minimum overall pose confidence to store
             limit: Optional cap on number of images (validation runs)
+            offset: Skip the first N remaining images (diagnostics/benchmarks)
             resume_since: Optional ISO timestamp — images whose newest pose was
                 created after this moment were already re-detected by an
-                interrupted run and are skipped. Pass the original run's start
-                time to resume it. (Images that yielded zero poses leave no
-                marker and are re-processed; that is correct and cheap.)
+                interrupted run and are skipped. (Images that yielded zero
+                poses leave no marker and are re-processed; correct and cheap.)
+            workers: Number of detection processes. 1 = in-process sequential.
+                >1 spawns that many worker processes, each with its own model
+                stack, sharding the image list — detection is the bottleneck
+                and the GPU is not saturated by a single process.
+            worker_init_kwargs: PostureKitBridge kwargs for worker processes
+                (pass the same configuration used to build this bridge).
+            rebuild_index: Rebuild FAISS at the end (disable for benchmarks).
 
         Returns:
             Summary dict with totals.
         """
         import sys
-        import cv2
         from sqlalchemy import func as sa_func
         from src.storage.models import Image as ImageModel, PoseDetection
-        from src.core.image_ingestor import ImageMetadata
-        from src.utils.image_utils import ImageUtils
 
         with self.storage_manager.session_scope() as session:
             rows = [
@@ -1012,136 +1022,176 @@ class PostureKitBridge:
                   f"re-detected since {resume_since}, {len(rows)} remaining",
                   file=sys.stderr, flush=True)
 
+        if offset:
+            rows = rows[offset:]
         if limit is not None:
             rows = rows[:limit]
 
         total_images = len(rows)
-        processed = poses_stored = failed = missing = preserved = deleted = 0
-        logger.info(f"Re-detection starting: {total_images} images")
+        counts = {'stored': 0, 'deleted': 0, 'preserved': 0,
+                  'failed': 0, 'missing': 0}
+        processed = 0
+        logger.info(f"Re-detection starting: {total_images} images, workers={workers}")
 
-        for image_id, file_path in rows:
+        def emit_progress(current_file: str) -> None:
             progress = {
                 'type': 'progress',
-                'current_file': Path(file_path).name,
+                'current_file': current_file,
                 'images_processed': processed,
                 'total_images': total_images,
-                'poses_indexed': poses_stored,
-                'failed_images': failed,
-                'skipped_images': missing,
+                'poses_indexed': counts['stored'],
+                'failed_images': counts['failed'],
+                'skipped_images': counts['missing'],
                 'failed_index_additions': 0,
                 'progress': processed / total_images if total_images else 0.0,
             }
-            # Stdout progress AND a paired stderr heartbeat, like
-            # index_directory. The Swift reader alternates BLOCKING reads
-            # between the two pipes; a stretch of images that writes only
-            # stdout (e.g. hundreds of missing files) starves the stderr read,
-            # fills the stdout pipe, and deadlocks both processes — observed
-            # against a 626-file evicted iCloud folder. Feeding both pipes
-            # every image keeps the reader cycling.
+            # Paired stderr heartbeat + stdout progress: keeps both pipes fed
+            # so the Swift blocking reader keeps cycling (see docstring).
             print(f"DEBUG REDETECT: processed={processed}/{total_images} "
-                  f"stored={poses_stored} failed={failed} missing={missing}",
+                  f"stored={counts['stored']} failed={counts['failed']} "
+                  f"missing={counts['missing']}",
                   file=sys.stderr, flush=True)
             print(f"PROGRESS:{json.dumps(progress)}", flush=True)
 
-            image_path = Path(file_path)
+        def fold(status: Dict[str, Any]) -> None:
+            counts['stored'] += status.get('stored', 0)
+            counts['deleted'] += status.get('deleted', 0)
+            counts['preserved'] += status.get('preserved', 0)
+            if status['status'] == 'failed':
+                counts['failed'] += 1
+            elif status['status'] == 'missing':
+                counts['missing'] += 1
+
+        import time as _time
+        first_img_t = last_img_t = None
+
+        if workers <= 1 or total_images <= 1:
+            first_img_t = _time.monotonic()
+            for image_id, file_path in rows:
+                emit_progress(Path(file_path).name)
+                status = self._redetect_one_image(image_id, file_path, min_confidence)
+                processed += 1
+                fold(status)
+            last_img_t = _time.monotonic()
+        else:
+            # Worker processes via plain subprocess: multiprocessing's 'spawn'
+            # re-imports the parent's __main__, which does not exist when the
+            # app launches this code via `python3 -c`/stdin (observed:
+            # FileNotFoundError '<stdin>'). Each worker is an independent
+            # interpreter fed a shard file; per-image results come back as
+            # WORKER_IMG lines on its private stdout pipe (the app's PROGRESS
+            # stdout belongs to this parent), stderr is inherited.
+            import os
+            import signal
+            import selectors
+            import subprocess
+            import tempfile
+
+            project_root = str(Path(__file__).resolve().parent.parent)
+            shard_paths = []
+            procs = []
             try:
-                if not image_path.exists():
-                    missing += 1
-                    processed += 1
-                    continue
+                shards = [rows[i::workers] for i in range(workers)]
+                for i in range(workers):
+                    tf = tempfile.NamedTemporaryFile(
+                        'w', suffix=f'_redetect_shard{i}.json', delete=False)
+                    json.dump({
+                        'shard': [[str(iid), fp] for iid, fp in shards[i]],
+                        'bridge_kwargs': worker_init_kwargs or {},
+                        'min_confidence': min_confidence,
+                    }, tf)
+                    tf.close()
+                    shard_paths.append(tf.name)
 
-                image = cv2.imread(str(image_path))
-                if image is None:
-                    # Unicode-path fallback (e.g. narrow no-break spaces)
-                    data = np.fromfile(str(image_path), dtype=np.uint8)
-                    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                if image is None:
-                    print(f"ERROR [Redetect Load]: {image_path.name}", file=sys.stderr, flush=True)
-                    failed += 1
-                    processed += 1
-                    continue
-                image_rgb = ImageUtils.normalize_to_rgb(image, image_path)
-
-                # Existing poses: corrected ones are preserved, the rest replaced
-                with self.storage_manager.session_scope() as session:
-                    existing = session.query(
-                        PoseDetection.id,
-                        PoseDetection.bbox,
-                        PoseDetection.is_corrected,
-                    ).filter(PoseDetection.image_id == image_id).all()
-                corrected_bboxes = [e[1] for e in existing if e[2] and e[1] is not None]
-                replace_ids = [e[0] for e in existing if not e[2]]
-                preserved += len(existing) - len(replace_ids)
-
-                if hasattr(self.detector, 'detect_multi_person'):
-                    poses = self.detector.detect_multi_person(image_rgb)
-                else:
-                    poses = self.detector.detect(image_rgb)
-                valid_poses = [p for p in poses if p.overall_confidence >= min_confidence]
-                if corrected_bboxes:
-                    valid_poses = [
-                        p for p in valid_poses
-                        if all(self._bbox_iou_xywh(p.bbox, cb) < 0.45
-                               for cb in corrected_bboxes)
-                    ]
-
-                # Detection succeeded — now safe to drop the replaced poses
-                for pid in replace_ids:
-                    if self.storage_manager.delete_pose(pid):
-                        deleted += 1
-
-                channels = image.shape[2] if len(image.shape) == 3 else 1
-                image_metadata = ImageMetadata(
-                    file_path=image_path,
-                    original_width=image.shape[1],
-                    original_height=image.shape[0],
-                    file_size_bytes=image_path.stat().st_size,
-                    channels=channels,
-                    dtype=str(image.dtype),
-                    content_hash=None,
+                boot = (
+                    "import sys; "
+                    f"sys.path.insert(0, {project_root!r}); "
+                    "from src.swift_bridge import _redetect_worker_subprocess_main; "
+                    "_redetect_worker_subprocess_main(sys.argv[1], int(sys.argv[2]))"
                 )
+                for i in range(workers):
+                    procs.append(subprocess.Popen(
+                        [sys.executable, '-u', '-c', boot, shard_paths[i], str(i)],
+                        stdout=subprocess.PIPE,
+                        stderr=None,  # inherit: keeps the app's stderr pipe fed
+                        text=True,
+                        bufsize=1,
+                        env=os.environ.copy(),
+                    ))
 
-                for pose in valid_poses:
-                    extracted = self._extract_person_features(image_rgb, pose, image_path.name)
-                    if extracted is None:
-                        continue
-                    features, visual_features, fused_features, body_part_detections = extracted
+                # cancelIndexing() SIGTERMs this parent; take the children along.
+                def _terminate_children(signum, frame):
+                    for p in procs:
+                        if p.poll() is None:
+                            p.terminate()
+                    sys.exit(1)
+                old_handler = signal.signal(signal.SIGTERM, _terminate_children)
+
+                print(f"DEBUG REDETECT: {workers} workers started "
+                      f"(shards: {[len(s) for s in shards]})",
+                      file=sys.stderr, flush=True)
+
+                sel = selectors.DefaultSelector()
+                for p in procs:
+                    sel.register(p.stdout, selectors.EVENT_READ, p)
+                open_workers = set(procs)
+                while open_workers:
+                    events = sel.select(timeout=600)
+                    if not events:
+                        if any(p.poll() is None for p in open_workers):
+                            print("DEBUG REDETECT: no output for 600s, workers still alive — waiting",
+                                  file=sys.stderr, flush=True)
+                            continue
+                        print("ERROR [Redetect]: all workers exited without closing their streams",
+                              file=sys.stderr, flush=True)
+                        break
+                    for key, _ in events:
+                        line = key.fileobj.readline()
+                        if not line:  # EOF: worker exited
+                            sel.unregister(key.fileobj)
+                            open_workers.discard(key.data)
+                            continue
+                        if not line.startswith('WORKER_IMG:'):
+                            continue
+                        try:
+                            current_file, status = json.loads(line[len('WORKER_IMG:'):])
+                        except (ValueError, TypeError):
+                            continue
+                        if first_img_t is None:
+                            first_img_t = _time.monotonic()
+                        last_img_t = _time.monotonic()
+                        processed += 1
+                        fold(status)
+                        emit_progress(current_file)
+                for p in procs:
+                    p.wait(timeout=30)
+            finally:
+                try:
+                    signal.signal(signal.SIGTERM, old_handler)
+                except (UnboundLocalError, ValueError):
+                    pass
+                for p in procs:
+                    if p.poll() is None:
+                        p.terminate()
+                for sp in shard_paths:
                     try:
-                        self.storage_manager.store_detection(
-                            image_path=image_path,
-                            image_metadata=image_metadata,
-                            pose_result=pose,
-                            features=features,
-                            visual_features=visual_features,
-                            fused_features=fused_features,
-                            thumbnail_bytes=None,  # keep the existing thumbnail
-                            body_part_detections=body_part_detections,
-                        )
-                        poses_stored += 1
-                    except Exception as e:
-                        logger.error(f"Redetect storage failed for {image_path.name}: {e}", exc_info=True)
-                        print(f"ERROR [Redetect Storage]: {image_path.name}: {e}", file=sys.stderr, flush=True)
-                processed += 1
+                        os.unlink(sp)
+                    except OSError:
+                        pass
 
-            except Exception as e:
-                import traceback
-                print(f"ERROR [Redetect]: {image_path}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                traceback.print_exc(file=sys.stderr)
-                logger.error(f"Redetect failed for {image_path}: {e}", exc_info=True)
-                failed += 1
-                processed += 1
-
-        # Single rebuild at the end — incremental adds would fight the deletions
-        self.similarity_engine.build_index(force_rebuild=True)
+        if rebuild_index:
+            # Single rebuild at the end — incremental adds would fight the
+            # deletions, and workers write the DB, not the index.
+            self.similarity_engine.build_index(force_rebuild=True)
 
         final_progress = {
             'type': 'progress',
-            'current_file': 'Index rebuild complete',
+            'current_file': 'Index rebuild complete' if rebuild_index else 'Done (index not rebuilt)',
             'images_processed': processed,
             'total_images': total_images,
-            'poses_indexed': poses_stored,
-            'failed_images': failed,
-            'skipped_images': missing,
+            'poses_indexed': counts['stored'],
+            'failed_images': counts['failed'],
+            'skipped_images': counts['missing'],
             'failed_index_additions': 0,
             'progress': 1.0,
         }
@@ -1150,14 +1200,132 @@ class PostureKitBridge:
         summary = {
             'total_images': total_images,
             'processed_images': processed,
-            'poses_stored': poses_stored,
-            'poses_deleted': deleted,
-            'poses_preserved': preserved,
-            'failed_images': failed,
-            'missing_files': missing,
+            'poses_stored': counts['stored'],
+            'poses_deleted': counts['deleted'],
+            'poses_preserved': counts['preserved'],
+            'failed_images': counts['failed'],
+            'missing_files': counts['missing'],
+            'workers': workers,
         }
+        if first_img_t is not None and last_img_t is not None and processed > 1:
+            steady = (processed - 1) / max(last_img_t - first_img_t, 1e-6)
+            summary['steady_images_per_sec'] = round(steady, 3)
         logger.info(f"Re-detection complete: {summary}")
         return summary
+
+    def _redetect_one_image(
+        self,
+        image_id,
+        file_path: str,
+        min_confidence: float,
+    ) -> Dict[str, Any]:
+        """Re-detect a single indexed image. Returns
+        {'status': 'ok'|'missing'|'failed', 'stored': n, 'deleted': n, 'preserved': n}.
+
+        Old poses AND their body-part rows are removed only after detection
+        succeeds. BodyPart cascades from Image, not PoseDetection, so
+        delete_pose alone leaves stale rows that would duplicate on every run.
+        Workers call this too — it must never write to stdout.
+        """
+        import sys
+        import cv2
+        from src.storage.models import PoseDetection, BodyPart
+        from src.core.image_ingestor import ImageMetadata
+        from src.utils.image_utils import ImageUtils
+
+        result = {'status': 'ok', 'stored': 0, 'deleted': 0, 'preserved': 0}
+        image_path = Path(file_path)
+        try:
+            if not image_path.exists():
+                result['status'] = 'missing'
+                return result
+
+            image = cv2.imread(str(image_path))
+            if image is None:
+                # Unicode-path fallback (e.g. narrow no-break spaces)
+                data = np.fromfile(str(image_path), dtype=np.uint8)
+                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if image is None:
+                print(f"ERROR [Redetect Load]: {image_path.name}", file=sys.stderr, flush=True)
+                result['status'] = 'failed'
+                return result
+            image_rgb = ImageUtils.normalize_to_rgb(image, image_path)
+
+            # Existing poses: corrected ones are preserved, the rest replaced
+            with self.storage_manager.session_scope() as session:
+                existing = session.query(
+                    PoseDetection.id,
+                    PoseDetection.bbox,
+                    PoseDetection.is_corrected,
+                    PoseDetection.person_id,
+                ).filter(PoseDetection.image_id == image_id).all()
+            corrected_bboxes = [e[1] for e in existing if e[2] and e[1] is not None]
+            corrected_person_ids = [e[3] for e in existing if e[2]]
+            replace_ids = [e[0] for e in existing if not e[2]]
+            result['preserved'] = len(existing) - len(replace_ids)
+
+            if hasattr(self.detector, 'detect_multi_person'):
+                poses = self.detector.detect_multi_person(image_rgb)
+            else:
+                poses = self.detector.detect(image_rgb)
+            valid_poses = [p for p in poses if p.overall_confidence >= min_confidence]
+            if corrected_bboxes:
+                valid_poses = [
+                    p for p in valid_poses
+                    if all(self._bbox_iou_xywh(p.bbox, cb) < 0.45
+                           for cb in corrected_bboxes)
+                ]
+
+            # Detection succeeded — now safe to drop the replaced records
+            for pid in replace_ids:
+                if self.storage_manager.delete_pose(pid):
+                    result['deleted'] += 1
+            with self.storage_manager.session_scope() as session:
+                q = session.query(BodyPart).filter(BodyPart.image_id == image_id)
+                if corrected_person_ids:
+                    q = q.filter(~BodyPart.person_index.in_(corrected_person_ids))
+                q.delete(synchronize_session=False)
+
+            channels = image.shape[2] if len(image.shape) == 3 else 1
+            image_metadata = ImageMetadata(
+                file_path=image_path,
+                original_width=image.shape[1],
+                original_height=image.shape[0],
+                file_size_bytes=image_path.stat().st_size,
+                channels=channels,
+                dtype=str(image.dtype),
+                content_hash=None,
+            )
+
+            for pose in valid_poses:
+                extracted = self._extract_person_features(image_rgb, pose, image_path.name)
+                if extracted is None:
+                    continue
+                features, visual_features, fused_features, body_part_detections = extracted
+                try:
+                    self.storage_manager.store_detection(
+                        image_path=image_path,
+                        image_metadata=image_metadata,
+                        pose_result=pose,
+                        features=features,
+                        visual_features=visual_features,
+                        fused_features=fused_features,
+                        thumbnail_bytes=None,  # keep the existing thumbnail
+                        body_part_detections=body_part_detections,
+                    )
+                    result['stored'] += 1
+                except Exception as e:
+                    logger.error(f"Redetect storage failed for {image_path.name}: {e}", exc_info=True)
+                    print(f"ERROR [Redetect Storage]: {image_path.name}: {e}", file=sys.stderr, flush=True)
+            return result
+
+        except Exception as e:
+            import traceback
+            print(f"ERROR [Redetect]: {image_path}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            logger.error(f"Redetect failed for {image_path}: {e}", exc_info=True)
+            result['status'] = 'failed'
+            return result
 
     def _extract_person_features(self, image_rgb, pose, image_name):
         """Extract geometric, visual, fused, and body-part features for one
@@ -2250,3 +2418,38 @@ def get_statistics() -> Dict[str, Any]:
 def build_index(force_rebuild: bool = False) -> bool:
     """Convenience function for building index."""
     return get_bridge().build_index(force_rebuild)
+
+
+
+def _redetect_worker_subprocess_main(shard_path, worker_idx):
+    """Entry point for re-detection worker subprocesses. Loads its shard spec
+    from a JSON file, builds a full bridge, and reports one WORKER_IMG line
+    per image on stdout (a private pipe to the parent — never the app's
+    stdout). Everything else goes to the inherited stderr."""
+    import json as _json
+    import sys
+    import uuid as _uuid
+    from pathlib import Path as _Path
+
+    with open(shard_path) as f:
+        spec = _json.load(f)
+
+    try:
+        bridge = PostureKitBridge(**spec['bridge_kwargs'])
+    except Exception as e:
+        print(f"ERROR [Redetect Worker {worker_idx}]: init failed: {e}",
+              file=sys.stderr, flush=True)
+        return
+    print(f"DEBUG REDETECT: worker {worker_idx} ready ({len(spec['shard'])} images)",
+          file=sys.stderr, flush=True)
+
+    for iid, file_path in spec['shard']:
+        try:
+            status = bridge._redetect_one_image(
+                _uuid.UUID(iid), file_path, spec['min_confidence'])
+        except Exception as e:
+            print(f"ERROR [Redetect Worker {worker_idx}]: {file_path}: {e}",
+                  file=sys.stderr, flush=True)
+            status = {'status': 'failed', 'stored': 0, 'deleted': 0, 'preserved': 0}
+        print('WORKER_IMG:' + _json.dumps([_Path(file_path).name, status]),
+              flush=True)
