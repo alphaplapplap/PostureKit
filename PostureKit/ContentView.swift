@@ -2133,79 +2133,8 @@ struct ResultCardView: View, Equatable {
                     .foregroundColor(.gray.opacity(0.3))
             }
 
-            // Skeleton overlay
-            if let keypoints = result.keypoints, !keypoints.isEmpty {
-                Canvas { context, size in
-                    // Calculate original image size for proper skeleton overlay positioning
-                    let originalSize: CGSize?
-                    if let width = result.imageWidth, let height = result.imageHeight {
-                        originalSize = CGSize(width: CGFloat(width), height: CGFloat(height))
-                    } else {
-                        originalSize = nil
-                    }
-                    
-                    drawSkeleton(
-                        context: context,
-                        size: size,
-                        keypoints: keypoints,
-                        detail: matchTier.skeletonDetail,
-                        alreadyNormalized: false,
-                        isSelected: true,
-                        originalImageSize: originalSize
-                    )
-                }
-            }
-
-            // Bounding box overlay (multi-person support)
-            if let bbox = result.bbox,
-               let imageWidth = result.imageWidth,
-               let imageHeight = result.imageHeight,
-               bbox.count == 4 {
-                Canvas { context, size in
-                    // Bbox is [x_min, y_min, x_max, y_max] in image coordinates
-                    let xMin = bbox[0]
-                    let yMin = bbox[1]
-                    let xMax = bbox[2]
-                    let yMax = bbox[3]
-
-                    // Calculate scale to fit image within 200x200 thumbnail
-                    let scale = min(200.0 / Double(imageWidth), 200.0 / Double(imageHeight))
-                    let scaledWidth = Double(imageWidth) * scale
-                    let scaledHeight = Double(imageHeight) * scale
-
-                    // Calculate padding offsets (center image on canvas)
-                    let xOffset = (200.0 - scaledWidth) / 2
-                    let yOffset = (200.0 - scaledHeight) / 2
-
-                    // Convert bbox to thumbnail coordinates
-                    let bboxX = xMin * scale + xOffset
-                    let bboxY = yMin * scale + yOffset
-                    let bboxWidth = (xMax - xMin) * scale
-                    let bboxHeight = (yMax - yMin) * scale
-
-                    // Draw bbox rectangle
-                    let rect = CGRect(x: bboxX, y: bboxY, width: bboxWidth, height: bboxHeight)
-                    let path = Path(roundedRect: rect, cornerRadius: 2)
-
-                    context.stroke(
-                        path,
-                        with: .color(.green),
-                        lineWidth: 2
-                    )
-
-                    // Draw person_id badge if available
-                    if let personId = result.personId {
-                        let badgeText = "P\(personId)"
-                        context.draw(
-                            Text(badgeText)
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(.white),
-                            at: CGPoint(x: bboxX + 12, y: bboxY + 8),
-                            anchor: .center
-                        )
-                    }
-                }
-            }
+            // Result thumbnails intentionally show NO skeleton/keypoint or bounding-box overlay
+            // (removed by request) — just the photo. The query image still shows its overlay.
 
             // Badges (similarity + flipped indicator)
             VStack(alignment: .leading, spacing: 4) {
