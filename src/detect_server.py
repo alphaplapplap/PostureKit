@@ -54,24 +54,6 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ---------------------------------------------------------------------------
-# OpenMP safety — MUST run BEFORE faiss/torch are imported (swift_bridge below).
-# faiss-cpu and torch each bundle their OWN libomp.dylib. This persistent server loads
-# BOTH (the bridge pulls in the FAISS search engine AND the torch detection models), so
-# two OpenMP runtimes coexist in one process. Their multi-threaded thread pools can
-# corrupt each other's barrier state and SIGSEGV inside __kmp_suspend_64 during a
-# parallel region — observed crashing on a torch tensor copy_ while loading the RTMW
-# model (EXC_BAD_ACCESS at 0x10 in libomp). Forcing single-threaded OpenMP removes the
-# worker-thread barriers entirely, which neutralizes the conflict; KMP_DUPLICATE_LIB_OK
-# tolerates the duplicate runtime at init. This server is GPU (MPS/CoreML) bound, so
-# single-threaded CPU OMP/BLAS costs effectively nothing here. Forced (not setdefault)
-# because crash-safety here outranks any inherited thread setting.
-for _omp_var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
-                 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
-    os.environ[_omp_var] = '1'
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-# ---------------------------------------------------------------------------
-
 # Setup logging to stderr (stdout is reserved for JSON responses)
 logging.basicConfig(
     level=logging.INFO,
@@ -94,22 +76,6 @@ def _emit(obj: Dict[str, Any]) -> None:
     _REAL_STDOUT.write(json.dumps(obj))
     _REAL_STDOUT.write("\n")
     _REAL_STDOUT.flush()
-
-
-def _release_mps_cache() -> None:
-    """Release cached MPS GPU memory after a detect request. The persistent server keeps the
-    detection models resident across many requests, so (unlike the old one-shot path that exited
-    and freed everything per call) MPS allocations can accumulate over a session and eventually
-    fail a model/inference allocation — especially under contention from other MPS processes.
-    Finding 12 correctly removed the expensive PER-INFERENCE empty_cache from the ensemble hot
-    loop; this per-REQUEST release is cheap (~tens of ms against a ~1-2s detect) and bounds the
-    long-lived server's steady-state GPU footprint. Best-effort: never let it break a response."""
-    try:
-        import torch
-        if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except Exception:
-        pass
 
 
 # Import bridge (this pulls swift_bridge; detection imports are lazy until the full
@@ -208,28 +174,13 @@ def _build_bridge() -> None:
         device=device,
         # skip_models=False (default): load the full detection stack ONCE.
         # skip_search=True: do NOT load the FAISS search engine. Detection never searches,
-        # and keeping faiss out of this process means torch's libomp is the ONLY OpenMP
-        # runtime here — eliminating the dual-libomp conflict that crashed the detect server
-        # (the OMP-pinning env vars above are now a secondary belt; this removes the root cause).
+        # and keeping faiss out of this process means torch's libomp is the ONLY OpenMP runtime
+        # here — which is the ROOT-CAUSE fix for the dual-libomp crash. No OpenMP suppression
+        # (KMP_DUPLICATE_LIB_OK / forced single-thread) is needed or wanted: if a future change
+        # ever loads both faiss and torch here again, it SHOULD crash loudly rather than be masked.
         skip_search=True,
     )
     logger.info("Detection bridge built (models loaded, search engine skipped)")
-
-    # Belt-and-suspenders to the OMP env vars set at module top: pin torch's OpenMP runtime to
-    # a single thread. NOTE: with skip_search=True faiss is NOT loaded here (the root-cause fix),
-    # so we must NOT `import faiss` — that would reload faiss's libomp and recreate the very
-    # dual-runtime conflict we removed. Only touch faiss if something already imported it.
-    if 'faiss' in sys.modules:
-        try:
-            sys.modules['faiss'].omp_set_num_threads(1)
-        except Exception as _e:
-            logger.warning(f"faiss.omp_set_num_threads(1) skipped: {_e}")
-    if 'torch' in sys.modules:
-        try:
-            sys.modules['torch'].set_num_threads(1)
-            sys.modules['torch'].set_num_interop_threads(1)
-        except Exception as _e:
-            logger.warning(f"torch.set_num_threads(1) skipped: {_e}")
 
 
 def handle_detect_all(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -350,10 +301,6 @@ def main():
                 break
             else:
                 response = {'status': 'error', 'error': f'Unknown command: {cmd_type}'}
-
-            # Bound steady-state MPS memory for this long-lived process (see _release_mps_cache).
-            if cmd_type in ('detect_all', 'detect_pose', 'extract_features'):
-                _release_mps_cache()
 
             _emit(response)
 
