@@ -2191,8 +2191,11 @@ class SimilarityEngine:
         # Extract geometric features from flipped pose. The extractor takes a PoseResult,
         # not a raw array — derive visibility from keypoint confidence and a tight bbox
         # from the confident keypoints.
+        # Both imports are torch-FREE (PoseResult + the geometric extractor live in / pull from
+        # src.core.models, not pose_detector). Critical: flip search runs inside the faiss-only
+        # search server, which must never load torch — a second OpenMP runtime aborts it.
         from src.core.geometric_feature_extractor import GeometricFeatureExtractor
-        from src.core.pose_detector import PoseResult
+        from src.core.models import PoseResult
 
         # Visibility MUST be derived with the SAME confidence→COCO mapping the direct/stored
         # path uses (pose_detector.py: conf>=0.5 → 2 visible, 0.1<=conf<0.5 → 1 occluded,

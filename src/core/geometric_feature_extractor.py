@@ -14,7 +14,7 @@ from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass
 import logging
 
-from src.core.pose_detector import PoseResult
+from src.core.models import PoseResult  # torch-free import (keeps this module faiss-server-safe)
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)

@@ -43,62 +43,12 @@ except ImportError:
     logger.info("ultralytics not available - person detection disabled")
 
 
-@dataclass
-class PoseResult:
-    """
-    Result from pose detection on a single person.
-
-    Attributes:
-        keypoints: Array of shape (133, 3) where each row is [x, y, confidence]
-        visibility: Array of shape (133,) with COCO visibility flags:
-                   0 = not labeled (not visible in image)
-                   1 = labeled but occluded (person present but keypoint hidden)
-                   2 = labeled and visible (keypoint clearly visible)
-        bbox: Bounding box [x, y, width, height]
-        overall_confidence: Mean confidence across all keypoints
-        person_id: Index of person in image (0-based)
-    """
-    keypoints: np.ndarray  # (133, 3)
-    visibility: np.ndarray  # (133,)
-    bbox: np.ndarray       # (4,) [x, y, w, h]
-    overall_confidence: float
-    person_id: int
-
-    def __post_init__(self):
-        """Validate data after initialization."""
-        assert self.keypoints.shape == (133, 3), \
-            f"Expected keypoints shape (133, 3), got {self.keypoints.shape}"
-        assert self.visibility.shape == (133,), \
-            f"Expected visibility shape (133,), got {self.visibility.shape}"
-        # Allow continuous visibility values [0, 2] for ensemble fusion
-        assert np.all((self.visibility >= 0) & (self.visibility <= 2)), \
-            f"Visibility must be in [0, 2], got range [{np.min(self.visibility)}, {np.max(self.visibility)}]"
-        assert self.bbox.shape == (4,), \
-            f"Expected bbox shape (4,), got {self.bbox.shape}"
-        assert 0.0 <= self.overall_confidence <= 1.0, \
-            f"Confidence must be in [0, 1], got {self.overall_confidence}"
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for storage."""
-        return {
-            'keypoints': self.keypoints.tolist(),
-            'visibility': self.visibility.tolist(),
-            'bbox': self.bbox.tolist(),
-            'overall_confidence': float(self.overall_confidence),
-            'person_id': self.person_id,
-        }
-
-    def get_visible_keypoints(self) -> np.ndarray:
-        """Get only visible keypoints (visibility == 2)."""
-        return self.keypoints[self.visibility == 2]
-
-    def count_visible(self) -> int:
-        """Count visible keypoints."""
-        return int((self.visibility == 2).sum())
-
-    def count_occluded(self) -> int:
-        """Count occluded keypoints."""
-        return int((self.visibility == 1).sum())
+# PoseResult moved to the torch-free src.core.models so consumers that only need the
+# dataclass (the geometric feature extractor, the search engine's flip-search re-extraction)
+# don't drag torch/mmpose into faiss-only processes — e.g. the search server, where a second
+# OpenMP runtime aborts the process (OMP Error #15). Re-exported here so existing
+# `from src.core.pose_detector import PoseResult` keeps working unchanged.
+from src.core.models import PoseResult
 
 
 class PoseDetectorError(Exception):
