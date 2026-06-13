@@ -54,6 +54,24 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# ---------------------------------------------------------------------------
+# OpenMP safety — MUST run BEFORE faiss/torch are imported (swift_bridge below).
+# faiss-cpu and torch each bundle their OWN libomp.dylib. This persistent server loads
+# BOTH (the bridge pulls in the FAISS search engine AND the torch detection models), so
+# two OpenMP runtimes coexist in one process. Their multi-threaded thread pools can
+# corrupt each other's barrier state and SIGSEGV inside __kmp_suspend_64 during a
+# parallel region — observed crashing on a torch tensor copy_ while loading the RTMW
+# model (EXC_BAD_ACCESS at 0x10 in libomp). Forcing single-threaded OpenMP removes the
+# worker-thread barriers entirely, which neutralizes the conflict; KMP_DUPLICATE_LIB_OK
+# tolerates the duplicate runtime at init. This server is GPU (MPS/CoreML) bound, so
+# single-threaded CPU OMP/BLAS costs effectively nothing here. Forced (not setdefault)
+# because crash-safety here outranks any inherited thread setting.
+for _omp_var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+    os.environ[_omp_var] = '1'
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+# ---------------------------------------------------------------------------
+
 # Setup logging to stderr (stdout is reserved for JSON responses)
 logging.basicConfig(
     level=logging.INFO,
@@ -191,6 +209,21 @@ def _build_bridge() -> None:
         # skip_models=False (default): load the full detection stack ONCE.
     )
     logger.info("Detection bridge built (models loaded)")
+
+    # Belt-and-suspenders to the OMP env vars set at module top: pin BOTH OpenMP runtimes
+    # (faiss's and torch's) to a single thread at runtime so their parallel regions never
+    # spawn the worker-thread barriers that crash when the two libomp copies collide.
+    try:
+        import faiss
+        faiss.omp_set_num_threads(1)
+    except Exception as _e:
+        logger.warning(f"faiss.omp_set_num_threads(1) skipped: {_e}")
+    try:
+        import torch
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception as _e:
+        logger.warning(f"torch.set_num_threads(1) skipped: {_e}")
 
 
 def handle_detect_all(params: Dict[str, Any]) -> Dict[str, Any]:
