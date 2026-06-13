@@ -78,6 +78,22 @@ def _emit(obj: Dict[str, Any]) -> None:
     _REAL_STDOUT.flush()
 
 
+def _release_mps_cache() -> None:
+    """Release cached MPS GPU memory after a detect request. The persistent server keeps the
+    detection models resident across many requests, so (unlike the old one-shot path that exited
+    and freed everything per call) MPS allocations can accumulate over a session and eventually
+    fail a model/inference allocation — especially under contention from other MPS processes.
+    Finding 12 correctly removed the expensive PER-INFERENCE empty_cache from the ensemble hot
+    loop; this per-REQUEST release is cheap (~tens of ms against a ~1-2s detect) and bounds the
+    long-lived server's steady-state GPU footprint. Best-effort: never let it break a response."""
+    try:
+        import torch
+        if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 # Import bridge (this pulls swift_bridge; detection imports are lazy until the full
 # bridge is constructed — finding 40 — but constructing it below loads the models).
 try:
@@ -295,6 +311,10 @@ def main():
                 break
             else:
                 response = {'status': 'error', 'error': f'Unknown command: {cmd_type}'}
+
+            # Bound steady-state MPS memory for this long-lived process (see _release_mps_cache).
+            if cmd_type in ('detect_all', 'detect_pose', 'extract_features'):
+                _release_mps_cache()
 
             _emit(response)
 
