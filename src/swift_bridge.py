@@ -107,7 +107,6 @@ def _process_thumbnail_worker(args):
 # is imported lazily by _ensure_detection_imports() the first time a non-skip
 # bridge is constructed — see finding 40.
 try:
-    from src.intelligence.similarity_engine import SimilarityEngine
     from src.storage.storage_manager import StorageManager
     from src.storage.models import Image, PoseDetection, GeometricFeatures as GeometricFeaturesModel
     from src.core.image_ingestor import ImageMetadata
@@ -132,6 +131,28 @@ EnsembleConfig = None
 TwoStageDetector = None
 TWO_STAGE_AVAILABLE = False
 _DETECTION_IMPORTS_LOADED = False
+
+# SimilarityEngine pulls faiss, which bundles its OWN libomp.dylib. torch (the detection
+# stack) bundles ANOTHER libomp. Both in one process is the dual-OpenMP-runtime conflict that
+# crashes the detect server (SIGSEGV in a libomp barrier, or SIGABRT in libomp's duplicate-
+# library registration during torch import — KMP_DUPLICATE_LIB_OK is unreliable at suppressing
+# it). So faiss is imported LAZILY here: a detection-only bridge (skip_search=True, the detect
+# server) never imports SimilarityEngine and therefore never loads faiss's libomp — only torch's.
+# A search-only bridge (skip_models=True) loads faiss but never torch. Neither process loads both.
+SimilarityEngine = None
+_SEARCH_IMPORTS_LOADED = False
+
+
+def _ensure_search_imports():
+    """Import the FAISS-backed search engine on demand. Called only when a search-capable
+    bridge (skip_search=False) is constructed — keeps faiss (and its libomp) out of the
+    detection-only detect server process."""
+    global SimilarityEngine, _SEARCH_IMPORTS_LOADED
+    if _SEARCH_IMPORTS_LOADED:
+        return
+    from src.intelligence.similarity_engine import SimilarityEngine as _SimilarityEngine
+    SimilarityEngine = _SimilarityEngine
+    _SEARCH_IMPORTS_LOADED = True
 
 
 def _ensure_detection_imports():
@@ -231,6 +252,7 @@ class PostureKitBridge:
         visual_model: Optional[str] = None,
         search_feature_mode: Optional[str] = None,
         skip_models: bool = False,
+        skip_search: bool = False,
     ):
         """
         Initialize PostureKit bridge.
@@ -518,15 +540,23 @@ class PostureKitBridge:
         from src.storage.models import Base
         Base.metadata.create_all(self.storage_manager.engine)
 
-        # Initialize similarity engine with configured feature mode
-        # Pass database_profile to ensure correct index path (data/indices/irl/)
-        self.similarity_engine = SimilarityEngine(
-            self.storage_manager,
-            database_profile=settings.DB_PROFILE,
-            feature_mode=self.search_feature_mode
-        )
-
-        logger.info("PostureKit bridge initialized with existing model files")
+        # Initialize similarity engine with configured feature mode (unless skip_search).
+        # skip_search keeps faiss — and its libomp — out of a detection-only process (the
+        # detect server), so it never coexists with torch's libomp. Detection + feature
+        # extraction never touch the search engine.
+        self.skip_search = skip_search
+        if skip_search:
+            self.similarity_engine = None
+            logger.info("PostureKit bridge initialized (detection-only, search engine skipped)")
+        else:
+            _ensure_search_imports()
+            # Pass database_profile to ensure correct index path (data/indices/irl/)
+            self.similarity_engine = SimilarityEngine(
+                self.storage_manager,
+                database_profile=settings.DB_PROFILE,
+                feature_mode=self.search_feature_mode
+            )
+            logger.info("PostureKit bridge initialized with existing model files")
 
 
     def detect_pose(self, image_array: np.ndarray) -> Optional[Dict[str, Any]]:

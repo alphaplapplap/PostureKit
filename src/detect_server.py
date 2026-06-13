@@ -207,23 +207,29 @@ def _build_bridge() -> None:
         num_threads=num_threads,
         device=device,
         # skip_models=False (default): load the full detection stack ONCE.
+        # skip_search=True: do NOT load the FAISS search engine. Detection never searches,
+        # and keeping faiss out of this process means torch's libomp is the ONLY OpenMP
+        # runtime here — eliminating the dual-libomp conflict that crashed the detect server
+        # (the OMP-pinning env vars above are now a secondary belt; this removes the root cause).
+        skip_search=True,
     )
-    logger.info("Detection bridge built (models loaded)")
+    logger.info("Detection bridge built (models loaded, search engine skipped)")
 
-    # Belt-and-suspenders to the OMP env vars set at module top: pin BOTH OpenMP runtimes
-    # (faiss's and torch's) to a single thread at runtime so their parallel regions never
-    # spawn the worker-thread barriers that crash when the two libomp copies collide.
-    try:
-        import faiss
-        faiss.omp_set_num_threads(1)
-    except Exception as _e:
-        logger.warning(f"faiss.omp_set_num_threads(1) skipped: {_e}")
-    try:
-        import torch
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except Exception as _e:
-        logger.warning(f"torch.set_num_threads(1) skipped: {_e}")
+    # Belt-and-suspenders to the OMP env vars set at module top: pin torch's OpenMP runtime to
+    # a single thread. NOTE: with skip_search=True faiss is NOT loaded here (the root-cause fix),
+    # so we must NOT `import faiss` — that would reload faiss's libomp and recreate the very
+    # dual-runtime conflict we removed. Only touch faiss if something already imported it.
+    if 'faiss' in sys.modules:
+        try:
+            sys.modules['faiss'].omp_set_num_threads(1)
+        except Exception as _e:
+            logger.warning(f"faiss.omp_set_num_threads(1) skipped: {_e}")
+    if 'torch' in sys.modules:
+        try:
+            sys.modules['torch'].set_num_threads(1)
+            sys.modules['torch'].set_num_interop_threads(1)
+        except Exception as _e:
+            logger.warning(f"torch.set_num_threads(1) skipped: {_e}")
 
 
 def handle_detect_all(params: Dict[str, Any]) -> Dict[str, Any]:
