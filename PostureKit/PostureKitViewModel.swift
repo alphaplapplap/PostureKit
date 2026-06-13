@@ -1484,27 +1484,20 @@ class PostureKitViewModel: ObservableObject {
         // Normalize destination once so we can compare parent folders reliably.
         let destFolderURL = URL(fileURLWithPath: destinationDirectory).standardizedFileURL
 
-        // A destination outside the indexed-folders scope means the moved photos'
-        // paths update fine but the next search filters them out — warn below.
-        let scope = IndexViewModel.indexedFoldersScope()
-        let destinationOutsideScope = !scope.isEmpty
-            && !scope.contains { destFolderURL.path == $0 || destFolderURL.path.hasPrefix($0 + "/") }
-
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             self.performMove(of: selectedResults, to: destFolderURL,
-                             destinationOutsideScope: destinationOutsideScope,
                              completion: completion)
         }
     }
 
     private func performMove(of selectedResults: [SearchResult], to destFolderURL: URL,
-                             destinationOutsideScope: Bool,
                              completion: @escaping (_ success: Int, _ failed: Int, _ skipped: Int) -> Void) {
         var successCount = 0
         var failedCount = 0
         var skippedCount = 0
         var movedPaths: [String: String] = [:]  // old absolute path -> final destination path
+        var skippedPaths: Set<String> = []       // old absolute path of files already in the destination
         let fileManager = FileManager.default
         let destinationDirectory = destFolderURL.path
 
@@ -1523,9 +1516,11 @@ class PostureKitViewModel: ObservableObject {
             let sourceURL = URL(fileURLWithPath: sourcePath)
             let sourceFolderURL = sourceURL.deletingLastPathComponent().standardizedFileURL
 
-            // No-op if the file is already in the chosen destination folder.
+            // No-op if the file is already in the chosen destination folder. It's still "filed"
+            // where the user wants it, so it's removed from the grid below alongside moved files.
             if sourceFolderURL.path == destFolderURL.path {
                 skippedCount += 1
+                skippedPaths.insert(sourcePath)
                 continue
             }
 
@@ -1568,25 +1563,24 @@ class PostureKitViewModel: ObservableObject {
             }
         }
 
-        // Rewrite the moved paths in the cached results — keyed by path, so every
-        // person-result of a moved photo updates. Moved photos stay in the grid,
-        // stay selected, and remain searchable.
+        // Remove every result whose photo is now in the destination folder — both the ones we
+        // just moved AND the ones already there (skipped) — so filed photos drop out of the grid
+        // and the user doesn't re-file the same images over and over. Keyed by the OLD path, so
+        // EVERY person-result of a multi-pose photo is removed together. Failed moves stay put.
         let updateFailed = pathUpdateFailed
+        var filedPaths = Set(movedPaths.keys)
+        filedPaths.formUnion(skippedPaths)
         DispatchQueue.main.async {
-            for index in self.rawResults.indices {
-                if let oldPath = self.rawResults[index].imagePath,
-                   let newPath = movedPaths[oldPath] {
-                    self.rawResults[index].imagePath = newPath
-                    self.rawResults[index].filename = URL(fileURLWithPath: newPath).lastPathComponent
-                }
-            }
-            if !movedPaths.isEmpty {
+            if !filedPaths.isEmpty {
+                let removedIds = Set(self.rawResults
+                    .filter { ($0.imagePath.map { filedPaths.contains($0) }) ?? false }
+                    .map { $0.id })
+                self.rawResults.removeAll { ($0.imagePath.map { filedPaths.contains($0) }) ?? false }
+                self.selectedResultIds.subtract(removedIds)
                 self.applyResultWindow()
             }
             if updateFailed {
-                self.errorMessage = "Files moved, but updating some stored paths failed — those photos will drop from results until re-added."
-            } else if destinationOutsideScope && successCount > 0 {
-                self.errorMessage = "Moved photos are outside your Indexed Folders — they'll be hidden from new searches until you add \(destFolderURL.path) in Indexed Photos."
+                self.errorMessage = "Files moved, but updating some stored paths failed — those photos are removed from the grid; re-add their new folder under Indexed Photos to make them searchable again."
             }
             completion(successCount, failedCount, skippedCount)
         }
