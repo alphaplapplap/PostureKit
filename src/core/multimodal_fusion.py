@@ -20,22 +20,22 @@ class FusedFeatures:
     Fused multi-modal features combining geometric and visual.
 
     Attributes:
-        fused_vector: Combined feature vector (628-dim)
-        geometric_vector: Original geometric features (52-dim)
+        fused_vector: Combined feature vector (642-dim)
+        geometric_vector: Original geometric features (66-dim)
         visual_vector: Original visual features (576-dim)
         fusion_method: Method used for fusion
     """
-    fused_vector: np.ndarray       # (628,) float32
-    geometric_vector: np.ndarray   # (52,) float32
+    fused_vector: np.ndarray       # (642,) float32
+    geometric_vector: np.ndarray   # (66,) float32
     visual_vector: np.ndarray      # (576,) float32
     fusion_method: str
 
     def __post_init__(self):
         """Validate feature dimensions."""
-        assert self.fused_vector.shape == (628,), \
-            f"Fused vector must be (628,), got {self.fused_vector.shape}"
-        assert self.geometric_vector.shape == (52,), \
-            f"Geometric vector must be (52,), got {self.geometric_vector.shape}"
+        assert self.fused_vector.shape == (642,), \
+            f"Fused vector must be (642,), got {self.fused_vector.shape}"
+        assert self.geometric_vector.shape == (66,), \
+            f"Geometric vector must be (66,), got {self.geometric_vector.shape}"
         assert self.visual_vector.shape == (576,), \
             f"Visual vector must be (576,), got {self.visual_vector.shape}"
         assert self.fused_vector.dtype == np.float32, \
@@ -49,7 +49,7 @@ class FusedFeatures:
     @property
     def geometric_dim(self):
         """Dimension of geometric features."""
-        return 52
+        return 66
 
     @property
     def visual_dim(self):
@@ -108,6 +108,15 @@ class MultiModalFusion:
     """
 
     VALID_METHODS = ['concatenate', 'weighted', 'normalized']
+
+    # Vector format v3 dimensions.
+    GEOMETRIC_DIM = 66
+    VISUAL_DIM = 576
+    FUSED_DIM = GEOMETRIC_DIM + VISUAL_DIM  # 642
+
+    def get_feature_dim(self) -> int:
+        """Total fused feature dimensionality produced by fuse()."""
+        return self.FUSED_DIM
 
     def __init__(
         self,
@@ -177,17 +186,56 @@ class MultiModalFusion:
             )
 
         # Validate dimensions
-        if geometric_vec.shape != (52,):
+        if geometric_vec.shape != (self.GEOMETRIC_DIM,):
             raise IncompatibleFeaturesError(
-                f"Expected 52-dim geometric features, got {geometric_vec.shape}"
+                f"Expected {self.GEOMETRIC_DIM}-dim geometric features, got {geometric_vec.shape}"
             )
 
-        if visual_vec.shape != (576,):
+        if visual_vec.shape != (self.VISUAL_DIM,):
             raise IncompatibleFeaturesError(
-                f"Expected 576-dim visual features, got {visual_vec.shape}"
+                f"Expected {self.VISUAL_DIM}-dim visual features, got {visual_vec.shape}"
             )
 
         return geometric_vec, visual_vec
+
+    @staticmethod
+    def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+        """Return vec scaled to unit L2 norm (unchanged if norm is 0)."""
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            return vec / norm
+        return vec
+
+    def _balanced_fusion(
+        self,
+        geometric_vec: np.ndarray,
+        visual_vec: np.ndarray
+    ) -> np.ndarray:
+        """
+        Weight-balanced fusion: [w_g * g/||g|| | w_v * v/||v||].
+
+        Both modalities are L2-normalized to unit norm BEFORE applying their
+        configured weights, so the configured weight ratio is the ACTUAL ratio
+        of each modality's L2 contribution to fused distances (finding 18).
+        Previously _weighted_fusion left the geometric block at its native,
+        pose-dependent norm (~3-4) while the visual block was already unit-norm,
+        so the 0.5 visual weight was a ~3-10% rounding error and the per-pose
+        balance drifted with the geometric norm; '_normalized_fusion' ignored
+        the weights entirely. This single balanced path backs both 'weighted'
+        and 'normalized' so weights are always honored.
+
+        Args:
+            geometric_vec: geometric features
+            visual_vec: visual features (already unit-norm from the extractor,
+                        re-normalized here for safety/idempotence)
+
+        Returns:
+            Fused vector (GEOMETRIC_DIM + VISUAL_DIM,)
+        """
+        g = self._l2_normalize(geometric_vec.astype(np.float32)) * self.geometric_weight
+        v = self._l2_normalize(visual_vec.astype(np.float32)) * self.visual_weight
+        fused = np.concatenate([g, v])
+        return fused.astype(np.float32)
 
     def _concatenate_fusion(
         self,
@@ -195,14 +243,14 @@ class MultiModalFusion:
         visual_vec: np.ndarray
     ) -> np.ndarray:
         """
-        Simple concatenation: [geometric | visual]
+        Simple concatenation: [geometric | visual] (raw, no weighting).
 
         Args:
-            geometric_vec: 52-dim geometric features
-            visual_vec: 576-dim visual features
+            geometric_vec: geometric features
+            visual_vec: visual features
 
         Returns:
-            628-dim fused vector
+            Fused vector (GEOMETRIC_DIM + VISUAL_DIM,)
         """
         fused = np.concatenate([geometric_vec, visual_vec])
         return fused.astype(np.float32)
@@ -213,22 +261,12 @@ class MultiModalFusion:
         visual_vec: np.ndarray
     ) -> np.ndarray:
         """
-        Weighted concatenation: [w_g * geometric | w_v * visual]
+        Weighted fusion that actually balances modality L2 contribution.
 
-        Allows adjusting relative importance of each modality.
-
-        Args:
-            geometric_vec: 52-dim geometric features
-            visual_vec: 576-dim visual features
-
-        Returns:
-            628-dim fused vector
+        Delegates to _balanced_fusion: each modality is L2-normalized then
+        scaled by its configured weight, so w_g:w_v is the real distance balance.
         """
-        weighted_geometric = geometric_vec * self.geometric_weight
-        weighted_visual = visual_vec * self.visual_weight
-
-        fused = np.concatenate([weighted_geometric, weighted_visual])
-        return fused.astype(np.float32)
+        return self._balanced_fusion(geometric_vec, visual_vec)
 
     def _normalized_fusion(
         self,
@@ -236,34 +274,13 @@ class MultiModalFusion:
         visual_vec: np.ndarray
     ) -> np.ndarray:
         """
-        Normalized concatenation: [norm(geometric) | norm(visual)]
+        Normalized fusion: [w_g * norm(g) | w_v * norm(v)].
 
-        L2 normalizes each modality separately before concatenation.
-        Ensures both modalities contribute equally regardless of scale.
-
-        Args:
-            geometric_vec: 52-dim geometric features
-            visual_vec: 576-dim visual features
-
-        Returns:
-            628-dim fused vector
+        L2-normalizes each modality AND honors the configured weights (finding
+        18 — the old 'normalized' mode silently ignored the weights). Identical
+        to _weighted_fusion now that weighting is balanced on unit-norm blocks.
         """
-        # L2 normalize each modality
-        geometric_norm = np.linalg.norm(geometric_vec)
-        visual_norm = np.linalg.norm(visual_vec)
-
-        if geometric_norm > 0:
-            geometric_normalized = geometric_vec / geometric_norm
-        else:
-            geometric_normalized = geometric_vec
-
-        if visual_norm > 0:
-            visual_normalized = visual_vec / visual_norm
-        else:
-            visual_normalized = visual_vec
-
-        fused = np.concatenate([geometric_normalized, visual_normalized])
-        return fused.astype(np.float32)
+        return self._balanced_fusion(geometric_vec, visual_vec)
 
     def fuse(
         self,
@@ -276,11 +293,11 @@ class MultiModalFusion:
         Accepts either feature objects or raw numpy arrays.
 
         Args:
-            geometric_features: 52-dim geometric features (GeometricFeatures object or numpy array)
+            geometric_features: 66-dim geometric features (GeometricFeatures object or numpy array)
             visual_features: 576-dim visual features (VisualFeatures object or numpy array)
 
         Returns:
-            FusedFeatures with 628-dim combined vector
+            FusedFeatures with 642-dim combined vector
 
         Raises:
             IncompatibleFeaturesError: If feature dimensions don't match
@@ -338,23 +355,23 @@ class MultiModalFusion:
         instead of feature objects.
 
         Args:
-            geometric_array: 52-dim geometric features as numpy array
+            geometric_array: 66-dim geometric features as numpy array
             visual_array: 576-dim visual features as numpy array
 
         Returns:
-            628-dim fused vector as numpy array
+            642-dim fused vector as numpy array
 
         Raises:
             IncompatibleFeaturesError: If feature dimensions don't match
         """
         # Validate inputs
-        if geometric_array.shape != (52,):
+        if geometric_array.shape != (self.GEOMETRIC_DIM,):
             raise IncompatibleFeaturesError(
-                f"Expected (52,) geometric features, got {geometric_array.shape}"
+                f"Expected ({self.GEOMETRIC_DIM},) geometric features, got {geometric_array.shape}"
             )
-        if visual_array.shape != (576,):
+        if visual_array.shape != (self.VISUAL_DIM,):
             raise IncompatibleFeaturesError(
-                f"Expected (576,) visual features, got {visual_array.shape}"
+                f"Expected ({self.VISUAL_DIM},) visual features, got {visual_array.shape}"
             )
 
         # Apply fusion strategy
@@ -374,7 +391,7 @@ class MultiModalFusion:
         Split fused vector back into geometric and visual components.
 
         Args:
-            fused_vector: 628-dim fused feature vector
+            fused_vector: 642-dim fused feature vector
 
         Returns:
             Tuple of (geometric_vector, visual_vector)
@@ -382,13 +399,13 @@ class MultiModalFusion:
         Raises:
             IncompatibleFeaturesError: If fused vector has wrong dimensions
         """
-        if fused_vector.shape != (628,):
+        if fused_vector.shape != (self.FUSED_DIM,):
             raise IncompatibleFeaturesError(
-                f"Expected (628,) fused vector, got {fused_vector.shape}"
+                f"Expected ({self.FUSED_DIM},) fused vector, got {fused_vector.shape}"
             )
 
-        geometric_vec = fused_vector[:52]
-        visual_vec = fused_vector[52:]
+        geometric_vec = fused_vector[:self.GEOMETRIC_DIM]
+        visual_vec = fused_vector[self.GEOMETRIC_DIM:]
 
         return geometric_vec, visual_vec
 
@@ -397,7 +414,7 @@ class MultiModalFusion:
         Alias for split_fused() for backwards compatibility.
 
         Args:
-            fused_vector: 628-dim fused feature vector
+            fused_vector: 642-dim fused feature vector
 
         Returns:
             Tuple of (geometric_vector, visual_vector)

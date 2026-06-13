@@ -150,7 +150,7 @@ class Settings:
         return self.NUM_KEYPOINTS * self.KEYPOINT_COORDINATES_DIM
 
     # Feature Vector Dimensions
-    GEOMETRIC_FEATURE_DIM: int = 52  # 12 angles + 10 ratios + 15 body angles + 8 symmetry + 7 occlusion
+    GEOMETRIC_FEATURE_DIM: int = 66  # v3: 12 angles + 10 ratios + 28 body-angle sin/cos + 1 body_twist + 8 symmetry + 7 occlusion
     VISUAL_FEATURE_DIM: int = 576  # MobileNetV3-Small output dimension
 
     @property
@@ -182,7 +182,7 @@ class Settings:
     # Layer 4: Search Features
     SEARCH_FEATURE_MODE: str = os.getenv('SEARCH_FEATURE_MODE', 'geometric')  # geometric, fused
 
-    # Multi-modal fusion of geometric + visual into the stored 628-dim vector.
+    # Multi-modal fusion of geometric + visual into the stored 642-dim vector.
     # Only affects ranking when SEARCH_FEATURE_MODE='fused'. 'weighted' keeps the
     # geometric subspace at its native scale (fused-mode distances stay comparable
     # to geometric mode) and scales the unit-norm visual embedding: visual is the

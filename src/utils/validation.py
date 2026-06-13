@@ -164,10 +164,10 @@ def validate_search_params(func: Callable) -> Callable:
                     context={'shape': vec.shape}
                 )
 
-            # Common dimensions: 52 (geometric) or 628 (fused)
-            if vec.shape[0] not in [52, 628]:
+            # Common dimensions: 66 (geometric v3) or 642 (fused = 66 + 576)
+            if vec.shape[0] not in [66, 642]:
                 raise ValidationError(
-                    f"Invalid feature dimension: {vec.shape[0]}, expected 52 or 628",
+                    f"Invalid feature dimension: {vec.shape[0]}, expected 66 or 642",
                     operation=func.__name__,
                     context={'dimension': vec.shape[0]}
                 )

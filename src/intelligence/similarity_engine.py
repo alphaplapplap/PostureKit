@@ -709,8 +709,9 @@ class SimilarityEngine:
             elif hasattr(self.index, 'd'):
                 self.dimension = self.index.d
             else:
-                logger.warning("Could not determine dimension from loaded index, using default 52")
-                self.dimension = 52
+                logger.warning(f"Could not determine dimension from loaded index, "
+                               f"using default {constants.GEOMETRIC_FEATURE_DIM}")
+                self.dimension = constants.GEOMETRIC_FEATURE_DIM
 
             logger.info(f"Loaded index with dimension: {self.dimension}")
 
@@ -745,7 +746,7 @@ class SimilarityEngine:
         k: int = 20,
         min_confidence: float = 0.0,
         min_feature_confidence: float = 0.35,
-        min_valid_overlap: int = 12,
+        min_valid_overlap: int = 15,
         deduplicate_images: bool = True,
         required_regions: Optional[List[str]] = None,
         min_region_confidence: float = 0.3,
@@ -1395,7 +1396,7 @@ class SimilarityEngine:
         exclude_self: bool = True,
         min_confidence: float = 0.0,
         min_feature_confidence: float = 0.35,
-        min_valid_overlap: int = 12,
+        min_valid_overlap: int = 15,
         required_regions: Optional[List[str]] = None,
         min_region_confidence: float = 0.3
     ) -> List[Dict]:
@@ -1696,25 +1697,23 @@ class SimilarityEngine:
         """
         Convert L2 distance to similarity score [0, 1].
 
-        Uses inverse exponential decay: similarity = exp(-distance / scale)
-        Scale dynamically adjusted based on feature dimensionality.
+        Uses inverse exponential decay: similarity = exp(-distance / scale).
 
-        For L2 distance, typical distances scale with sqrt(dimension).
-        Base scale of 2.0 was empirically determined for 52-dim features.
+        The scale comes from self.similarity_scale, which is loaded from the index
+        metadata (finding 38) and fit by the re-extraction calibration step to the
+        ACTUAL post-v3 distance distribution. The masked distance is already
+        RMS-rescaled to the full-dimension equivalent, so no separate sqrt(dim)
+        heuristic is applied here — the empirical calibration subsumes it. Default
+        (constants.DEFAULT_SIMILARITY_SCALE) applies until a calibration is stored.
         """
-        # Use stored dimension (set during index build)
-        dimension = self.dimension
-
-        # Scale proportional to sqrt(dimension) for L2 distance
-        # This normalizes similarity scores across different dimensionalities
-        base_scale = 2.0
-        scale = base_scale * np.sqrt(dimension / 52.0)
+        scale = self.similarity_scale if self.similarity_scale and self.similarity_scale > 0 \
+            else constants.DEFAULT_SIMILARITY_SCALE
 
         similarity = float(np.exp(-distance / scale))
 
         # Log first result for debugging (avoid spam)
         if not hasattr(self, '_logged_similarity'):
-            logger.info(f"Similarity calculation: distance={distance:.2f} → similarity={similarity:.2%} (dim={dimension}, scale={scale:.2f})")
+            logger.info(f"Similarity calculation: distance={distance:.2f} → similarity={similarity:.2%} (dim={self.dimension}, scale={scale:.2f})")
             self._logged_similarity = True
 
         return similarity

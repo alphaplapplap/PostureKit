@@ -22,15 +22,16 @@ MIN_FEATURE_CONFIDENCE = 0.35
 BBOX_PADDING_BASE = 0.05
 BBOX_PADDING_OCCLUSION_FACTOR = 0.10
 
-# Feature dimensions
-GEOMETRIC_FEATURE_DIM = 52
+# Feature dimensions (geometric vector format v3)
+GEOMETRIC_FEATURE_DIM = 66
 VISUAL_FEATURE_DIM = 576
-FUSED_FEATURE_DIM = GEOMETRIC_FEATURE_DIM + VISUAL_FEATURE_DIM  # 628
+FUSED_FEATURE_DIM = GEOMETRIC_FEATURE_DIM + VISUAL_FEATURE_DIM  # 642
 
-# Geometric feature composition
+# Geometric feature composition (v3)
 NUM_JOINT_ANGLES = 12
 NUM_LIMB_RATIOS = 10
-NUM_BODY_ANGLES = 15
+NUM_BODY_ANGLE_SINCOS = 28      # 14 signed angles x [sin_part, cos_part]
+NUM_BODY_TWIST = 1             # non-wrapping shoulder-vs-hip torsion cue
 NUM_SYMMETRY_FEATURES = 8
 NUM_OCCLUSION_FEATURES = 7
 

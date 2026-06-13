@@ -79,16 +79,16 @@ class VisualModel(Enum):
 
 class SearchFeatureMode(Enum):
     """Feature types used for similarity search."""
-    GEOMETRIC_ONLY = "geometric"   # 52-dim keypoint-based features
-    FUSED_MULTIMODAL = "fused"     # 628-dim geometric+visual features
+    GEOMETRIC_ONLY = "geometric"   # 66-dim keypoint-based features (v3)
+    FUSED_MULTIMODAL = "fused"     # 642-dim geometric+visual features (66 + 576)
 
     def get_feature_dim(self) -> int:
-        """Get feature dimensionality for this mode."""
+        """Get feature dimensionality for this mode (geometric vector format v3)."""
         dim_map = {
-            SearchFeatureMode.GEOMETRIC_ONLY: 52,
-            SearchFeatureMode.FUSED_MULTIMODAL: 628,
+            SearchFeatureMode.GEOMETRIC_ONLY: 66,
+            SearchFeatureMode.FUSED_MULTIMODAL: 642,
         }
-        return dim_map.get(self, 52)
+        return dim_map.get(self, 66)
 
     def requires_visual_features(self) -> bool:
         """Check if this mode requires visual features."""

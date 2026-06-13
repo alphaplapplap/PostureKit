@@ -309,9 +309,9 @@ class MultiModalCorrectionLearner(CorrectionLearner):
         if not self.models:
             raise CorrectionLearnerError("Models not trained. Call train() first.")
 
-        # Validate inputs
-        if geometric_features.shape != (52,):
-            raise ValueError(f"Expected (52,) geometric features, got {geometric_features.shape}")
+        # Validate inputs (geometric vector format v3 = 66-dim)
+        if geometric_features.shape != (66,):
+            raise ValueError(f"Expected (66,) geometric features, got {geometric_features.shape}")
 
         # Prepare input
         if self.use_visual_features:

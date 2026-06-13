@@ -50,7 +50,7 @@ class CustomFormatter:
             'dataset_info': {
                 'total_poses': len(poses),
                 'keypoint_count': 133,
-                'feature_dimension': 52,
+                'feature_dimension': 66,  # geometric vector format v3
                 'categories': self._extract_categories(poses),
                 'difficulty_levels': self._extract_difficulties(poses)
             },

@@ -56,18 +56,19 @@ print("\n[4/5] Testing multimodal fusion...")
 try:
     from core.geometric_feature_extractor import GeometricFeatures
     # Create dummy geometric features
-    geometric_vec = np.random.rand(52).astype(np.float32)
+    geometric_vec = np.random.rand(66).astype(np.float32)  # v3 geometric dim
     visual_vec = np.random.rand(576).astype(np.float32)
 
     # Create feature objects
     import json
     geom_features = GeometricFeatures(
         feature_vector=geometric_vec,
+        feature_confidence=np.ones(66, dtype=np.float32),
         joint_angles={},
         limb_ratios={},
         body_angles={},
         symmetry_scores={},
-        occlusion_pattern=np.zeros(7)
+        occlusion_pattern=np.zeros(7, dtype=np.float32)
     )
 
     from core.visual_feature_extractor import VisualFeatures
@@ -77,7 +78,7 @@ try:
     fused = bridge.fusion_engine.fuse(geom_features, vis_features)
 
     assert hasattr(fused, 'fused_vector'), "Missing fused_vector"
-    assert fused.fused_vector.shape == (628,), f"Wrong fused dim: {fused.fused_vector.shape}"
+    assert fused.fused_vector.shape == (642,), f"Wrong fused dim: {fused.fused_vector.shape}"
     assert fused.fused_vector.dtype == np.float32, "Wrong fused dtype"
     print(f"✓ Fusion works: {fused.fused_vector.shape}")
 except Exception as e:
@@ -100,6 +101,6 @@ print("ALL TESTS PASSED ✓")
 print("="*80)
 print("\nPhase 1 implementation verified:")
 print("  - Visual feature extraction: 576-dim ✓")
-print("  - Multimodal fusion: 628-dim (52 + 576) ✓")
+print("  - Multimodal fusion: 642-dim (66 + 576) ✓")
 print("  - Database models ready ✓")
 print("\nReady to test with real images!")
