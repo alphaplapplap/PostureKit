@@ -8,6 +8,8 @@ from typing import List, Optional
 from dataclasses import dataclass
 import logging
 import weakref
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 from ultralytics import YOLO
@@ -17,6 +19,29 @@ from src.utils.logging_config import get_logger
 from src.config.settings import settings
 
 logger = get_logger(__name__)
+
+# Shared, bounded thread pool for concurrent per-tile RTMO inference.
+# ONNX Runtime's InferenceSession.run is thread-safe, and the CPU-resident
+# partitions of the CoreML-split RTMO graph overlap across threads (measured
+# ~1.67x on the 8-tile pass for a 4K image). Tiles are large 1280px inferences,
+# so the pool is intentionally bounded (4 workers) rather than scaled to the
+# 18-core machine — wider pools oversubscribe the ANE/CPU partitions for no
+# additional gain. Module-level so the pool (and its threads) are reused across
+# images instead of being torn down per detection.
+_TILE_INFERENCE_WORKERS = 4
+_tile_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_tile_executor() -> ThreadPoolExecutor:
+    """Lazily construct the shared per-tile inference pool."""
+    global _tile_executor
+    if _tile_executor is None:
+        _tile_executor = ThreadPoolExecutor(
+            max_workers=_TILE_INFERENCE_WORKERS,
+            thread_name_prefix="rtmo-tile",
+        )
+        atexit.register(_tile_executor.shutdown, wait=False)
+    return _tile_executor
 
 
 def _has_mps_module() -> bool:
@@ -408,25 +433,42 @@ class RTMOPersonDetector:
         H, W = image.shape[:2]
         detections: List[PersonDetection] = []
 
-        # Full-image pass: finds large/close people regardless of image size.
-        candidates = self._collect_candidates(bgr, (0, 0))
-
         # High-res tiling pass: each tile is a pixel crop (no resize), so RTMO's
         # 640x640 input sees small people at tile_size/640 ≈ 2x the detail of the
         # full-image pass. Tile fragments of people the full pass already found
         # have fewer visible keypoints and get dropped by the containment dedup.
+        tiles: List[tuple] = []
         if self.tile_min_long_side > 0 and max(H, W) >= self.tile_min_long_side:
             tiles = self._generate_tiles(W, H)
-            for (tx1, ty1, tx2, ty2) in tiles:
-                candidates.extend(self._collect_candidates(
+
+        if tiles:
+            # Run the full-image pass and all tile passes concurrently through a
+            # bounded shared pool: InferenceSession.run is thread-safe and the
+            # CPU-resident partitions of the CoreML-split RTMO graph overlap
+            # across threads (~1.67x on the tile portion). Futures are collected
+            # in deterministic order — full-image candidates first, then tiles in
+            # tile order — so the input to the two-phase dedup (and thus the final
+            # result) is bit-identical to the previous serial implementation.
+            executor = _get_tile_executor()
+            full_future = executor.submit(self._collect_candidates, bgr, (0, 0))
+            tile_futures = [
+                executor.submit(
+                    self._collect_candidates,
                     bgr[ty1:ty2, tx1:tx2], (tx1, ty1),
-                    min_visible=self.tile_min_visible_kps,
-                    from_tile=True
-                ))
+                    self.tile_min_visible_kps, True,
+                )
+                for (tx1, ty1, tx2, ty2) in tiles
+            ]
+            candidates = full_future.result()
+            for tf in tile_futures:
+                candidates.extend(tf.result())
             logger.info(
                 f"RTMO tiled detection: {len(tiles)} tiles for {W}x{H}, "
                 f"{len(candidates)} candidates pre-dedup"
             )
+        else:
+            # Full-image pass only: finds large/close people regardless of size.
+            candidates = self._collect_candidates(bgr, (0, 0))
 
         if not candidates:
             logger.info("RTMO detected 0 people")

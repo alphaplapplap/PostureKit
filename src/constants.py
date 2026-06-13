@@ -54,7 +54,11 @@ DEFAULT_CACHE_TTL_SECONDS = 600  # 10 minutes
 BATCH_PROCESSING_SIZE = 1000
 
 # Distance and similarity
-BASE_SIMILARITY_SCALE = 2.0
+# Default exp(-d/scale) base when the index mapping metadata carries no fitted
+# 'similarity_scale' (e.g. legacy indices). The live value is read from index
+# metadata so Wave 4 can fit it post-re-extraction without code changes; see
+# SimilarityEngine._distance_to_similarity / save_index.
+DEFAULT_SIMILARITY_SCALE = 2.0
 REFERENCE_FEATURE_DIMENSION = 52.0
 
 # Plausibility scoring

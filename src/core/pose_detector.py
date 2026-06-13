@@ -910,6 +910,16 @@ class RTMWCocktail14Detector:
         """
         Detect pose from cropped person image.
 
+        Shares the SAME extraction pipeline as detect() — visibility
+        derivation (incl. keypoints_visible / out-of-bounds marking),
+        visible-only confidence, and _validate_detection — by delegating to
+        _extract_pose_results, then offsetting the result back into original
+        image coordinates. This keeps the production ensemble path (which only
+        ever reaches poses through this method) consistent with the
+        single-model detect() path so occluded/partial poses are not
+        confidence-penalized and implausible crop detections are rejected
+        identically across both paths.
+
         Args:
             crop: Cropped image of person (H, W, 3) in RGB
             bbox_in_original: Bounding box in original image [x, y, w, h]
@@ -935,55 +945,32 @@ class RTMWCocktail14Detector:
                 logger.debug("No pose detected in crop")
                 return None
 
-            # Extract first (should only be one person in crop)
-            sample = data_samples[0]
-            pred_instances = sample.pred_instances
+            # Extract using the SHARED pipeline (visibility/OOB/validation/
+            # visible-only confidence) in CROP coordinate space — keypoints
+            # from inference_topdown(crop) are relative to the crop, so OOB
+            # marking and validation must run against the crop's shape.
+            crop_results = self._extract_pose_results(data_samples, crop.shape[:2])
 
-            # Extract keypoints (133, 2) and scores (133,)
-            keypoints = pred_instances.keypoints
-            keypoint_scores = pred_instances.keypoint_scores
+            if not crop_results:
+                logger.debug("Crop pose rejected by shared extraction/validation")
+                return None
 
-            # Handle batch dimension
-            if len(keypoints.shape) == 3:
-                keypoints = keypoints[0]
-                keypoint_scores = keypoint_scores[0]
+            # One person per crop — take the first (and only) result.
+            result = crop_results[0]
 
-            # Convert to numpy if tensor
-            if torch.is_tensor(keypoints):
-                keypoints = keypoints.detach().cpu().numpy()
-            if torch.is_tensor(keypoint_scores):
-                keypoint_scores = keypoint_scores.detach().cpu().numpy()
-
-            # Map keypoints back to original image coordinates
+            # Map keypoints back into original image coordinates.
             x_offset, y_offset = bbox_in_original[0], bbox_in_original[1]
-            keypoints_original = keypoints.copy()
-            keypoints_original[:, 0] += x_offset
-            keypoints_original[:, 1] += y_offset
+            result.keypoints[:, 0] += x_offset
+            result.keypoints[:, 1] += y_offset
 
-            # Combine into (133, 3) with pre-allocation
-            keypoints_with_conf = np.empty((133, 3), dtype=np.float32)
-            keypoints_with_conf[:, :2] = keypoints_original
-            keypoints_with_conf[:, 2] = np.clip(keypoint_scores, 0.0, 1.0)
+            # Use the caller-supplied bbox in original coordinates (the crop's
+            # own bbox is meaningless in the original frame).
+            result.bbox = bbox_in_original.copy().astype(np.float32)
 
-            # Overall confidence
-            overall_confidence = float(np.clip(keypoint_scores.mean(), 0.0, 1.0))
+            # person_id is assigned by the caller.
+            result.person_id = 0
 
-            # Compute visibility from confidence scores
-            visibility_array = np.zeros(133, dtype=np.int8)
-            visibility_array[keypoint_scores >= 0.5] = 2  # Visible
-            visibility_array[(keypoint_scores >= 0.1) & (keypoint_scores < 0.5)] = 1  # Occluded
-            visibility_array[keypoint_scores < 0.1] = 0  # Missing
-
-            # Create result
-            result = PoseResult(
-                keypoints=keypoints_with_conf,
-                visibility=visibility_array,
-                bbox=bbox_in_original.copy(),
-                overall_confidence=overall_confidence,
-                person_id=0  # Will be set by caller
-            )
-
-            logger.debug(f"Pose detected with confidence: {overall_confidence:.3f}")
+            logger.debug(f"Pose detected with confidence: {result.overall_confidence:.3f}")
 
             return result
 

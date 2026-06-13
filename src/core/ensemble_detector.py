@@ -14,6 +14,13 @@ from typing import List, Dict, Optional, Literal
 from dataclasses import dataclass
 import torch
 
+# mmpose's inference_topdown natively batches every supplied bbox into one
+# model.test_step (collated via pseudo_collate), so the ensemble can run ONE
+# batched forward per model over all persons instead of 2N batch-1 crops.
+# (torch is patched by the entry point's _torch_patch before this module loads;
+# pose_detector below also imports mmpose, so the patch is already applied.)
+from mmpose.apis import inference_topdown
+
 from src.core.pose_detector import RTMWCocktail14Detector, PoseResult
 from src.core.person_detector import (
     YOLOPersonDetector,
@@ -180,19 +187,9 @@ class EnsembleDetector:
                 else:
                     logger.debug(f"Model {i}: no pose detected")
 
-                # Clear GPU cache between model inferences to prevent accumulation
-                if i < len(self.detectors):  # Don't clear after last detector
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    elif torch.backends.mps.is_available():
-                        if _has_mps_module():
-                            try:
-                                torch.mps.empty_cache()
-                            except Exception:
-                                pass
-                        # Else: PyTorch < 2.1, skip MPS cache cleanup
+                # Per-inference gc.collect() + torch.mps cache wiping removed
+                # (finding 12): each cost ~38ms, leaked nothing, and emptying the
+                # MPS cache only slowed the next forward on this 128 GB machine.
             except Exception as e:
                 logger.warning(f"Model {i} detection failed: {e}")
                 continue
@@ -229,13 +226,108 @@ class EnsembleDetector:
             logger.warning(f"Using fallback (best model): confidence={best['pose'].overall_confidence:.3f}")
             return [best["pose"]]
 
+    def _detect_model_batched(
+        self,
+        detector: "RTMWCocktail14Detector",
+        image: np.ndarray,
+        person_bboxes_xywh: List[np.ndarray],
+    ) -> List[Optional[PoseResult]]:
+        """
+        Run ONE model over every person in a single batched forward pass.
+
+        mmpose's inference_topdown collates all supplied bboxes into one
+        pseudo_collate batch and runs a single model.test_step, so passing the
+        N padded person bboxes here issues one batch-N MPS forward instead of N
+        batch-1 forwards over per-person crops. Each model is rebuilt once (one
+        Compose pipeline) per call rather than once per (person, model) pair.
+
+        Keypoints come back in full-image coordinates (the bbox is the
+        full-image padded box, not a crop origin), so no per-person offset-add
+        is needed — this reproduces detect_from_crop's geometry without the
+        zero-filled crop margins (it samples real pixels in the padded region,
+        which is neutral-to-slightly-positive for occluded limbs).
+
+        Args:
+            detector: One ensemble member (RTMWCocktail14Detector).
+            image: Full RGB image (H, W, 3).
+            person_bboxes_xywh: Per-person padded bboxes in [x, y, w, h] order,
+                index-aligned with the persons list.
+
+        Returns:
+            List index-aligned with person_bboxes_xywh; each entry is a
+            PoseResult (keypoints in image coords) or None if that person
+            produced no usable sample.
+        """
+        if detector._model is None:
+            detector._load_model()
+
+        # Convert [x, y, w, h] -> [x1, y1, x2, y2] for inference_topdown.
+        bboxes_xyxy = np.array(
+            [[b[0], b[1], b[0] + b[2], b[1] + b[3]] for b in person_bboxes_xywh],
+            dtype=np.float32,
+        )
+
+        # Single batched forward over all persons.
+        data_samples = inference_topdown(
+            detector._model, image, bboxes=bboxes_xyxy, bbox_format="xyxy"
+        )
+
+        results: List[Optional[PoseResult]] = [None] * len(person_bboxes_xywh)
+        # inference_topdown returns results in bbox order, index-aligned with persons.
+        for idx, sample in enumerate(data_samples):
+            if idx >= len(results):
+                break
+            try:
+                pred_instances = sample.pred_instances
+                keypoints = pred_instances.keypoints
+                keypoint_scores = pred_instances.keypoint_scores
+
+                # Strip the per-sample instance dimension if present.
+                if len(keypoints.shape) == 3:
+                    keypoints = keypoints[0]
+                    keypoint_scores = keypoint_scores[0]
+
+                if torch.is_tensor(keypoints):
+                    keypoints = keypoints.detach().cpu().numpy()
+                if torch.is_tensor(keypoint_scores):
+                    keypoint_scores = keypoint_scores.detach().cpu().numpy()
+
+                # Keypoints are already in full-image coordinates (bbox was the
+                # full-image padded box), so NO offset-add — unlike the crop path.
+                keypoints_with_conf = np.empty((133, 3), dtype=np.float32)
+                keypoints_with_conf[:, :2] = keypoints
+                keypoints_with_conf[:, 2] = np.clip(keypoint_scores, 0.0, 1.0)
+
+                overall_confidence = float(np.clip(keypoint_scores.mean(), 0.0, 1.0))
+
+                # Same visibility thresholds as detect_from_crop.
+                visibility_array = np.zeros(133, dtype=np.int8)
+                visibility_array[keypoint_scores >= 0.5] = 2
+                visibility_array[(keypoint_scores >= 0.1) & (keypoint_scores < 0.5)] = 1
+                visibility_array[keypoint_scores < 0.1] = 0
+
+                results[idx] = PoseResult(
+                    keypoints=keypoints_with_conf,
+                    visibility=visibility_array,
+                    bbox=person_bboxes_xywh[idx].copy(),
+                    overall_confidence=overall_confidence,
+                    person_id=0,  # set by caller
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to build pose for person index {idx}: {e}", exc_info=True
+                )
+                results[idx] = None
+
+        return results
+
     def detect_multi_person(self, image: np.ndarray) -> List[PoseResult]:
         """
         Detect multiple people using ensemble with per-person fusion.
 
         This method properly handles multi-person scenarios by:
-        1. Detecting all people with YOLO first
-        2. For each person, running all ensemble models on their crop
+        1. Detecting all people with the person detector first
+        2. Running each ensemble model ONCE over all persons (batched forward)
         3. Applying ensemble fusion to each person's predictions
         4. Returning all fused results
 
@@ -256,11 +348,13 @@ class EnsembleDetector:
 
         logger.info("Starting multi-person ensemble detection")
 
-        # Step 1: Detect all people with YOLO
+        # Step 1: Detect all people with the person detector.
+        # Batched pose inference re-crops from the full image via the padded
+        # bbox geometry, so we no longer need materialized per-person crops.
         try:
-            person_detections = self.person_detector.detect_people(image, return_crops=True)
+            person_detections = self.person_detector.detect_people(image, return_crops=False)
         except Exception as e:
-            logger.error(f"YOLO person detection failed: {e}, falling back to whole-image")
+            logger.error(f"Person detection failed: {e}, falling back to whole-image")
             return self.detect(image)
 
         if not person_detections:
@@ -284,54 +378,46 @@ class EnsembleDetector:
                 return []
             logger.info(f"After mega-bbox filter: {len(person_detections)} people")
 
-        # Step 2: For each person, run ensemble detection and fusion
+        # Step 2: Run each model ONCE over all persons (batched), then fuse
+        # per person. Restructured from 2N batch-1 crop forwards to 2 batch-N
+        # forwards (one per ensemble member). Per-inference gc.collect() +
+        # torch.mps cache wiping removed: each cost ~38ms and is pointless on a
+        # 128 GB machine — they only defeated the MPS allocator cache for the
+        # next forward. unload_models() still does one end-of-life cleanup.
         all_fused_results = []
 
-        for person in person_detections:
+        person_bboxes_xywh = [p.bbox for p in person_detections]
+
+        # model_results[model_index] -> list aligned with persons.
+        model_results: List[List[Optional[PoseResult]]] = []
+        for i, det_spec in enumerate(self.detectors, 1):
+            try:
+                per_person = self._detect_model_batched(
+                    det_spec["detector"], image, person_bboxes_xywh
+                )
+            except Exception as e:
+                logger.warning(f"Model {i} batched detection failed: {e}")
+                per_person = [None] * len(person_detections)
+            model_results.append(per_person)
+
+        for p_idx, person in enumerate(person_detections):
             person_id = person.person_id
             logger.debug(f"Processing person {person_id} with ensemble fusion")
 
-            # Collect predictions from all models for this person
+            # Collect predictions from all models for this person.
             person_predictions = []
-
             for i, det_spec in enumerate(self.detectors, 1):
-                try:
-                    # Run pose detection on person's crop
-                    pose = det_spec["detector"].detect_from_crop(
-                        person.crop,
-                        person.bbox
+                pose = model_results[i - 1][p_idx]
+                if pose is not None:
+                    pose.person_id = person_id
+                    person_predictions.append(
+                        {"pose": pose, "weight": det_spec["weight"], "model_id": i}
                     )
-
-                    if pose is not None:
-                        # Set person ID
-                        pose.person_id = person_id
-
-                        person_predictions.append(
-                            {"pose": pose, "weight": det_spec["weight"], "model_id": i}
-                        )
-                        logger.debug(
-                            f"Model {i} detected person {person_id} with confidence {pose.overall_confidence:.3f}"
-                        )
-                    else:
-                        logger.debug(f"Model {i} failed to detect person {person_id}")
-
-                    # Clear GPU cache between models
-                    if i < len(self.detectors):
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        elif torch.backends.mps.is_available():
-                            if _has_mps_module():
-                                try:
-                                    torch.mps.empty_cache()
-                                except Exception:
-                                    pass
-                            # Else: PyTorch < 2.1, skip MPS cache cleanup
-
-                except Exception as e:
-                    logger.warning(f"Model {i} detection failed for person {person_id}: {e}")
-                    continue
+                    logger.debug(
+                        f"Model {i} detected person {person_id} with confidence {pose.overall_confidence:.3f}"
+                    )
+                else:
+                    logger.debug(f"Model {i} failed to detect person {person_id}")
 
             # Apply fusion if we have predictions for this person
             if person_predictions:

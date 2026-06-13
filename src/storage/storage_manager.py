@@ -2,10 +2,13 @@
 Storage Manager for PostureKit.
 Coordinates atomic writes across all database tables.
 """
+from __future__ import annotations
+
 from contextlib import contextmanager
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 from uuid import UUID
+import uuid
 from datetime import datetime
 import logging
 import numpy as np
@@ -23,11 +26,17 @@ from src.storage.models import (
     VisualFeatures, FusedFeatures, TrainingLabel, CorrectionStatistics, CorrectionEvent,
     ExcludedFolder
 )
-from src.core.pose_detector import PoseResult
-from src.core.geometric_feature_extractor import GeometricFeatures as GeometricFeaturesData
-from src.core.visual_feature_extractor import VisualFeatures as VisualFeaturesData
-from src.core.multimodal_fusion import FusedFeatures as FusedFeaturesData
-from src.core.image_ingestor import ImageMetadata
+# These core modules transitively import torch/mmpose (~2.2s) but are only
+# referenced here as type annotations. Deferring them keeps pure-DB processes
+# (e.g. migration runners, the detect/search servers' DB layer) from paying the
+# detection-stack import cost. `from __future__ import annotations` makes every
+# annotation a string, so nothing below needs these at runtime.
+if TYPE_CHECKING:
+    from src.core.pose_detector import PoseResult
+    from src.core.geometric_feature_extractor import GeometricFeatures as GeometricFeaturesData
+    from src.core.visual_feature_extractor import VisualFeatures as VisualFeaturesData
+    from src.core.multimodal_fusion import FusedFeatures as FusedFeaturesData
+    from src.core.image_ingestor import ImageMetadata
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -178,7 +187,10 @@ class StorageManager:
             ).scalar_one_or_none()
 
             if image is None:
+                # Pre-assign the client-side id so we can return it without a
+                # round-trip flush; the commit-time flush performs the insert.
                 image = Image(
+                    id=uuid.uuid4(),
                     file_path=str(image_path),
                     content_hash=image_metadata.content_hash,
                     width=image_metadata.original_width,
@@ -187,7 +199,6 @@ class StorageManager:
                     thumbnail=thumbnail_bytes
                 )
                 session.add(image)
-                session.flush()  # Get image.id
                 logger.debug(f"Created pose-less Image record: {image.id}")
             elif thumbnail_bytes and not image.thumbnail:
                 image.thumbnail = thumbnail_bytes
@@ -236,13 +247,19 @@ class StorageManager:
 
         try:
             with self.session_scope() as session:
-                # 1. Create or get Image record
+                # 1. Create or get Image record.
+                #    All ids on this path are client-side (default=uuid.uuid4),
+                #    so we pre-assign them at construction and wire FK columns
+                #    directly. That removes the per-row session.flush() round
+                #    trips (their only purpose was to read back generated ids)
+                #    and lets the single commit-time flush batch the writes.
                 image = session.execute(
                     select(Image).where(Image.file_path == str(image_path))
                 ).scalar_one_or_none()
 
                 if image is None:
                     image = Image(
+                        id=uuid.uuid4(),
                         file_path=str(image_path),
                         content_hash=image_metadata.content_hash,
                         width=image_metadata.original_width,
@@ -251,7 +268,6 @@ class StorageManager:
                         thumbnail=thumbnail_bytes
                     )
                     session.add(image)
-                    session.flush()  # Get image.id
                     logger.debug(f"Created Image record: {image.id} (thumbnail: {len(thumbnail_bytes) if thumbnail_bytes else 0} bytes)")
                 else:
                     # Update thumbnail if provided and not already set
@@ -262,6 +278,7 @@ class StorageManager:
 
                 # 2. Create PoseDetection record
                 pose_detection = PoseDetection(
+                    id=uuid.uuid4(),
                     image_id=image.id,
                     bbox=pose_result.bbox.tolist(),
                     overall_confidence=float(pose_result.overall_confidence),
@@ -273,11 +290,11 @@ class StorageManager:
                 pose_detection.set_visibility(pose_result.visibility)
 
                 session.add(pose_detection)
-                session.flush()  # Get pose_detection.id
                 logger.debug(f"Created PoseDetection record: {pose_detection.id}")
 
                 # 3. Create GeometricFeatures record
                 geometric_features_rec = GeometricFeatures(
+                    id=uuid.uuid4(),
                     pose_id=pose_detection.id,
                     feature_vector=features.feature_vector.tolist(),
                     feature_confidence=features.feature_confidence.tolist(),
@@ -288,7 +305,6 @@ class StorageManager:
                     occlusion_pattern=features.occlusion_pattern.tolist()
                 )
                 session.add(geometric_features_rec)
-                session.flush()  # Get geometric_features_rec.id
                 logger.debug(f"Created GeometricFeatures record: {geometric_features_rec.id}")
 
                 # 4. Create VisualFeatures record if provided
@@ -296,13 +312,13 @@ class StorageManager:
                 logger.debug(f"Visual features provided: {visual_features is not None}")
                 if visual_features is not None:
                     visual_features_rec = VisualFeatures(
+                        id=uuid.uuid4(),
                         pose_id=pose_detection.id,
                         feature_vector=visual_features.feature_vector.tolist(),
                         model_name=visual_features.model_name,
                         normalization=visual_features.normalization
                     )
                     session.add(visual_features_rec)
-                    session.flush()  # Get visual_features_rec.id
                     logger.debug(f"Created VisualFeatures record: {visual_features_rec.id}")
                 else:
                     # Expected whenever VISUAL_MODEL=disabled — not a fault.
@@ -313,6 +329,7 @@ class StorageManager:
                 logger.debug(f"FusedFeatures creation check: fused_features={'provided' if fused_features is not None else 'None'}, visual_features_rec={'exists' if visual_features_rec is not None else 'None'}")
                 if fused_features is not None and visual_features_rec is not None:
                     fused_features_rec = FusedFeatures(
+                        id=uuid.uuid4(),
                         pose_id=pose_detection.id,
                         geometric_feature_id=geometric_features_rec.id,
                         visual_feature_id=visual_features_rec.id,
@@ -333,6 +350,7 @@ class StorageManager:
                 # 6. Create TrainingLabel record if any labels provided
                 if category or difficulty or tags or user_notes:
                     training_label = TrainingLabel(
+                        id=uuid.uuid4(),
                         pose_id=pose_detection.id,
                         category=category,
                         difficulty=difficulty,
@@ -348,6 +366,7 @@ class StorageManager:
                     from src.storage.models import BodyPart
                     for detection in body_part_detections:
                         body_part = BodyPart(
+                            id=uuid.uuid4(),
                             image_id=image.id,
                             person_index=pose_result.person_id,
                             part_name=detection.part_name,
@@ -450,7 +469,11 @@ class StorageManager:
         try:
             pose_ids = []
 
-            # Store all persons in a single transaction
+            # Store all persons in a single transaction.
+            # Ids are client-side (default=uuid.uuid4) so we pre-assign them and
+            # wire FK columns directly; with no intermediate flushes, the single
+            # commit-time flush batches same-table rows across all persons into
+            # SQLAlchemy 2.0 insertmanyvalues statements (1-2 round trips/table).
             with self.session_scope() as session:
                 # 1. Create or get Image record (shared by all persons)
                 image = session.execute(
@@ -459,6 +482,7 @@ class StorageManager:
 
                 if image is None:
                     image = Image(
+                        id=uuid.uuid4(),
                         file_path=str(image_path),
                         content_hash=image_metadata.content_hash,
                         width=image_metadata.original_width,
@@ -467,7 +491,6 @@ class StorageManager:
                         thumbnail=thumbnail_bytes
                     )
                     session.add(image)
-                    session.flush()  # Get image.id
                     logger.debug(f"Created Image record: {image.id}")
                 else:
                     # Update thumbnail if provided and not already set
@@ -487,6 +510,7 @@ class StorageManager:
 
                     # Create PoseDetection record
                     pose_detection = PoseDetection(
+                        id=uuid.uuid4(),
                         image_id=image.id,
                         bbox=pose_result.bbox.tolist(),
                         overall_confidence=float(pose_result.overall_confidence),
@@ -497,11 +521,11 @@ class StorageManager:
                     pose_detection.set_visibility(pose_result.visibility)
 
                     session.add(pose_detection)
-                    session.flush()  # Get pose_detection.id
                     pose_ids.append(pose_detection.id)
 
                     # Create GeometricFeatures record
                     geometric_features_rec = GeometricFeatures(
+                        id=uuid.uuid4(),
                         pose_id=pose_detection.id,
                         feature_vector=features.feature_vector.tolist(),
                         feature_confidence=features.feature_confidence.tolist(),
@@ -512,23 +536,23 @@ class StorageManager:
                         occlusion_pattern=features.occlusion_pattern.tolist()
                     )
                     session.add(geometric_features_rec)
-                    session.flush()
 
                     # Create VisualFeatures record if provided
                     visual_features_rec = None
                     if visual_features is not None:
                         visual_features_rec = VisualFeatures(
+                            id=uuid.uuid4(),
                             pose_id=pose_detection.id,
                             feature_vector=visual_features.feature_vector.tolist(),
                             model_name=visual_features.model_name,
                             normalization=visual_features.normalization
                         )
                         session.add(visual_features_rec)
-                        session.flush()
 
                     # Create FusedFeatures record if provided
                     if fused_features is not None and visual_features_rec is not None:
                         fused_features_rec = FusedFeatures(
+                            id=uuid.uuid4(),
                             pose_id=pose_detection.id,
                             geometric_feature_id=geometric_features_rec.id,
                             visual_feature_id=visual_features_rec.id,
@@ -542,6 +566,7 @@ class StorageManager:
                     # Create TrainingLabel record if any labels provided
                     if category or difficulty or tags or user_notes:
                         training_label = TrainingLabel(
+                            id=uuid.uuid4(),
                             pose_id=pose_detection.id,
                             category=category,
                             difficulty=difficulty,
@@ -555,6 +580,7 @@ class StorageManager:
                         from src.storage.models import BodyPart
                         for detection in body_part_detections:
                             body_part = BodyPart(
+                                id=uuid.uuid4(),
                                 image_id=image.id,
                                 person_index=pose_result.person_id,
                                 part_name=detection.part_name,

@@ -3,12 +3,26 @@
     "query": "0000da89-e79a-4c49-aad8-892e285d1199",
     "candidate": "ca3767cc-06c1-475b-b78e-e6650db6e45d",
     "label": "match",
-    "note": "seed example: engine's own top match for the query pose (replace with human-judged pairs)"
+    "note": "seed example: engine's own top match for the query pose (circular — replace with human-judged pairs)"
   },
   {
     "query": "0000da89-e79a-4c49-aad8-892e285d1199",
     "candidate": "97dd06fb-09ff-45b7-b2a8-6b535c2a4c4a",
     "label": "non-match",
     "note": "seed example: rank ~2061 weak pair"
+  },
+  {
+    "query": "bf650eca-1832-4376-afd1-d0018d21f945",
+    "candidate": "bf650eca-1832-4376-afd1-d0018d21f945",
+    "label": "match",
+    "flip": true,
+    "note": "mirrored self-pair (label-free ground truth): a horizontally-flipped query of this pose retrieves the original at rank ~7 (score ~0.55). A left/right-symmetric engine should rank it near the top; regressions here mean broken mirror invariance."
+  },
+  {
+    "query": "9ec34fc4-069d-45f8-8ba2-3e37f7aa36a5",
+    "candidate": "9ec34fc4-069d-45f8-8ba2-3e37f7aa36a5",
+    "label": "match",
+    "flip": true,
+    "note": "mirrored self-pair (label-free ground truth): flipped query retrieves the original at rank ~52 (score ~0.56). More asymmetric pose than bf650eca — a harder mirror-symmetry case."
   }
 ]

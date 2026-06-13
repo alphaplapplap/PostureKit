@@ -242,6 +242,27 @@ class Settings:
     # perfect poses keep their score and implausible ones sink up to 20%.
     PLAUSIBILITY_WEIGHT: float = float(os.getenv('PLAUSIBILITY_WEIGHT', '1.0'))
     PLAUSIBILITY_MIN_LIMB_SYMMETRY: float = float(os.getenv('PLAUSIBILITY_MIN_LIMB_SYMMETRY', '0.8'))  # Left ≈ Right
+    # The plausibility boost is an unvalidated prior: it multiplies similarity by a per-pose
+    # factor in [0.8, 1.0] BEFORE the min_similarity floor, so a valid foreshortened/profile pose
+    # (pixel limb asymmetry is the normal signature of perspective, not bad detection) can be
+    # pushed under the floor and vanish. When this gate is False the boost is computed and
+    # reported (plausibility_score still surfaces) but does NOT multiply similarity_score or
+    # affect the floor — plausibility becomes a tie-break re-sort only. Default True preserves
+    # the historical scoring behavior; flip to False (or PLAUSIBILITY_GATE_AFFECTS_SCORE=false in
+    # .env) to A/B the boost on the retrieval benchmark.
+    PLAUSIBILITY_GATE_AFFECTS_SCORE: bool = os.getenv('PLAUSIBILITY_GATE_AFFECTS_SCORE', 'true').lower() == 'true'
+
+    # ========================================================================
+    # Visual-feature rerank (two-stage geometric → visual blend)
+    # ========================================================================
+    # OPTIONAL second-stage rerank: after the geometric pass, bulk-fetch stored 576-dim
+    # MobileNetV3 visual embeddings for the top candidates and blend calibrated geometric +
+    # cosine-visual scores: final = (1 - w)·geo + w·cos_vis. Default OFF (w forced to 0 below)
+    # so behavior is unchanged until Wave 4 backfills visual features and tunes the weight.
+    # When a candidate has no stored visual embedding it falls back to its geometric score.
+    ENABLE_VISUAL_RERANK: bool = os.getenv('ENABLE_VISUAL_RERANK', 'false').lower() == 'true'
+    VISUAL_RERANK_WEIGHT: float = float(os.getenv('VISUAL_RERANK_WEIGHT', '0.0'))  # blend w in [0, 1]
+    VISUAL_RERANK_CANDIDATES: int = int(os.getenv('VISUAL_RERANK_CANDIDATES', '300'))  # top-N to rerank
 
     def validate(self) -> list[str]:
         """

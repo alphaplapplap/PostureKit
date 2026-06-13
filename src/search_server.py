@@ -10,6 +10,7 @@ import logging
 import traceback
 import signal
 import atexit
+import threading
 from pathlib import Path
 from typing import Dict, Any
 
@@ -251,6 +252,36 @@ def handle_search_by_pose_id(params: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def handle_fetch_details(params: Dict[str, Any]) -> Dict[str, Any]:
+    """On-demand heavy-field fetch for the visible page of a deferred-detail search
+    (finding 25). Searches now ship lightweight rows for large result sets; Swift
+    calls this with the visible page's pose_ids to get their thumbnails, normalized
+    keypoints and detailed-region breakdowns. The server already holds the DB hot."""
+    global bridge
+
+    if bridge is None:
+        config = params.get('config', {})
+        init_result = initialize_bridge(config)
+        if init_result['status'] != 'success':
+            return init_result
+
+    try:
+        pose_ids = params.get('pose_ids', [])
+        details = bridge.fetch_result_details(pose_ids)
+        logger.info(f"fetch_details: returned heavy fields for {len(details)}/{len(pose_ids)} poses")
+        return {
+            'status': 'success',
+            'details': details
+        }
+    except Exception as e:
+        logger.error(f"fetch_details failed: {e}")
+        traceback.print_exc(file=sys.stderr)
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+
 def handle_update_image_paths(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle a batched stored-path update after files were moved on disk."""
     global bridge
@@ -404,6 +435,31 @@ def main():
     atexit.register(cleanup_gracefully)            # Handle normal exit
     logger.info("✓ Cleanup handlers registered (SIGTERM, SIGINT, atexit)")
 
+    # Finding 43: eagerly build the bridge (DB connect + create_all + FAISS load) BEFORE
+    # signalling ready, so the first user search does not pay that startup cost while they wait.
+    # The heavier confidence-aware corpus-cache warm (~2s for a large index) is deferred to a
+    # BACKGROUND daemon thread AFTER ready, so it can never push boot past the Swift-side 10s
+    # ready timeout; _ensure_corpus_cache is lock-guarded and idempotent, so a first search that
+    # arrives mid-warm simply waits on the lock. Failures here are non-fatal — an empty/missing
+    # index is valid and the lazy per-command path still initializes on demand — but we must
+    # always print the ready line afterwards or the Swift launch sequence hangs.
+    try:
+        init_result = initialize_bridge({})
+        if init_result.get('status') == 'success' and bridge is not None:
+            def _warm_corpus_cache():
+                try:
+                    bridge.similarity_engine.reload_if_stale()
+                    bridge.similarity_engine._ensure_corpus_cache()
+                    logger.info("✓ Corpus cache warmed (background)")
+                except Exception as warm_err:
+                    logger.warning(f"Corpus cache warm skipped: {warm_err}")
+            threading.Thread(target=_warm_corpus_cache, name="corpus-warm", daemon=True).start()
+            logger.info("✓ Bridge initialized at boot (eager init); corpus cache warming in background")
+        else:
+            logger.info("Eager bridge init did not complete; will initialize lazily on first command")
+    except Exception as e:
+        logger.warning(f"Eager bridge init failed ({e}); falling back to lazy init")
+
     # Signal ready
     print(json.dumps({'status': 'ready'}), flush=True)
 
@@ -439,6 +495,8 @@ def main():
                 response = handle_search(params)
             elif cmd_type == 'search_by_pose_id':
                 response = handle_search_by_pose_id(params)
+            elif cmd_type == 'fetch_details':
+                response = handle_fetch_details(params)
             elif cmd_type == 'update_image_paths':
                 response = handle_update_image_paths(params)
             elif cmd_type == 'statistics':

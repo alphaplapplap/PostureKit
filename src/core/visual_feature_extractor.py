@@ -365,10 +365,6 @@ class VisualFeatureExtractor:
         logger.debug(f"Extracting visual features from batch of {len(images)} images")
 
         try:
-            # Pre-allocate output array (use zeros to prevent uninitialized memory)
-            # Note: Performance difference vs empty() is negligible for this size
-            batch_features = np.zeros((len(images), self.FEATURE_DIM), dtype=np.float32)
-
             # Convert all images to tensors and batch them
             tensor_list = []
             for i, image in enumerate(images):
@@ -429,12 +425,10 @@ class VisualFeatureExtractor:
                     f"Expected shape ({len(images)}, {self.FEATURE_DIM}), got {features_np.shape}"
                 )
 
-            # Apply L2 normalization if requested
+            # Apply L2 normalization if requested (vectorized; zero-row guarded)
             if self.normalize:
-                for i in range(len(images)):
-                    norm = np.linalg.norm(features_np[i])
-                    if norm > 0:
-                        features_np[i] = features_np[i] / norm
+                norms = np.linalg.norm(features_np, axis=1, keepdims=True)
+                np.divide(features_np, norms, out=features_np, where=norms > 0)
 
             logger.debug(f"Batch extraction complete: shape={features_np.shape}")
 
@@ -444,6 +438,37 @@ class VisualFeatureExtractor:
             if isinstance(e, FeatureExtractionError):
                 raise
             raise FeatureExtractionError(f"Batch extraction failed: {e}") from e
+
+    def extract_features_batch(self, images: list) -> list:
+        """Extract VisualFeatures objects for a batch of crops in one forward pass.
+
+        Convenience wrapper over extract_batch() that returns the same
+        VisualFeatures dataclass extract() produces, so multi-person ingest can
+        amortize per-image MPS dispatch overhead across all person crops in an
+        image while keeping the existing storage/fusion contract. Persons after
+        the first effectively become free.
+
+        Args:
+            images: List of RGB crops as numpy arrays (H, W, 3) uint8
+
+        Returns:
+            List of VisualFeatures, one per input crop, in input order
+
+        Raises:
+            FeatureExtractionError: If batch extraction fails. Callers that need
+                per-crop isolation should fall back to per-crop extract() on this
+                error (the whole batch fails together, matching extract_batch).
+        """
+        vectors = self.extract_batch(images)
+        model_norm = 'l2' if self.normalize else 'none'
+        return [
+            VisualFeatures(
+                feature_vector=vectors[i].astype(np.float32),
+                model_name=self.MODEL_NAME,
+                normalization=model_norm,
+            )
+            for i in range(len(images))
+        ]
 
     def is_model_loaded(self) -> bool:
         """Check if model is currently loaded in memory."""

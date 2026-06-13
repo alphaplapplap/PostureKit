@@ -263,9 +263,11 @@ class GeometricFeatures(Base):
         cascade='all, delete-orphan'
     )
 
-    __table_args__ = (
-        Index('idx_geometric_features_pose_id', 'pose_id'),
-    )
+    # pose_id is unique=True, which is backed by a unique index
+    # (geometric_features_pose_id_key) that serves all pose_id lookups. A
+    # separate idx_geometric_features_pose_id would be a strict duplicate, so it
+    # is intentionally NOT declared here (and dropped from existing DBs via
+    # migrations/002_drop_duplicate_pose_id_indexes.sql).
 
     def __repr__(self):
         return f"<GeometricFeatures(id={self.id}, pose_id={self.pose_id})>"
@@ -293,9 +295,8 @@ class VisualFeatures(Base):
         cascade='all, delete-orphan'
     )
 
-    __table_args__ = (
-        Index('idx_visual_features_pose_id', 'pose_id'),
-    )
+    # pose_id unique=True is backed by visual_features_pose_id_key; the former
+    # idx_visual_features_pose_id was a duplicate (dropped via migration 002).
 
     @validates('feature_vector')
     def validate_feature_vector(self, key, value):
@@ -334,7 +335,9 @@ class FusedFeatures(Base):
             "fusion_method IN ('concatenate', 'weighted', 'normalized')",
             name='fusion_method_valid'
         ),
-        Index('idx_fused_features_pose_id', 'pose_id'),
+        # pose_id unique=True is backed by fused_features_pose_id_key; the former
+        # idx_fused_features_pose_id was a duplicate (dropped via migration 002).
+        # The geometric/visual FK indexes are NOT unique, so they are kept.
         Index('idx_fused_features_geometric_id', 'geometric_feature_id'),
         Index('idx_fused_features_visual_id', 'visual_feature_id'),
     )
@@ -432,7 +435,9 @@ class CorrectionStatistics(Base):
     pose_detection = relationship('PoseDetection', back_populates='correction_statistics')
 
     __table_args__ = (
-        Index('idx_correction_statistics_pose_id', 'pose_id'),
+        # pose_id unique=True is backed by correction_statistics_pose_id_key; the
+        # former idx_correction_statistics_pose_id was a duplicate (dropped via
+        # migration 002). The GIN index on corrected_keypoint_types is kept.
         Index('idx_correction_statistics_keypoint_types', 'corrected_keypoint_types', postgresql_using='gin'),
     )
 

@@ -26,9 +26,6 @@ warnings.filterwarnings('ignore', message='.*torch.cuda.amp.autocast.*')
 # Add project root to path for imports (parent of src directory)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# CRITICAL: Import torch patch BEFORE any mmpose/mmengine imports
-import src.core._torch_patch as core_torch_patch
-
 logger = logging.getLogger(__name__)
 
 
@@ -102,20 +99,18 @@ def _process_thumbnail_worker(args):
         }
 
 
-# Import core modules (required)
+# Import the SEARCH-ONLY core (required). These pull faiss/sqlalchemy/cv2 but NOT
+# torch/mmpose, so a skip_models=True bridge (the search/detail/statistics server)
+# never drags in the ~2.3s detection-model import chain. The detection stack
+# (pose_detector / geometric_feature_extractor / visual_feature_extractor /
+# multimodal_fusion / ensemble_detector / two_stage_detector and the torch patch)
+# is imported lazily by _ensure_detection_imports() the first time a non-skip
+# bridge is constructed — see finding 40.
 try:
-    from src.core.pose_detector import RTMWCocktail14Detector, PoseResult
-    from src.core.geometric_feature_extractor import GeometricFeatureExtractor, GeometricFeatures
-    from src.core.visual_feature_extractor import VisualFeatureExtractor
-    from src.core.multimodal_fusion import MultiModalFusion
-    from src.core.ensemble_detector import EnsembleDetector, EnsembleConfig
     from src.intelligence.similarity_engine import SimilarityEngine
     from src.storage.storage_manager import StorageManager
     from src.storage.models import Image, PoseDetection, GeometricFeatures as GeometricFeaturesModel
     from src.core.image_ingestor import ImageMetadata
-
-    # Apply mmengine patch after imports (now mmengine is in sys.modules)
-    core_torch_patch._apply_mmengine_patch()
 
     CORE_AVAILABLE = True
 except ImportError as e:
@@ -123,14 +118,76 @@ except ImportError as e:
     CORE_AVAILABLE = False
     raise  # Re-raise - core modules are required
 
-# Import optional modules (two-stage detection)
-try:
-    from src.core.two_stage_detector import TwoStageDetector
-    TWO_STAGE_AVAILABLE = True
-except ImportError as e:
-    logger.info(f"Two-stage detection not available (optional): {e}")
-    TwoStageDetector = None
-    TWO_STAGE_AVAILABLE = False
+# Detection-stack symbols are bound at module scope by _ensure_detection_imports()
+# only when a model-loading bridge is built. Declared here so methods that reference
+# them (extract_features, _refine_bbox_from_keypoints, detect_*) resolve the global.
+RTMWCocktail14Detector = None
+PoseResult = None
+GeometricFeatureExtractor = None
+GeometricFeatures = None
+VisualFeatureExtractor = None
+MultiModalFusion = None
+EnsembleDetector = None
+EnsembleConfig = None
+TwoStageDetector = None
+TWO_STAGE_AVAILABLE = False
+_DETECTION_IMPORTS_LOADED = False
+
+
+def _ensure_detection_imports():
+    """Lazily import the torch/mmpose detection stack, preserving the critical
+    import order (_torch_patch FIRST, then mmpose-backed modules, then
+    _apply_mmengine_patch). Idempotent: a no-op after the first successful load.
+
+    Binds the detection symbols as module globals so existing method bodies that
+    reference RTMWCocktail14Detector / PoseResult / GeometricFeatureExtractor /
+    EnsembleDetector / etc. keep working unchanged.
+    """
+    global _DETECTION_IMPORTS_LOADED
+    global RTMWCocktail14Detector, PoseResult
+    global GeometricFeatureExtractor, GeometricFeatures
+    global VisualFeatureExtractor, MultiModalFusion
+    global EnsembleDetector, EnsembleConfig
+    global TwoStageDetector, TWO_STAGE_AVAILABLE
+
+    if _DETECTION_IMPORTS_LOADED:
+        return
+
+    # CRITICAL: torch patch BEFORE any mmpose/mmengine import.
+    import src.core._torch_patch as core_torch_patch
+
+    from src.core.pose_detector import RTMWCocktail14Detector as _RTMWCocktail14Detector, PoseResult as _PoseResult
+    from src.core.geometric_feature_extractor import (
+        GeometricFeatureExtractor as _GeometricFeatureExtractor,
+        GeometricFeatures as _GeometricFeatures,
+    )
+    from src.core.visual_feature_extractor import VisualFeatureExtractor as _VisualFeatureExtractor
+    from src.core.multimodal_fusion import MultiModalFusion as _MultiModalFusion
+    from src.core.ensemble_detector import EnsembleDetector as _EnsembleDetector, EnsembleConfig as _EnsembleConfig
+
+    # Apply mmengine patch after imports (now mmengine is in sys.modules)
+    core_torch_patch._apply_mmengine_patch()
+
+    RTMWCocktail14Detector = _RTMWCocktail14Detector
+    PoseResult = _PoseResult
+    GeometricFeatureExtractor = _GeometricFeatureExtractor
+    GeometricFeatures = _GeometricFeatures
+    VisualFeatureExtractor = _VisualFeatureExtractor
+    MultiModalFusion = _MultiModalFusion
+    EnsembleDetector = _EnsembleDetector
+    EnsembleConfig = _EnsembleConfig
+
+    # Optional two-stage detector (requires ultralytics)
+    try:
+        from src.core.two_stage_detector import TwoStageDetector as _TwoStageDetector
+        TwoStageDetector = _TwoStageDetector
+        TWO_STAGE_AVAILABLE = True
+    except ImportError as e:
+        logger.info(f"Two-stage detection not available (optional): {e}")
+        TwoStageDetector = None
+        TWO_STAGE_AVAILABLE = False
+
+    _DETECTION_IMPORTS_LOADED = True
 
 
 class PostureKitBridge:
@@ -255,6 +312,10 @@ class PostureKitBridge:
             self.detector = None
             self.pose_detector = None
         else:
+            # Lazily pull in the torch/mmpose detection stack (finding 40). Search-only
+            # bridges never reach here, so they never pay the ~2.3s import chain.
+            _ensure_detection_imports()
+
             # Determine which models to use
             # Handle backward compatibility with use_ensemble
             if pose_models is None:
@@ -277,9 +338,37 @@ class PostureKitBridge:
                     available = ', '.join(self.AVAILABLE_MODELS.keys())
                     raise ValueError(f"Unknown model '{model_name}'. Available: {available}")
 
-            # Build model specifications
+            # Per-member ensemble weights (finding 11). The default ensemble pairs two
+            # highly correlated RTMW models at equal weight; their errors correlate, so
+            # blind 1:1 coordinate averaging buys little for ~1.8x compute. Make the
+            # mix a documented, reversible setting instead of silently changing accuracy:
+            #   POSE_ENSEMBLE_MEMBER_WEIGHTS="1.0,1.0"  (default — current behavior)
+            #   POSE_ENSEMBLE_MEMBER_WEIGHTS="0.0,1.0"  -> RTMW-X effectively alone
+            #   POSE_ENSEMBLE_MEMBER_WEIGHTS="0.7,1.3"  -> favor RTMW-X
+            # Values align positionally with model_list; a member weighted 0.0 is dropped
+            # entirely so it isn't even loaded (the ~45% compute cut). Malformed/short
+            # specs fall back to 1.0 per member, preserving current accuracy.
+            weights_env = os.environ.get('POSE_ENSEMBLE_MEMBER_WEIGHTS', '').strip()
+            member_weights = {}
+            if weights_env:
+                parsed = [w.strip() for w in weights_env.split(',')]
+                for idx, model_name in enumerate(model_list):
+                    if idx < len(parsed) and parsed[idx]:
+                        try:
+                            member_weights[model_name] = float(parsed[idx])
+                        except ValueError:
+                            logger.warning(
+                                f"Invalid POSE_ENSEMBLE_MEMBER_WEIGHTS entry "
+                                f"'{parsed[idx]}' for '{model_name}'; using 1.0"
+                            )
+
+            # Build model specifications (drop members explicitly weighted to 0.0)
             model_specs = []
             for model_name in model_list:
+                weight = member_weights.get(model_name, 1.0)
+                if weight <= 0.0:
+                    logger.info(f"Ensemble member '{model_name}' weighted {weight} — skipping (not loaded)")
+                    continue
                 model_info = self.AVAILABLE_MODELS[model_name]
                 config_path = settings.PROJECT_ROOT / "data" / "models" / model_info['config']
                 checkpoint_path = settings.PROJECT_ROOT / "data" / "models" / model_info['checkpoint']
@@ -293,9 +382,20 @@ class PostureKitBridge:
                     'name': model_name,
                     'config': str(config_path),
                     'checkpoint': str(checkpoint_path),
-                    'weight': 1.0,
+                    'weight': weight,
                     'info': model_info
                 })
+
+            if not model_specs:
+                raise ValueError(
+                    "All ensemble members were weighted to 0.0 via "
+                    "POSE_ENSEMBLE_MEMBER_WEIGHTS; at least one must be > 0."
+                )
+
+            # Re-evaluate ensemble vs single-model after weight-based drops: a single
+            # surviving member should run as a plain single-stage detector, not a
+            # 1-model "ensemble".
+            use_ensemble_mode = len(model_specs) > 1
 
             # Suppress mmengine logging during model loading
             import logging as py_logging
@@ -368,19 +468,32 @@ class PostureKitBridge:
                     sys.stderr = old_stderr
                     mmengine_logger.setLevel(old_level)
 
-        self.feature_extractor = GeometricFeatureExtractor()
+        # Remember device for any lazy feature-extractor construction below.
+        self._device = device
 
-        # Initialize visual extractor only if enabled
-        if self.visual_model != 'disabled':
-            self.visual_extractor = VisualFeatureExtractor(device=device)  # Lazy-loads model on first use
-        else:
+        # Feature/visual/fusion extractors all transitively import torch (finding 40),
+        # so a skip_models (search-only) bridge must NOT build them — the search path
+        # never touches feature_extractor/visual_extractor/fusion_engine. They are
+        # constructed here for model-loading bridges, where _ensure_detection_imports()
+        # has already run.
+        if skip_models:
+            self.feature_extractor = None
             self.visual_extractor = None
+            self.fusion_engine = None
+        else:
+            self.feature_extractor = GeometricFeatureExtractor()
 
-        self.fusion_engine = MultiModalFusion(
-            fusion_method=settings.FUSION_METHOD,
-            geometric_weight=settings.FUSION_GEOMETRIC_WEIGHT,
-            visual_weight=settings.FUSION_VISUAL_WEIGHT,
-        )
+            # Initialize visual extractor only if enabled
+            if self.visual_model != 'disabled':
+                self.visual_extractor = VisualFeatureExtractor(device=device)  # Lazy-loads model on first use
+            else:
+                self.visual_extractor = None
+
+            self.fusion_engine = MultiModalFusion(
+                fusion_method=settings.FUSION_METHOD,
+                geometric_weight=settings.FUSION_GEOMETRIC_WEIGHT,
+                visual_weight=settings.FUSION_VISUAL_WEIGHT,
+            )
 
         # Ensure PostgreSQL is running before attempting database operations
         import socket
@@ -566,6 +679,140 @@ class PostureKitBridge:
             logger.error(f"Multi-person pose detection from file failed: {e}")
             return []
 
+    def _pose_features_dict(self, pose, image_array: Optional[np.ndarray]) -> Optional[Dict[str, Any]]:
+        """Extract geometric (and, when an image is supplied, visual+fused) features
+        for one detected PoseResult and return the same dict shape as
+        extract_features(). Computed directly from the in-memory PoseResult so the
+        query-side features use full-precision visibility — no Swift round-trip that
+        quantizes visibility to 0/1 (finding 23). Returns None on failure."""
+        self._ensure_feature_extractors()
+        try:
+            geometric_features = self.feature_extractor.extract(pose)
+        except Exception as e:
+            logger.error(f"Inline geometric feature extraction failed: {e}", exc_info=True)
+            return None
+
+        visual_features = None
+        fused_vector = None
+        if image_array is not None and self.visual_extractor is not None:
+            try:
+                # Crop to the person's bbox for appearance features, matching the
+                # ingest path (_extract_person_features) rather than whole-image.
+                x, y, w, h = [int(v) for v in pose.bbox]
+                x = max(0, min(x, image_array.shape[1] - 1))
+                y = max(0, min(y, image_array.shape[0] - 1))
+                w = min(w, image_array.shape[1] - x)
+                h = min(h, image_array.shape[0] - y)
+                if w > 10 and h > 10:
+                    person_crop = image_array[y:y + h, x:x + w]
+                    visual_features = self.visual_extractor.extract(person_crop)
+                    fused_features = self.fusion_engine.fuse(geometric_features, visual_features)
+                    fused_vector = fused_features.fused_vector.tolist()
+            except Exception as e:
+                logger.warning(f"Inline visual/fused feature extraction failed, geometric only: {e}")
+
+        return {
+            'feature_vector': geometric_features.feature_vector.tolist(),  # 52-dim geometric
+            'feature_confidence': geometric_features.feature_confidence.tolist(),  # 52-dim confidence
+            'fused_vector': fused_vector,  # 628-dim fused (None if visual disabled/failed)
+            'joint_angles': geometric_features.joint_angles,
+            'limb_ratios': geometric_features.limb_ratios,
+            'body_angles': geometric_features.body_angles,
+            'symmetry_scores': geometric_features.symmetry_scores,
+            'occlusion_pattern': geometric_features.occlusion_pattern.tolist(),
+        }
+
+    def detect_multi_person_poses_with_features(
+        self, image_array: np.ndarray, refine_bbox: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Detect every person AND fold each one's extracted geometric (+visual/fused)
+        features into its pose dict under a 'features' key (finding 23).
+
+        Same per-person shape as detect_multi_person_poses() plus 'features'. Features
+        are computed in this same process from the decoded image and PoseResults, so a
+        caller (the detect server) gets detection + features in ONE round trip instead
+        of spawning a second full one-shot just to extract features.
+        """
+        try:
+            if hasattr(self.detector, 'detect_multi_person'):
+                poses = self.detector.detect_multi_person(image_array)
+            else:
+                poses = self.detector.detect(image_array)
+
+            if not poses:
+                return []
+
+            results = []
+            for pose in poses:
+                bbox = pose.bbox
+                if refine_bbox:
+                    bbox = self._refine_bbox_from_keypoints(pose)
+
+                results.append({
+                    'keypoints': pose.keypoints.tolist(),
+                    'visibility': pose.visibility.tolist(),
+                    'bbox': bbox.tolist(),
+                    'confidence': float(pose.overall_confidence),
+                    'person_id': int(pose.person_id),
+                    'features': self._pose_features_dict(pose, image_array),
+                })
+
+            logger.info(f"Detected {len(results)} person(s) with inline features")
+            return results
+
+        except Exception as e:
+            logger.error(f"Multi-person detection with features failed: {e}", exc_info=True)
+            return []
+
+    def detect_multi_person_poses_with_features_from_file(
+        self, image_path: str, refine_bbox: bool = True
+    ) -> List[Dict[str, Any]]:
+        """File wrapper for detect_multi_person_poses_with_features (finding 23)."""
+        try:
+            import cv2
+            image = cv2.imread(image_path)
+            if image is None:
+                logger.error(f"Failed to load image: {image_path}")
+                return []
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            return self.detect_multi_person_poses_with_features(image_rgb, refine_bbox=refine_bbox)
+        except Exception as e:
+            logger.error(f"Multi-person detection-with-features from file failed: {e}", exc_info=True)
+            return []
+
+    def detect_pose_with_features_from_file(
+        self, image_path: str, bbox: Optional[List[float]] = None, refine_bbox: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """Detect a single person (first/highest-confidence, or the one whose bbox best
+        matches `bbox` when supplied) with inline features folded in (finding 23).
+
+        Returns a single pose dict (same shape as detect_pose plus 'features'), or None.
+        """
+        try:
+            import cv2
+            image = cv2.imread(image_path)
+            if image is None:
+                logger.error(f"Failed to load image: {image_path}")
+                return None
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            persons = self.detect_multi_person_poses_with_features(image_rgb, refine_bbox=refine_bbox)
+            if not persons:
+                return None
+
+            if bbox is not None:
+                # Pick the detected person whose bbox overlaps the requested one most.
+                best, best_iou = None, -1.0
+                for p in persons:
+                    iou = self._bbox_iou_xywh(p['bbox'], bbox)
+                    if iou > best_iou:
+                        best, best_iou = p, iou
+                return best if best is not None else persons[0]
+
+            return persons[0]
+        except Exception as e:
+            logger.error(f"Single-person detection-with-features from file failed: {e}", exc_info=True)
+            return None
+
     def _refine_bbox_from_keypoints(self, pose_result: PoseResult) -> np.ndarray:
         """
         Refine bounding box using visible keypoints for tighter fit.
@@ -635,7 +882,30 @@ class PostureKitBridge:
         )
 
         return refined_bbox
-    
+
+    def _ensure_feature_extractors(self):
+        """Build the geometric/visual/fusion extractors on demand.
+
+        A skip_models (search-only) bridge constructs none of these (they pull
+        torch — finding 40). Any caller that actually needs feature extraction
+        (extract_features, _extract_person_features) routes through here so a
+        bridge that skipped them still works, while the search path stays clean.
+        """
+        if self.feature_extractor is not None:
+            return
+        _ensure_detection_imports()
+        self.feature_extractor = GeometricFeatureExtractor()
+        if self.visual_model != 'disabled':
+            self.visual_extractor = VisualFeatureExtractor(device=self._device)
+        else:
+            self.visual_extractor = None
+        from src.config.settings import settings
+        self.fusion_engine = MultiModalFusion(
+            fusion_method=settings.FUSION_METHOD,
+            geometric_weight=settings.FUSION_GEOMETRIC_WEIGHT,
+            visual_weight=settings.FUSION_VISUAL_WEIGHT,
+        )
+
     def extract_features(self, pose_data: Dict[str, Any], image_array: Optional[np.ndarray] = None) -> Optional[Dict[str, Any]]:
         """
         Extract and fuse geometric and visual features from pose data and image.
@@ -648,6 +918,7 @@ class PostureKitBridge:
             Dictionary with feature data including fused 628-dim vector, or None if extraction failed
         """
         try:
+            self._ensure_feature_extractors()
             # Reconstruct PoseResult object
             pose_result = PoseResult(
                 keypoints=np.array(pose_data['keypoints']),
@@ -778,18 +1049,24 @@ class PostureKitBridge:
                     **search_kwargs
                 )
 
-            # Convert to Swift-friendly format.
+            # Convert to Swift-friendly format (finding 25).
             #
-            # The base64 thumbnail (~17 KB), keypoints (399 floats) and detailed regions are by
-            # far the heaviest per-result fields, and the response scales with result count. A low
-            # similarity threshold can return tens of thousands of results — at full fidelity that
-            # is a ~0.5 GB single-line JSON blob, which overruns the Swift stdin/stdout reader and
-            # comes back as ZERO results. Past a cap we omit those fields; Swift then loads each
-            # visible cell's thumbnail from disk (it already falls back to that) and simply skips
-            # the skeleton overlay / detailed-region breakdown for very large sets.
+            # The base64 thumbnail (~17 KB), normalized keypoints (399 floats) and the
+            # detailed-region breakdown are by far the heaviest per-result fields, and the
+            # response scales with result count. The UI pages 20 at a time, so shipping
+            # those heavy fields for ALL of a 500-1000+ result set wastes a multi-MB
+            # single-line pipe transfer, JSON parse and base64 decode the user never sees.
+            #
+            # New contract: inline the heavy fields ONLY for small "quick" searches
+            # (<= DETAIL_INLINE_CAP results) so those keep single-phase behavior. For
+            # larger sets we ship lightweight rows and Swift pulls heavy fields for just
+            # the visible page via the search server's 'fetch_details' command (which has
+            # the corpus hot). Swift detects the deferred case by the ABSENCE of the
+            # 'keypoints'/'thumbnail_base64' keys — exactly the same signal the old
+            # >1000-result disk-fallback path already relied on.
             import base64
-            HEAVY_PAYLOAD_CAP = 1000
-            include_heavy = len(results) <= HEAVY_PAYLOAD_CAP
+            DETAIL_INLINE_CAP = 50
+            include_heavy = len(results) <= DETAIL_INLINE_CAP
             swift_results = []
             for result in results:
                 result_dict = {
@@ -826,8 +1103,8 @@ class PostureKitBridge:
                     'valid_dimensions': result.get('valid_dimensions')  # Confidence-aware search
                 }
 
-                # Heavy fields only for reasonably-sized result sets; otherwise omit to keep the
-                # JSON response transferable (Swift loads thumbnails from disk on demand).
+                # Heavy fields only for small result sets; otherwise omit and let Swift
+                # fetch_details the visible page on demand.
                 if include_heavy:
                     result_dict['keypoints'] = result.get('keypoints', [])  # 133 × 3 [x, y, confidence]
                     result_dict['visible_regions_detailed'] = result.get('visible_regions_detailed', [])
@@ -838,8 +1115,9 @@ class PostureKitBridge:
 
             if not include_heavy:
                 logger.info(
-                    f"Large result set ({len(results)} > {HEAVY_PAYLOAD_CAP}): omitted thumbnails/keypoints/"
-                    f"detailed-regions to keep the response transferable; Swift will load thumbnails from disk"
+                    f"Deferred-detail result set ({len(results)} > {DETAIL_INLINE_CAP}): shipped "
+                    f"lightweight rows; Swift fetches thumbnails/keypoints/detailed-regions per "
+                    f"visible page via fetch_details"
                 )
 
             return swift_results
@@ -849,6 +1127,135 @@ class PostureKitBridge:
             import traceback
             logger.error(f"Similarity search failed: {e}", exc_info=True)
             print(f'SEARCH ERROR: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            return []
+
+    def fetch_result_details(self, pose_ids: List[str]) -> List[Dict[str, Any]]:
+        """On-demand heavy-field fetch for a page of search results (finding 25).
+
+        Given the pose_ids of the currently-visible result page, return their
+        thumbnail (base64 JPEG), overlay-normalized keypoints (200x200) and detailed
+        body-region breakdown. Bulk-fetched from PostgreSQL with chunked IN queries
+        (NOT one query per id), mirroring the engine's bulk pattern. Order of the
+        returned list follows the input pose_ids (missing/invalid ids are skipped).
+
+        Returned per-row shape:
+          {
+            'pose_id': str,
+            'thumbnail_base64': Optional[str],   # base64 JPEG (None if no thumbnail)
+            'keypoints': [[x, y, conf], ...],    # 133 entries, normalized to 200x200
+            'visible_regions_detailed': [ {part_name, canonical_region, confidence, is_exposed}, ... ]
+          }
+        """
+        import base64
+        from uuid import UUID
+        from src.storage.models import (
+            PoseDetection as PoseDetectionModel,
+            Image as ImageModel,
+            BodyPart as BodyPartModel,
+        )
+
+        if not pose_ids:
+            return []
+
+        try:
+            # Parse + de-dup ids while preserving caller order.
+            ordered_uuids = []
+            seen = set()
+            for pid in pose_ids:
+                try:
+                    u = UUID(str(pid))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if u not in seen:
+                    seen.add(u)
+                    ordered_uuids.append(u)
+            if not ordered_uuids:
+                return []
+
+            CHUNK = 500
+            pose_rows = {}     # pose_uuid -> (PoseDetection row, Image row)
+            with self.storage_manager.session_scope() as session:
+                for i in range(0, len(ordered_uuids), CHUNK):
+                    chunk = ordered_uuids[i:i + CHUNK]
+                    rows = (
+                        session.query(PoseDetectionModel, ImageModel)
+                        .join(ImageModel, PoseDetectionModel.image_id == ImageModel.id)
+                        .filter(PoseDetectionModel.id.in_(chunk))
+                        .all()
+                    )
+                    for pose, image in rows:
+                        pose_rows[pose.id] = (
+                            pose.keypoints,
+                            image.width,
+                            image.height,
+                            image.id,
+                            pose.person_id,
+                            image.thumbnail,
+                        )
+
+                # Body parts for the involved (image_id, person_id) pairs, chunked.
+                image_person_pairs = {
+                    (img_id, person_id)
+                    for (_, _, _, img_id, person_id, _) in pose_rows.values()
+                }
+                # Materialize body-part fields into plain dicts INSIDE the session so
+                # they don't detach when session_scope() closes (the result-build loop
+                # below runs after the session is gone).
+                bp_map = {}
+                image_ids = list({img_id for (img_id, _) in image_person_pairs})
+                for i in range(0, len(image_ids), CHUNK):
+                    chunk = image_ids[i:i + CHUNK]
+                    for bp in (
+                        session.query(BodyPartModel)
+                        .filter(BodyPartModel.image_id.in_(chunk))
+                        .all()
+                    ):
+                        bp_map.setdefault((bp.image_id, bp.person_index), []).append({
+                            'part_name': bp.part_name,
+                            'canonical_region': bp.canonical_region,
+                            'confidence': float(bp.confidence),
+                            'is_exposed': bp.is_exposed,
+                        })
+
+            details = []
+            for u in ordered_uuids:
+                rec = pose_rows.get(u)
+                if rec is None:
+                    continue
+                keypoints_raw, width, height, image_id, person_id, thumbnail = rec
+
+                # Normalize keypoints to the 200x200 thumbnail canvas, identical math to
+                # similarity_engine result construction (letterbox/pillarbox fit).
+                keypoints_normalized = []
+                if keypoints_raw and len(keypoints_raw) == 399 and width and height:
+                    scale = min(200.0 / width, 200.0 / height)
+                    x_offset = (200.0 - width * scale) / 2
+                    y_offset = (200.0 - height * scale) / 2
+                    for j in range(0, 399, 3):
+                        kx = keypoints_raw[j]
+                        ky = keypoints_raw[j + 1]
+                        conf = keypoints_raw[j + 2]
+                        keypoints_normalized.append([kx * scale + x_offset, ky * scale + y_offset, conf])
+
+                visible_regions_detailed = bp_map.get((image_id, person_id), [])
+
+                details.append({
+                    'pose_id': str(u),
+                    'thumbnail_base64': (
+                        base64.b64encode(thumbnail).decode('utf-8') if thumbnail else None
+                    ),
+                    'keypoints': keypoints_normalized,
+                    'visible_regions_detailed': visible_regions_detailed,
+                })
+
+            return details
+
+        except Exception as e:
+            import sys
+            import traceback
+            logger.error(f"fetch_result_details failed: {e}", exc_info=True)
+            print(f'FETCH DETAILS ERROR: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
             return []
 
@@ -1467,8 +1874,11 @@ class PostureKitBridge:
                 content_hash=None,
             )
 
+            # Per-image NudeNet full-pass cache, reused across all persons (finding 15)
+            full_image_bp_cache = {}
             for pose in valid_poses:
-                extracted = self._extract_person_features(image_rgb, pose, image_path.name)
+                extracted = self._extract_person_features(
+                    image_rgb, pose, image_path.name, full_image_bp_cache=full_image_bp_cache)
                 if extracted is None:
                     continue
                 features, visual_features, fused_features, body_part_detections = extracted
@@ -1497,15 +1907,27 @@ class PostureKitBridge:
             result['status'] = 'failed'
             return result
 
-    def _extract_person_features(self, image_rgb, pose, image_name):
+    def _extract_person_features(self, image_rgb, pose, image_name, full_image_bp_cache=None):
         """Extract geometric, visual, fused, and body-part features for one
         detected person. Shared by index_directory and redetect_all_images.
+
+        Args:
+            full_image_bp_cache: Optional mutable dict, created ONCE per image by the
+                caller and threaded through every person of that image. The
+                full-image NudeNet fallback pass (run when a person's crop yields
+                <2 parts) is computed lazily into this cache and reused across all
+                subsequent sparse persons in the same image — instead of k identical
+                full-image inferences for k sparse persons (finding 15). The pass is
+                deterministic on identical pixels, so the cached detections are
+                bit-identical to a per-person re-run.
 
         Returns (features, visual_features, fused_features, body_part_detections),
         or None when geometric extraction fails (skip the person).
         """
         import sys
         person_id = pose.person_id
+
+        self._ensure_feature_extractors()
 
         # Extract geometric features
         try:
@@ -1593,13 +2015,23 @@ class PostureKitBridge:
                     body_part_detections.extend(body_parts_crop)
 
                     # OPTIMIZATION 2: Dual-pass detection if few parts found
-                    # Run full-image detection to catch faces/distant parts
+                    # Run full-image detection to catch faces/distant parts.
+                    # The full-image pass depends only on the image pixels and the
+                    # (constant) lowered threshold — NOT on the person — so compute it
+                    # ONCE per image and reuse across every sparse person, rather than
+                    # re-running full-image NudeNet per person (finding 15). Only the
+                    # bbox-center filter below is person-specific.
                     if len(body_part_detections) < 2:
-                        body_parts_full = self._body_detector.detect(
-                            image_rgb,
-                            min_confidence=self.body_part_confidence * 0.8,  # Slightly lower threshold
-                            use_adaptive=True
-                        )
+                        if full_image_bp_cache is not None and 'full' in full_image_bp_cache:
+                            body_parts_full = full_image_bp_cache['full']
+                        else:
+                            body_parts_full = self._body_detector.detect(
+                                image_rgb,
+                                min_confidence=self.body_part_confidence * 0.8,  # Slightly lower threshold
+                                use_adaptive=True
+                            )
+                            if full_image_bp_cache is not None:
+                                full_image_bp_cache['full'] = body_parts_full
 
                         # Filter to parts within person's bbox region (with 50px margin)
                         for part in body_parts_full:
@@ -1953,12 +2385,16 @@ class PostureKitBridge:
 
                     logger.info(f"Processing {len(valid_poses)} person(s) in {image_path.name}")
 
+                    # Per-image NudeNet full-pass cache, reused across all persons (finding 15)
+                    full_image_bp_cache = {}
+
                     # Process each person
                     for pose in valid_poses:
                         person_id = pose.person_id
                         logger.debug(f"Processing person {person_id} in {image_path.name}")
 
-                        extracted = self._extract_person_features(image_rgb, pose, image_path.name)
+                        extracted = self._extract_person_features(
+                            image_rgb, pose, image_path.name, full_image_bp_cache=full_image_bp_cache)
                         if extracted is None:
                             continue  # Geometric extraction failed; skip this person
                         features, visual_features, fused_features, body_part_detections = extracted

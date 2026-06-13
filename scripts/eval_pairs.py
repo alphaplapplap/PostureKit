@@ -36,10 +36,16 @@ import src.core._torch_patch  # noqa: F401
 from src.config.settings import settings
 from src.storage.storage_manager import StorageManager
 from src.intelligence.similarity_engine import SimilarityEngine
+from src.core.geometric_feature_extractor import GeometricFeatureExtractor
 
 from diagnose_match import resolve, LIVE_MIN_FEATURE_CONFIDENCE, LIVE_MIN_VALID_OVERLAP  # noqa: E402
 
 SWEEP_CONFIDENCES = [0.25, 0.30, 0.35, 0.40]
+
+# Shared extractor for mirrored-positive pairs ("flip": true). flip_features
+# swaps the 52-dim vector's (and confidence's) left/right dimensions, the same
+# transform the engine's flip search uses.
+_EXTRACTOR = GeometricFeatureExtractor()
 
 
 def main():
@@ -80,13 +86,26 @@ def main():
         q = q_records[0]
         cand_ids = {c.pose_id for c in c_records}
 
+        # Mirrored-positive pair ("flip": true): query the index with the
+        # horizontally-flipped feature vector and expect the (unflipped)
+        # candidate back — a label-free left/right-symmetry test. The source is
+        # the target here, so it is NOT excluded.
+        flip = bool(pair.get("flip"))
+        if flip:
+            q_vector = _EXTRACTOR.flip_features(np.asarray(q.vector, dtype=np.float32))
+            q_conf = _EXTRACTOR.flip_features(np.asarray(q.conf, dtype=np.float32))
+            exclude = None
+        else:
+            q_vector, q_conf = q.vector, q.conf
+            exclude = q.pose_id
+
         engine.clear_search_cache()
         results = engine.search_by_feature(
-            q.vector, query_confidence=q.conf,
+            q_vector, query_confidence=q_conf,
             k=engine.index.ntotal, min_confidence=0.0,
             min_feature_confidence=LIVE_MIN_FEATURE_CONFIDENCE,
             min_valid_overlap=LIVE_MIN_VALID_OVERLAP,
-            deduplicate_images=False, min_similarity=0.0, exclude_pose_id=q.pose_id)
+            deduplicate_images=False, min_similarity=0.0, exclude_pose_id=exclude)
         best = next((r for r in results if r["pose_id"] in cand_ids), None)
 
         if label == "match":

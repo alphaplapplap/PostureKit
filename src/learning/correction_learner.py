@@ -20,6 +20,9 @@ from src.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+# Minimum pixel movement for a keypoint to count as "corrected".
+CORRECTION_MOVEMENT_THRESHOLD = 1.0
+
 # Keypoint indices for major body parts
 BODY_PARTS = {
     'nose': [0],
@@ -40,6 +43,87 @@ BODY_PARTS = {
     'left_ankle': [15],
     'right_ankle': [16],
 }
+
+
+# Reverse map: keypoint index -> body-part name (COCO-17 subset; whole-body
+# keypoints 17..132 fall through to a generic "keypoint_N" label).
+KEYPOINT_NAMES = {idx: name for name, indices in BODY_PARTS.items() for idx in indices}
+
+
+def _keypoint_name(kp_idx: int) -> str:
+    """Human-readable name for a keypoint index, with a generic fallback."""
+    return KEYPOINT_NAMES.get(kp_idx, f"keypoint_{kp_idx}")
+
+
+class CorrectionLearner:
+    """
+    Back-compatibility shim used by the correction-save path.
+
+    Historically `storage_manager.store_correction_statistics` and
+    `multimodal_correction_learner` imported a `CorrectionLearner` class with a
+    static `compute_correction_statistics` method. That class was lost in a
+    refactor (only `BiasCorrector` remained), leaving a latent `ImportError`
+    that would crash `StorageManager.update_detection(store_statistics=True)`
+    the moment a correction was saved. This shim restores the symbol and the
+    one static method those call sites actually use, so the save path degrades
+    gracefully instead of throwing.
+
+    It deliberately does NOT re-introduce any model-training behavior — bias
+    learning lives in `BiasCorrector` and is not wired into the live detector
+    (see FIXME below). This class only summarizes a single correction.
+    """
+
+    @staticmethod
+    def compute_correction_statistics(
+        original_keypoints: np.ndarray,
+        corrected_keypoints: np.ndarray
+    ) -> Dict:
+        """
+        Summarize a single manual correction for storage in CorrectionStatistics.
+
+        Args:
+            original_keypoints: Detected keypoints (133, 3) with [x, y, confidence]
+            corrected_keypoints: User-corrected keypoints (133, 3) with [x, y, confidence]
+
+        Returns:
+            Dict with keys matching the CorrectionStatistics columns:
+            keypoints_corrected_count (int), avg_correction_distance (float),
+            max_correction_distance (float), corrected_keypoint_types (list[str]),
+            avg_confidence_before (float), avg_confidence_after (float).
+        """
+        original = np.asarray(original_keypoints, dtype=np.float64).reshape(-1, 3)
+        corrected = np.asarray(corrected_keypoints, dtype=np.float64).reshape(-1, 3)
+
+        n_keypoints = min(len(original), len(corrected))
+        original = original[:n_keypoints]
+        corrected = corrected[:n_keypoints]
+
+        # Per-keypoint XY movement (ignore the confidence channel).
+        deltas = corrected[:, :2] - original[:, :2]
+        distances = np.linalg.norm(deltas, axis=1)
+        moved_mask = distances > CORRECTION_MOVEMENT_THRESHOLD
+
+        corrected_distances = distances[moved_mask]
+        corrected_types = [
+            _keypoint_name(int(idx)) for idx in np.nonzero(moved_mask)[0]
+        ]
+
+        return {
+            'keypoints_corrected_count': int(moved_mask.sum()),
+            'avg_correction_distance': (
+                float(corrected_distances.mean()) if corrected_distances.size else 0.0
+            ),
+            'max_correction_distance': (
+                float(corrected_distances.max()) if corrected_distances.size else 0.0
+            ),
+            'corrected_keypoint_types': corrected_types,
+            'avg_confidence_before': (
+                float(original[:, 2].mean()) if n_keypoints else 0.0
+            ),
+            'avg_confidence_after': (
+                float(corrected[:, 2].mean()) if n_keypoints else 0.0
+            ),
+        }
 
 
 @dataclass
@@ -80,6 +164,23 @@ class InsufficientDataError(CorrectionLearnerError):
 class BiasCorrector:
     """
     Learns and applies systematic bias corrections to pose detections.
+
+    FIXME(correction-loop): This class is currently DEAD in the running app.
+    To actually close the detector-bias feedback loop, the following wiring is
+    required (intentionally NOT done here — out of scope, unmeasured, and
+    valueless until correction data exists; the irl DB has 0 corrected poses):
+      1. Pass a StorageManager into the detector so it can build a BiasCorrector:
+         swift_bridge.py ~336-340 constructs RTMWCocktail14Detector WITHOUT a
+         storage_manager, so PoseDetector.bias_corrector is always None
+         (pose_detector.py ~188-202) and the apply_correction hook
+         (pose_detector.py ~572-588) never runs. Do the same for
+         ensemble_detector.py ~100 and multi_person_pipeline.py ~48.
+      2. Add a Swift-side correction UI / trigger that calls update_detection so
+         corrected keypoints accumulate (>= MIN_TRAINING_SAMPLES) and train() can
+         run.
+      3. Add a BiasCorrector ablation to the eval harness before enabling it,
+         since detect-time offsets change stored keypoints (re-detection needed
+         to take effect). No geometric vector-format change is involved.
 
     This learner doesn't try to predict exact keypoint positions. Instead, it
     identifies systematic biases in the pose detector (e.g., "left elbows are
@@ -177,10 +278,12 @@ class BiasCorrector:
         else:
             arm_position = 'arms_down'
 
-        # Shoulder width ratio (feature 18 in limb ratios section) indicates viewing angle
-        # High ratio = frontal view, low ratio = profile view
-        # In normalized space, compare to typical frontal threshold
-        shoulder_width_ratio = features[18]
+        # Shoulder width ratio indicates viewing angle.
+        # In the 52-dim layout the limb-ratios block starts at index 12, so
+        # shoulder_width is index 20 (left/right shin are 18/19). Reading
+        # index 18 here was a latent bug: it keyed orientation off left_shin_ratio.
+        # High ratio = frontal view, low ratio = profile view.
+        shoulder_width_ratio = features[20]
 
         if shoulder_width_ratio > 0.7:  # Wide shoulders visible
             orientation = 'frontal'

@@ -6,8 +6,9 @@ Supports batch indexing, incremental updates, and persistence.
 """
 
 import logging
+import time as _time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Callable
+from typing import List, Dict, Optional, Tuple, Callable, Any
 import numpy as np
 import faiss
 from uuid import UUID
@@ -15,6 +16,7 @@ import threading
 
 from src.storage.models import GeometricFeatures, FusedFeatures, PoseDetection, Image
 from src.config.model_config import SearchFeatureMode
+from src import constants
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +62,35 @@ class SimilarityEngine:
         self.index: Optional[faiss.Index] = None
         self.dimension: int = feature_mode.get_feature_dim()  # 52 for geometric, 628 for fused
         self.pose_id_map: Dict[int, str] = {}  # FAISS ID → pose UUID (for efficient deletion)
+        self.uuid_to_faiss_id: Dict[str, int] = {}  # reverse map for O(1) remove_pose
         self.next_id_counter: int = 0  # Counter for assigning stable IDs
         self.index_path = self.index_dir / "pose_features.index"
         self.mapping_path = self.index_dir / "pose_mapping.npy"
+
+        # exp(-d/scale) base, read from index metadata (save_index persists it). Lets Wave 4
+        # fit the curve after re-extraction without code changes; default when absent.
+        self.similarity_scale: float = constants.DEFAULT_SIMILARITY_SCALE
+
+        # --- Confidence-aware corpus cache (findings 0 & 6) ---
+        # Static between index mutations: the geometric corpus held as contiguous float32
+        # matrices plus a faiss-id→row map, so the default threshold search re-ranks in one
+        # broadcast numpy pass instead of a per-query full-table DB load + 75k-iteration loop.
+        # Built lazily on first confidence-aware search (NOT at load — that would add ~2s
+        # before the search server's {"status":"ready"} handshake), invalidated on every index
+        # mutation / stale reload.
+        self._corpus_feat: Optional[np.ndarray] = None    # (N, 52) float32, row order = self._corpus_faiss_ids
+        self._corpus_conf: Optional[np.ndarray] = None    # (N, 52) float32 (NULL confidence → ones)
+        self._corpus_faiss_ids: Optional[np.ndarray] = None  # (N,) int64 faiss ids aligned with the rows above
+        self._corpus_row_of_faiss_id: Dict[int, int] = {}    # faiss id → row index
+        self._corpus_lock = threading.Lock()
+
+        # --- Batched checkpoint persistence (finding 1) ---
+        # Per-pose add/remove no longer writes the full index to disk; callers persist via
+        # checkpoint_index() every N mutations / T seconds and flush_index() once at the end.
+        self._dirty_since_save: int = 0       # pending in-memory mutations not yet on disk
+        self._last_checkpoint_time: float = _time.monotonic()
+        self.checkpoint_every_n: int = 500    # poses
+        self.checkpoint_every_seconds: float = 30.0
 
         # Tracks whether the currently-loaded index is a clean, validated load
         # or a successful build. Prevents close() from re-saving stale data when
@@ -74,12 +102,16 @@ class SimilarityEngine:
         self._index_lock = threading.RLock()  # Reentrant lock for nested calls
         self._build_lock = threading.Lock()    # Exclusive lock for building
 
-        # Search results cache (LRU with TTL)
+        # Search results cache (LRU with TTL + byte bound)
         from collections import OrderedDict
-        import time as time_module
-        self._search_cache: OrderedDict = OrderedDict()  # (query_hash, k) -> (results, timestamp)
-        self._search_cache_max_size = 1000  # Maximum cached queries
+        self._search_cache: OrderedDict = OrderedDict()  # cache_key -> (results, timestamp, approx_bytes)
+        self._search_cache_max_size = 1000  # Maximum cached queries (count bound)
         self._search_cache_ttl = 600  # 10 minutes TTL
+        # Byte bound: threshold-mode entries can hold the thumbnails of an entire result set
+        # (~17 KB each), so a count-only cap let resident memory grow unbounded. Evict by total
+        # approx bytes too. 2 GB is trivial headroom on this machine yet caps the worst case.
+        self._search_cache_max_bytes = 2 * 1024 * 1024 * 1024
+        self._search_cache_bytes = 0  # running sum of approx entry sizes
         self._cache_lock = threading.Lock()  # Protects OrderedDict from concurrent access
 
         # Try to load existing index
@@ -175,7 +207,10 @@ class SimilarityEngine:
         ids = np.arange(len(vectors), dtype=np.int64)
         self.index.add_with_ids(vectors, ids)
         self.pose_id_map = {int(i): uuid for i, uuid in enumerate(pose_uuids)}
+        self._rebuild_uuid_reverse_map()
         self.next_id_counter = len(vectors)
+        # Corpus cache (confidence matrices) is now stale; drop it so it rebuilds lazily.
+        self._invalidate_corpus_cache()
 
         logger.info(f"Built FAISS index with {len(self.pose_id_map)} poses")
 
@@ -186,14 +221,21 @@ class SimilarityEngine:
         if progress_callback:
             progress_callback(3, 3, f"Index built with {len(self.pose_id_map)} poses")
 
-    def save_index(self) -> None:
-        """Persist FAISS index and ID mapping to disk atomically."""
+    def save_index(self, verify: bool = True) -> None:
+        """Persist FAISS index and ID mapping to disk atomically.
+
+        Args:
+            verify: When True (final saves / explicit mutations), re-read the freshly written
+                index and compare ntotal as a corruption guard. Intermediate ingest checkpoints
+                pass verify=False to skip a full faiss.read_index deserialization of the whole
+                index per checkpoint (the DB remains source of truth and the run rebuilds the
+                index once at the end, so a checkpoint need not pay the re-read cost).
+        """
         if self.index is None:
             logger.warning("No index to save")
             return
 
         try:
-            import tempfile
             import os
 
             # Verify consistency before save
@@ -219,16 +261,18 @@ class SimilarityEngine:
                     'index_size': self.index.ntotal,  # For validation on load
                     'feature_mode': self.feature_mode.value,  # Store feature mode
                     'dimension': self.dimension,  # Store dimension for validation
+                    'similarity_scale': self.similarity_scale,  # exp(-d/scale) base (Wave 4 calibration)
                 }
                 np.save(str(tmp_mapping_base), save_data)
                 # np.save adds .npy to the base name, so append (not replace with .with_suffix)
                 tmp_mapping = tmp_mapping_base.parent / f"{tmp_mapping_base.name}.npy"
 
-                # Verify temp files are valid
-                test_index = faiss.read_index(str(tmp_index))
-                if test_index.ntotal != self.index.ntotal:
-                    raise ValueError("Index verification failed after write")
-                del test_index
+                # Verify temp files are valid (skipped for intermediate checkpoints)
+                if verify:
+                    test_index = faiss.read_index(str(tmp_index))
+                    if test_index.ntotal != self.index.ntotal:
+                        raise ValueError("Index verification failed after write")
+                    del test_index
 
                 # Atomic renames (both or neither) - convert Path to str
                 os.replace(str(tmp_index), str(self.index_path))
@@ -254,11 +298,244 @@ class SimilarityEngine:
         except Exception as e:
             logger.error(f"Failed to save index: {e}", exc_info=True)
 
+    def checkpoint_index(self, force: bool = False) -> None:
+        """Persist the in-memory index to disk on a bounded interval during ingest.
+
+        add_pose/remove_pose mutate only RAM (cheap add_with_ids / remove_ids); this writes the
+        whole index at most every checkpoint_every_n mutations or checkpoint_every_seconds,
+        skipping the read_index verification (verify=False) since the final flush_index() (or the
+        end-of-run full rebuild) re-verifies. A crash loses at most one checkpoint window of
+        additions, all recoverable from the DB. Call under no lock; takes _index_lock itself.
+        """
+        with self._index_lock:
+            if self._dirty_since_save == 0:
+                return
+            now = _time.monotonic()
+            if not force and self._dirty_since_save < self.checkpoint_every_n and \
+                    (now - self._last_checkpoint_time) < self.checkpoint_every_seconds:
+                return
+            self.save_index(verify=False)
+            self._loaded_clean = True
+            self._dirty_since_save = 0
+            self._last_checkpoint_time = now
+
+    def flush_index(self) -> None:
+        """Final, verified persistence of any pending in-memory mutations (end-of-run/cancel)."""
+        with self._index_lock:
+            if self._dirty_since_save == 0:
+                return
+            self.save_index(verify=True)
+            self._loaded_clean = True
+            self._dirty_since_save = 0
+            self._last_checkpoint_time = _time.monotonic()
+
+    def _rebuild_uuid_reverse_map(self) -> None:
+        """Rebuild uuid→faiss_id from pose_id_map (after bulk build/load)."""
+        self.uuid_to_faiss_id = {uuid: fid for fid, uuid in self.pose_id_map.items()}
+
+    def _invalidate_corpus_cache(self) -> None:
+        """Drop the cached confidence/feature corpus matrices (rebuilt lazily on next use)."""
+        with self._corpus_lock:
+            self._corpus_feat = None
+            self._corpus_conf = None
+            self._corpus_faiss_ids = None
+            self._corpus_row_of_faiss_id = {}
+
+    def _ensure_corpus_cache(self) -> bool:
+        """Build the contiguous geometric corpus matrices once, keyed to the current index.
+
+        Loads feature_vector + feature_confidence for every pose currently in pose_id_map in one
+        DB query and stores them as (N, 52) float32 matrices aligned with a faiss-id array. The
+        confidence-aware re-rank then masks/scores in one broadcast pass against these instead of
+        re-fetching the whole table and looping per candidate each query.
+
+        Returns True if a usable cache is present.
+        """
+        with self._corpus_lock:
+            if self._corpus_feat is not None and self._corpus_faiss_ids is not None:
+                return self._corpus_feat.shape[0] > 0
+            # Snapshot the id→uuid mapping under the index lock so we cache exactly what is indexed.
+            with self._index_lock:
+                items = list(self.pose_id_map.items())  # (faiss_id, uuid_str)
+            if not items:
+                self._corpus_feat = np.zeros((0, self.dimension), dtype=np.float32)
+                self._corpus_conf = np.zeros((0, self.dimension), dtype=np.float32)
+                self._corpus_faiss_ids = np.zeros((0,), dtype=np.int64)
+                self._corpus_row_of_faiss_id = {}
+                return False
+
+            uuid_to_fid = {uuid: int(fid) for fid, uuid in items}
+            n = len(items)
+            dim = self.dimension
+            feat = np.zeros((n, dim), dtype=np.float32)
+            conf = np.ones((n, dim), dtype=np.float32)  # NULL confidence → ones (legacy poses)
+            faiss_ids = np.empty((n,), dtype=np.int64)
+            row_of_fid: Dict[int, int] = {}
+
+            row = 0
+            uuids = list(uuid_to_fid.keys())
+            with self.storage.session_scope() as session:
+                for chunk_start in range(0, len(uuids), 1000):
+                    chunk = [UUID(u) for u in uuids[chunk_start:chunk_start + 1000]]
+                    rows = session.query(
+                        GeometricFeatures.pose_id,
+                        GeometricFeatures.feature_vector,
+                        GeometricFeatures.feature_confidence
+                    ).filter(GeometricFeatures.pose_id.in_(chunk)).all()
+                    for pose_id, feat_vec, feat_conf in rows:
+                        fid = uuid_to_fid.get(str(pose_id))
+                        if fid is None:
+                            continue
+                        feat[row] = np.asarray(feat_vec, dtype=np.float32)
+                        if feat_conf is not None:
+                            conf[row] = np.asarray(feat_conf, dtype=np.float32)
+                        faiss_ids[row] = fid
+                        row_of_fid[fid] = row
+                        row += 1
+
+            if row < n:
+                # Some indexed poses had no GeometricFeatures row (shouldn't happen for the
+                # geometric mode index, but trim defensively so rows are all populated).
+                feat = feat[:row]
+                conf = conf[:row]
+                faiss_ids = faiss_ids[:row]
+
+            self._corpus_feat = feat
+            self._corpus_conf = conf
+            self._corpus_faiss_ids = faiss_ids
+            self._corpus_row_of_faiss_id = row_of_fid
+            logger.info(f"Built confidence-aware corpus cache: {row} poses x {dim} dims "
+                        f"(~{(feat.nbytes + conf.nbytes) // (1024 * 1024)} MB)")
+            return row > 0
+
+    # Tier-1 (low-overlap) candidates are demoted by this fixed additive distance so that
+    # EVERY sufficient-overlap candidate outranks EVERY fallback candidate (finding 39). The
+    # offset dwarfs any realistic RMS-rescaled masked L2 (geometric distances are O(10) at
+    # most), so it both guarantees the tier ordering and crushes fallback similarity to ~0 via
+    # exp(-d/scale) — low-overlap placeholder geometry is no longer admitted at a positive floor.
+    _FALLBACK_TIER_OFFSET = 1000.0
+
+    def _rerank_confidence_aware(
+        self,
+        faiss_indices: np.ndarray,
+        faiss_distances: np.ndarray,
+        query_vec: np.ndarray,
+        query_conf: np.ndarray,
+        min_confidence: float,
+        min_valid_overlap: int,
+    ) -> tuple:
+        """Vectorized confidence-aware re-rank over the cached corpus (findings 0, 6, 39).
+
+        Replaces the old per-candidate Python loop + full-table re-fetch with one broadcast
+        numpy pass against the contiguous corpus matrices built by _ensure_corpus_cache().
+
+        For each candidate, the masked distance uses only dimensions where BOTH the query and
+        the candidate have confidence >= min_confidence, RMS-rescaled to the full-dimension
+        equivalent — numerically identical to _compute_masked_distance(). Candidates with fewer
+        than min_valid_overlap mutually-valid dims are scored over whatever dims ARE valid (NOT
+        the full vector with placeholder dims) and demoted to a trailing second tier.
+
+        Args:
+            faiss_indices: faiss ids for the candidate shortlist (may contain -1 padding).
+            faiss_distances: squared-L2 from IndexFlatL2 (used only as a last resort when a
+                candidate has zero mutually-valid dims).
+            query_vec: query feature vector (dim,).
+            query_conf: query per-dim confidence (dim,).
+            min_confidence: per-dimension confidence floor for a "valid" dimension.
+            min_valid_overlap: minimum mutually-valid dims for a tier-0 (sufficient) candidate.
+
+        Returns:
+            (faiss_idx_array, distances_array, valid_dimensions_map, fallback_pose_ids)
+            - faiss_idx_array (int64, sorted nearest-first across both tiers)
+            - distances_array (float32, true RMS-rescaled L2; tier-1 carries the demotion offset)
+            - valid_dimensions_map: {UUID(pose_id): valid_dim_count} for every returned candidate
+            - fallback_pose_ids: set of UUID(pose_id) for the demoted tier-1 candidates
+        """
+        empty = (np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float32), {}, set())
+        if not self._ensure_corpus_cache():
+            return empty
+
+        # Snapshot corpus references so a concurrent cache invalidation can't pull them mid-pass.
+        feat = self._corpus_feat
+        conf = self._corpus_conf
+        row_of_fid = self._corpus_row_of_faiss_id
+        if feat is None or feat.shape[0] == 0:
+            return empty
+
+        cand_fids = np.asarray(faiss_indices, dtype=np.int64).reshape(-1)
+        cand_fids = cand_fids[cand_fids != -1]
+        if cand_fids.size == 0:
+            return empty
+
+        # Map candidate faiss ids -> corpus rows; drop any not present (poses without a stored
+        # GeometricFeatures row, which the corpus cache already trims).
+        rows = np.fromiter((row_of_fid.get(int(f), -1) for f in cand_fids),
+                           dtype=np.int64, count=cand_fids.size)
+        keep = rows >= 0
+        if not keep.any():
+            return empty
+        cand_fids = cand_fids[keep]
+        rows = rows[keep]
+
+        C = feat[rows]                                   # (M, dim) candidate vectors
+        Cconf = conf[rows]                               # (M, dim) candidate confidences
+        qv = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+        qc = np.asarray(query_conf, dtype=np.float32).reshape(-1)
+        dim = int(self.dimension)
+
+        qmask = qc >= min_confidence                     # (dim,)
+        mask = qmask[None, :] & (Cconf >= min_confidence)  # (M, dim)
+        valid_count = mask.sum(axis=1).astype(np.int64)   # (M,)
+
+        diff = qv[None, :] - C                            # (M, dim)
+        sq = diff * diff
+        masked_sumsq = np.einsum('ij,ij->i', sq, mask.astype(np.float32))  # (M,)
+
+        # Masked RMS-rescaled L2: ||diff_valid|| * sqrt(dim / valid_count). Mirrors
+        # _compute_masked_distance exactly for the sufficient-overlap case.
+        vc_safe = np.maximum(valid_count, 1)
+        dist = np.sqrt(masked_sumsq) * np.sqrt(dim / vc_safe.astype(np.float32))
+
+        # Last resort for candidates with ZERO mutually-valid dims: there is nothing to mask,
+        # so fall back to the true (sqrt) full-vector L2. These are demoted below anyway.
+        zero_valid = valid_count == 0
+        if zero_valid.any():
+            full_sumsq = sq.sum(axis=1)
+            dist[zero_valid] = np.sqrt(full_sumsq[zero_valid])
+
+        # Tier-1 demotion: any candidate below the overlap floor sorts after all tier-0 ones.
+        fallback = valid_count < min_valid_overlap        # (M,) bool
+        dist_final = dist.astype(np.float32, copy=True)
+        dist_final[fallback] += self._FALLBACK_TIER_OFFSET
+
+        order = np.argsort(dist_final, kind='stable')
+        cand_fids = cand_fids[order]
+        dist_final = dist_final[order]
+        valid_count = valid_count[order]
+        fallback = fallback[order]
+
+        valid_dimensions_map: Dict[Any, int] = {}
+        fallback_pose_ids: set = set()
+        pose_id_map = self.pose_id_map
+        for fid, vc, fb in zip(cand_fids.tolist(), valid_count.tolist(), fallback.tolist()):
+            uuid_str = pose_id_map.get(fid)
+            if uuid_str is None:
+                continue
+            pid = UUID(uuid_str)
+            valid_dimensions_map[pid] = int(vc)
+            if fb:
+                fallback_pose_ids.add(pid)
+
+        return cand_fids, dist_final, valid_dimensions_map, fallback_pose_ids
+
     def _reset_index_state(self) -> None:
         """Clear in-memory index state. Used after failed loads so close() won't re-save stale data."""
         self.index = None
         self.pose_id_map = {}
+        self.uuid_to_faiss_id = {}
         self.next_id_counter = 0
+        self._dirty_since_save = 0
+        self._invalidate_corpus_cache()
 
     def _index_files_mtime(self):
         """(index mtime, mapping mtime) for staleness detection, or None."""
@@ -289,6 +566,8 @@ class SimilarityEngine:
                 return False
             with self._cache_lock:
                 self._search_cache.clear()
+                self._search_cache_bytes = 0
+            self._invalidate_corpus_cache()
             return self.load_index()
 
     def load_index(self) -> bool:
@@ -316,6 +595,11 @@ class SimilarityEngine:
                     if isinstance(data_dict, dict) and 'pose_id_map' in data_dict:
                         self.pose_id_map = {int(k): v for k, v in data_dict['pose_id_map'].items()}
                         self.next_id_counter = data_dict['next_id_counter']
+
+                        # Calibration scale (Wave 4); default when absent (legacy indices)
+                        self.similarity_scale = float(
+                            data_dict.get('similarity_scale', constants.DEFAULT_SIMILARITY_SCALE)
+                        )
 
                         # Validate feature mode (if stored)
                         if 'feature_mode' in data_dict:
@@ -373,6 +657,9 @@ class SimilarityEngine:
                         logger.warning(f"Failed to extract vectors: {reconstruct_error}")
                         logger.warning("Skipping index upgrade, using existing index as-is")
                         # Can't upgrade, but old index still works
+                        self._rebuild_uuid_reverse_map()
+                        self._invalidate_corpus_cache()
+                        self._dirty_since_save = 0
                         self._loaded_clean = True
                         self._loaded_index_mtime = self._index_files_mtime()
                         return True
@@ -395,6 +682,9 @@ class SimilarityEngine:
 
             logger.info(f"Loaded index with dimension: {self.dimension}")
 
+            self._rebuild_uuid_reverse_map()
+            self._invalidate_corpus_cache()
+            self._dirty_since_save = 0
             self._loaded_clean = True
             self._loaded_index_mtime = self._index_files_mtime()
             return True
@@ -519,19 +809,23 @@ class SimilarityEngine:
         # Thread-safe cache check
         with self._cache_lock:
             if cache_key in self._search_cache:
-                cached_results, timestamp = self._search_cache[cache_key]
+                cached_results, timestamp, _approx_bytes = self._search_cache[cache_key]
                 cache_age = time.time() - timestamp
 
                 if cache_age < self._search_cache_ttl:
                     # Cache hit - move to end for LRU
                     self._search_cache.move_to_end(cache_key)
                     logger.debug(f"Search cache hit (age: {cache_age:.1f}s)")
-                    # Return deep copy to prevent cache pollution
-                    import copy
-                    return copy.deepcopy(cached_results)
+                    # Shallow per-dict copy (finding 4): protects the cached list and its dicts
+                    # from caller-side response shaping (paging, stripping heavy fields) without
+                    # deep-copying immutable thumbnail bytes + nested keypoint lists on every hit,
+                    # which was hundreds of ms to seconds for large sets. Callers must not mutate
+                    # nested list VALUES (keypoints, regions) in place — they only ever reassign
+                    # or delete dict keys, which a shallow copy already isolates.
+                    return [dict(r) for r in cached_results]
 
                 # Cache expired, will recompute
-                del self._search_cache[cache_key]
+                self._evict_cache_entry(cache_key)
                 logger.debug(f"Search cache expired ({cache_age:.1f}s)")
 
         with self._index_lock:  # Thread-safe search
@@ -573,104 +867,26 @@ class SimilarityEngine:
                 search_k = min(k * multiplier, self.index.ntotal)
             distances, indices = self.index.search(query, search_k)
 
-        # === CONFIDENCE-AWARE RE-RANKING ===
+        # === CONFIDENCE-AWARE RE-RANKING (vectorized, cached corpus) ===
+        # valid_dimensions_map: pose_id(UUID) -> valid_count for the result dicts.
+        # fallback_pose_ids: pose_ids re-ranked over <min_valid_overlap mutually-valid dims
+        # (second-tier; sorted after every sufficient-overlap candidate, see finding 39).
+        valid_dimensions_map = {}
+        fallback_pose_ids: set = set()
         if query_confidence is not None:
-            logger.debug(f"Re-ranking {len(indices[0])} FAISS candidates using confidence masking")
-
-            # Collect candidate pose IDs
-            candidate_ids = []
-            faiss_results = []
-            for idx, dist in zip(indices[0], distances[0]):
-                if idx == -1:
-                    continue
-                pose_id = UUID(self.pose_id_map[idx])
-                candidate_ids.append(pose_id)
-                faiss_results.append((idx, dist))
-
-            if not candidate_ids:
+            faiss_idx_array, distances_array, valid_dimensions_map, fallback_pose_ids = \
+                self._rerank_confidence_aware(
+                    indices[0],
+                    distances[0],
+                    np.asarray(feature_vector, dtype=np.float32).reshape(-1),
+                    np.asarray(query_confidence, dtype=np.float32).reshape(-1),
+                    min_feature_confidence,
+                    min_valid_overlap,
+                )
+            if faiss_idx_array.size == 0:
                 return []
-
-            # Batch load feature vectors and confidences for all candidates.
-            # In threshold mode search_k == ntotal, so candidate_ids spans the whole index;
-            # skip the (huge) IN clause and load every row in one shot instead.
-            with self.storage.session_scope() as session:
-                base_conf_query = session.query(
-                    GeometricFeatures.pose_id,
-                    GeometricFeatures.feature_vector,
-                    GeometricFeatures.feature_confidence
-                )
-                if len(candidate_ids) >= self.index.ntotal:
-                    confidence_query = base_conf_query.all()
-                else:
-                    confidence_query = base_conf_query.filter(
-                        GeometricFeatures.pose_id.in_(candidate_ids)
-                    ).all()
-
-                # Build lookup maps
-                candidate_features = {}
-                candidate_confidences = {}
-                for pose_id, feat_vec, feat_conf in confidence_query:
-                    candidate_features[pose_id] = np.array(feat_vec, dtype=np.float32)
-                    # Handle NULL confidence (backward compatibility)
-                    candidate_confidences[pose_id] = (
-                        np.array(feat_conf, dtype=np.float32)
-                        if feat_conf is not None
-                        else np.ones(52, dtype=np.float32)
-                    )
-
-            # Re-compute distances using masked distance
-            reranked_candidates = []
-            for idx, faiss_dist in faiss_results:
-                pose_id = UUID(self.pose_id_map[idx])
-
-                # Skip if not in database query results
-                if pose_id not in candidate_features:
-                    continue
-
-                candidate_vec = candidate_features[pose_id]
-                candidate_conf = candidate_confidences[pose_id]
-
-                # Compute masked distance
-                masked_dist, valid_count = self._compute_masked_distance(
-                    feature_vector,  # Query feature vector
-                    query_confidence,  # Query confidence
-                    candidate_vec,
-                    candidate_conf,
-                    min_confidence=min_feature_confidence,
-                    min_valid_overlap=min_valid_overlap
-                )
-
-                # Insufficient overlap: not enough mutual signal to mask. Fall
-                # back to the plain full-vector distance instead of dropping the
-                # candidate — a heavily occluded query previously hit this cliff
-                # for EVERY candidate and returned zero results. FAISS reports
-                # squared L2; sqrt puts the fallback on the same true-L2 scale
-                # as the masked distances it ranks against.
-                if masked_dist == float('inf'):
-                    logger.debug(f"Pose {pose_id}: insufficient valid overlap ({valid_count}/{min_valid_overlap}), falling back to unmasked distance")
-                    masked_dist = float(np.sqrt(max(faiss_dist, 0.0)))
-
-                reranked_candidates.append({
-                    'faiss_idx': idx,
-                    'pose_id': pose_id,
-                    'distance': masked_dist,
-                    'valid_dimensions': valid_count,
-                    'faiss_distance': faiss_dist
-                })
-
-            # Sort by masked distance (ascending)
-            reranked_candidates.sort(key=lambda x: x['distance'])
-
-            logger.debug(f"Re-ranking reduced {len(faiss_results)} → {len(reranked_candidates)} candidates")
-
-            # Reconstruct indices and distances arrays from re-ranked results
-            indices = np.array([[c['faiss_idx'] for c in reranked_candidates[:search_k]]], dtype=np.int64)
-            distances = np.array([[c['distance'] for c in reranked_candidates[:search_k]]], dtype=np.float32)
-
-            # Store valid_dimensions for later inclusion in results
-            valid_dimensions_map = {c['pose_id']: c['valid_dimensions'] for c in reranked_candidates}
-        else:
-            valid_dimensions_map = {}
+            indices = faiss_idx_array.reshape(1, -1)
+            distances = distances_array.reshape(1, -1)
 
         # ===== OKS-BASED RE-RANKING (Optional) =====
         from src.config.settings import settings
@@ -788,19 +1004,42 @@ class SimilarityEngine:
         result_fetch_cap = None if min_similarity > 0.0 else max(k * 2, 200)
 
         # Phase 1: ordered candidate shortlist (faiss_idx, distance, pose_id, base_similarity)
+        #
+        # The floor early-stop assumes candidates are sorted similarity-descending. That holds
+        # for the OKS / confidence-masked / plain paths (all distance-ascending). It does NOT
+        # hold when finding-39 fallback candidates are present: they are demoted to a second
+        # tier (sorted after every sufficient-overlap candidate) but their true masked distance
+        # may be smaller than the tier boundary, so a tier-0 candidate dipping below the floor
+        # does not imply the trailing tier-1 candidates are below it. Disable the break in that
+        # case and floor-filter per candidate instead (still bounded by search_k / fetch cap).
+        allow_early_stop = not fallback_pose_ids
         candidates = []
         for idx, dist in zip(indices[0], distances[0]):
             if idx == -1:  # FAISS returns -1 for empty slots
                 continue
             dist_f = float(dist)
-            # OKS distances are already 1-OKS in [0, 1]; mapping them through the L2
-            # exp(-d/scale) curve would compress every score into [0.61, 1.0] and break
-            # threshold semantics. Either way distances ascend, so similarity descends
-            # and the floor early-stop below stays valid.
-            base_sim = (1.0 - dist_f) if oks_active else self._distance_to_similarity(dist_f)
+            if oks_active:
+                # OKS distances are already 1-OKS in [0, 1]; mapping them through the L2
+                # exp(-d/scale) curve would compress every score into [0.61, 1.0] and break
+                # threshold semantics.
+                base_sim = 1.0 - dist_f
+            else:
+                if query_confidence is None:
+                    # Plain path: distances are RAW squared-L2 from IndexFlatL2. sqrt to true L2
+                    # so _distance_to_similarity (calibrated for true L2) sees the same scale as
+                    # the confidence-masked path, keeping the min_similarity floor consistent
+                    # across modes (finding 2). Report the true-L2 value as 'distance' too, so the
+                    # distance/base_similarity fields are comparable across modes. sqrt is
+                    # monotonic, so the early-stop below stays valid.
+                    dist_f = float(np.sqrt(max(dist_f, 0.0)))
+                # else: confidence-masked path — distances are already true (RMS-rescaled) L2.
+                base_sim = self._distance_to_similarity(dist_f)
             if min_similarity > 0.0 and base_sim < base_similarity_floor:
-                # Sorted nearest-first → every remaining candidate is also below the floor.
-                break
+                if allow_early_stop:
+                    # Sorted nearest-first → every remaining candidate is also below the floor.
+                    break
+                # Fallback tier present: skip this one, keep scanning for higher-sim tier-1 hits.
+                continue
             candidates.append((int(idx), dist_f, UUID(self.pose_id_map[idx]), base_sim))
             if result_fetch_cap is not None and len(candidates) >= result_fetch_cap:
                 break
@@ -991,17 +1230,46 @@ class SimilarityEngine:
         for rank, result_dict in enumerate(results, 1):
             result_dict['rank'] = rank
 
-        # Thread-safe cache store and eviction
+        # Thread-safe cache store and eviction (count- AND byte-bounded — finding 4)
         with self._cache_lock:
-            self._search_cache[cache_key] = (results, time.time())
+            if cache_key in self._search_cache:
+                # Overwrite: drop the old entry's byte contribution first.
+                self._evict_cache_entry(cache_key)
+            approx_bytes = self._estimate_results_bytes(results)
+            self._search_cache[cache_key] = (results, time.time(), approx_bytes)
+            self._search_cache_bytes += approx_bytes
 
-            # Enforce cache size limit (LRU eviction)
-            if len(self._search_cache) > self._search_cache_max_size:
-                # Remove oldest entry (first item in OrderedDict)
-                self._search_cache.popitem(last=False)
-                logger.debug("Evicted oldest search cache entry")
+            # Evict oldest entries until BOTH the count and byte budgets are satisfied. A single
+            # large threshold-mode result set (thumbnails for thousands of poses) could otherwise
+            # pin gigabytes; the byte bound caps total cache footprint regardless of query count.
+            while self._search_cache and (
+                len(self._search_cache) > self._search_cache_max_size
+                or self._search_cache_bytes > self._search_cache_max_bytes
+            ):
+                oldest_key = next(iter(self._search_cache))
+                if oldest_key == cache_key:
+                    break  # never evict the entry we just inserted
+                self._evict_cache_entry(oldest_key)
+                logger.debug("Evicted oldest search cache entry (count/byte budget)")
 
         return results
+
+    def _estimate_results_bytes(self, results: List[Dict]) -> int:
+        """Approximate in-memory footprint of a cached result set. Thumbnail JPEG bytes
+        dominate; a flat per-result overhead covers keypoints + metadata."""
+        total = 0
+        for r in results:
+            thumb = r.get('thumbnail')
+            if thumb:
+                total += len(thumb)
+            total += 2048  # keypoints (133x3) + metadata estimate
+        return total
+
+    def _evict_cache_entry(self, cache_key) -> None:
+        """Remove one cache entry and decrement the running byte total. Caller holds _cache_lock."""
+        entry = self._search_cache.pop(cache_key, None)
+        if entry is not None and len(entry) >= 3:
+            self._search_cache_bytes = max(0, self._search_cache_bytes - entry[2])
 
     def search_by_pose_id(
         self,
@@ -1176,6 +1444,7 @@ class SimilarityEngine:
         """Clear the search results cache (thread-safe)."""
         with self._cache_lock:
             self._search_cache.clear()
+            self._search_cache_bytes = 0
         logger.debug("Search cache cleared")
 
     def close(self) -> None:
