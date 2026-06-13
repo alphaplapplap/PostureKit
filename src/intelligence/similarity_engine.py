@@ -753,7 +753,8 @@ class SimilarityEngine:
         min_similarity: float = 0.0,
         query_keypoints: Optional[np.ndarray] = None,
         query_bbox: Optional[np.ndarray] = None,
-        exclude_pose_id: Optional[str] = None
+        exclude_pose_id: Optional[str] = None,
+        query_visual_embedding: Optional[np.ndarray] = None
     ) -> List[Dict]:
         """
         Find k most similar poses to given feature vector with caching.
@@ -823,6 +824,15 @@ class SimilarityEngine:
 
         # Include region filter in cache key
         regions_tuple = tuple(sorted(required_regions)) if required_regions else None
+        # Visual rerank (finding 36) changes ordering/scores, so its state must key the cache:
+        # the enable flag + weight, plus a short hash of the query visual embedding.
+        from src.config.settings import settings as _settings
+        visual_rerank_on = bool(_settings.ENABLE_VISUAL_RERANK) and query_visual_embedding is not None \
+            and _settings.VISUAL_RERANK_WEIGHT > 0
+        vis_hash = (
+            hashlib.md5(np.asarray(query_visual_embedding, dtype=np.float32).tobytes()).hexdigest()[:8]
+            if visual_rerank_on else 'none'
+        )
         cache_key = (
             query_hash,
             conf_hash,
@@ -836,7 +846,9 @@ class SimilarityEngine:
             regions_tuple,
             min_region_confidence,
             min_similarity,
-            exclude_pose_id
+            exclude_pose_id,
+            vis_hash,
+            round(_settings.VISUAL_RERANK_WEIGHT, 3) if visual_rerank_on else 0.0,
         )
 
         # Thread-safe cache check
@@ -875,6 +887,18 @@ class SimilarityEngine:
             query_keypoints=query_keypoints,
             query_bbox=query_bbox,
         )
+
+        # Optional visual rerank (finding 36): blend MobileNetV3 cosine into the top-N geometric
+        # candidates before hydration. Gated OFF by default (ENABLE_VISUAL_RERANK / weight 0), so
+        # the default path is untouched. Blended scores then flow through the normal floor + sort
+        # in _hydrate_candidates, so enabling it makes the floor visual-aware by design.
+        if visual_rerank_on:
+            candidates = self._visual_rerank(
+                candidates,
+                query_visual_embedding,
+                weight=_settings.VISUAL_RERANK_WEIGHT,
+                top_n=_settings.VISUAL_RERANK_CANDIDATES,
+            )
 
         # Phase 2/3: hydrate the shortlist once (shared with search_with_flip — finding 5).
         results = self._hydrate_candidates(
@@ -1147,6 +1171,59 @@ class SimilarityEngine:
                 break
 
         return candidates, valid_dimensions_map, oks_similarity_map
+
+    def _visual_rerank(self, candidates, query_visual_embedding, weight: float, top_n: int):
+        """Blend MobileNetV3 visual cosine into the top-N geometric candidates (finding 36).
+
+        candidates: ordered (faiss_idx, distance, pose_id(UUID), base_similarity), geo-sorted.
+        Only the top-N are reranked (the visual fetch is bounded by VISUAL_RERANK_CANDIDATES);
+        the geometric tail keeps its order. Stored VisualFeatures vectors are L2-normalized, so
+        cosine == dot; the query embedding is L2-normalized here to match. Blended similarity is
+        (1-w)*geo + w*(cos+1)/2 (cosine mapped from [-1,1] to [0,1]); candidates lacking a stored
+        embedding keep their geometric score. Returns a new candidate list with blended scores in
+        the reranked prefix (re-sorted by blended score), followed by the untouched tail.
+        """
+        if not candidates or query_visual_embedding is None or weight <= 0:
+            return candidates
+        qv = np.asarray(query_visual_embedding, dtype=np.float32).reshape(-1)
+        qnorm = float(np.linalg.norm(qv))
+        if qnorm <= 0:
+            return candidates
+        qv = qv / qnorm
+
+        n = min(int(top_n), len(candidates))
+        head = candidates[:n]
+        tail = candidates[n:]
+        head_ids = [c[2] for c in head]
+
+        from src.storage.models import VisualFeatures
+        vis_map = {}
+        with self.storage.session_scope() as session:
+            for cs in range(0, len(head_ids), 1000):
+                chunk = head_ids[cs:cs + 1000]
+                for pid, vec in session.query(
+                    VisualFeatures.pose_id, VisualFeatures.feature_vector
+                ).filter(VisualFeatures.pose_id.in_(chunk)).all():
+                    vis_map[pid] = np.asarray(vec, dtype=np.float32)
+
+        reranked = []
+        matched = 0
+        for (idx, dist, pid, base_sim) in head:
+            cv = vis_map.get(pid)
+            if cv is not None and cv.shape == qv.shape:
+                cn = float(np.linalg.norm(cv))
+                cos = float(np.dot(qv, cv / cn)) if cn > 0 else 0.0
+                cos01 = (cos + 1.0) / 2.0
+                blended = (1.0 - weight) * base_sim + weight * cos01
+                matched += 1
+            else:
+                blended = base_sim  # no stored visual embedding → geometric score unchanged
+            reranked.append((idx, dist, pid, blended))
+
+        reranked.sort(key=lambda c: c[3], reverse=True)
+        logger.info(f"Visual rerank: blended {matched}/{len(head)} top candidates "
+                    f"(w={weight:.2f}, {len(vis_map)} embeddings fetched)")
+        return reranked + tail
 
     def _hydrate_candidates(
         self,
@@ -1456,6 +1533,20 @@ class SimilarityEngine:
                 raise ValueError(f"Unsupported feature mode: {self.feature_mode}")
 
         # Search with confidence (request k+1 if excluding self)
+        # Visual rerank (finding 36): when enabled, use THIS pose's stored MobileNetV3 embedding
+        # as the query visual so the "find similar to this indexed pose" flow reranks by
+        # appearance with zero extra plumbing. No-op when the feature is off or no embedding exists.
+        from src.config.settings import settings as _settings
+        query_visual = None
+        if _settings.ENABLE_VISUAL_RERANK and _settings.VISUAL_RERANK_WEIGHT > 0:
+            from src.storage.models import VisualFeatures
+            with self.storage.session_scope() as session:
+                vf = session.query(VisualFeatures.feature_vector).filter(
+                    VisualFeatures.pose_id == pose_id
+                ).first()
+                if vf is not None:
+                    query_visual = np.asarray(vf[0], dtype=np.float32)
+
         search_k = k + 1 if exclude_self else k
         results = self.search_by_feature(
             query_vector,
@@ -1465,7 +1556,8 @@ class SimilarityEngine:
             min_feature_confidence=min_feature_confidence,
             min_valid_overlap=min_valid_overlap,
             required_regions=required_regions,
-            min_region_confidence=min_region_confidence
+            min_region_confidence=min_region_confidence,
+            query_visual_embedding=query_visual
         )
 
         # Remove self if requested
