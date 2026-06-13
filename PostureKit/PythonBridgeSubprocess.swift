@@ -22,6 +22,42 @@ class PythonBridgeSubprocess {
     private var searchServerInitialized = false
     private var isShuttingDown = false  // Flag to cancel startup during shutdown
 
+    // Persistent DETECTION server (finding 22): a long-lived process that loads the
+    // ensemble ONCE and serves detect_all/detect_pose/extract_features over the same
+    // newline-delimited JSON protocol as the search server. Started LAZILY on the
+    // first detect (unlike the search server, which starts eagerly) so we don't pay
+    // the ~6s model load until the user actually drops a query image.
+    private var detectServerProcess: Process?
+    private var detectServerLock = NSRecursiveLock()  // Recursive to allow reentrant locking
+    private var detectServerStdin: FileHandle?
+    private var detectServerStdout: FileHandle?
+    private var detectServerInitialized = false
+
+    // Per-image+person feature cache (finding 23). detect_all now returns each
+    // person's geometric features inline; we stash them here keyed by
+    // "<imageKey>|<personIndex>" so extractFeatures() returns the already-computed
+    // vector instead of spawning a second ~2.5s one-shot. Bounded to the last
+    // detect's people (cleared and repopulated on each detectAllPoses/detectPose).
+    private var lastDetectFeatures: [String: GeometricFeatures] = [:]
+    private var lastDetectImageKey: String = ""
+    private let detectFeatureCacheLock = NSLock()
+
+    // Cancellation support for in-flight server searches (finding 27). Each search
+    // round trip is tagged with a monotonic token; cancelSearch() bumps the token so
+    // the reader of a superseded search abandons its (still-arriving) response and
+    // releases the lock instead of blocking the replacement search for the full
+    // 60s round trip.
+    private var searchCancelToken: Int = 0
+    private let searchCancelLock = NSLock()
+
+    // When a search is abandoned mid-flight (finding 27), the single-threaded search
+    // server STILL finishes that search and writes its (now orphaned) response line to
+    // the pipe before it reads the next command. The next search command must therefore
+    // drain that many orphaned lines first, or it would read a stale response and desync
+    // the protocol. Guarded by searchServerLock (every search command holds it), so this
+    // plain counter is safe.
+    private var pendingSearchDrains: Int = 0
+
     // MARK: - Helper: Swift Bool to Python bool converter
     private func pythonBool(_ value: Bool) -> String {
         value ? "True" : "False"
@@ -188,7 +224,169 @@ class PythonBridgeSubprocess {
         }
     }
 
-    private func sendSearchServerCommand(_ command: [String: Any]) -> [String: Any]? {
+    // MARK: - Persistent Detection Server (finding 22)
+    /// Lazily start the long-lived detection worker (src/detect_server.py). Mirrors
+    /// startSearchServer(): spawns venv/bin/python3 src/detect_server.py, inherits
+    /// DB_PROFILE, and blocks on a {"status":"ready"} stdout line with a timeout.
+    /// The detect server loads the ensemble + full bridge once, so per-query detection
+    /// drops from ~7s (one-shot spawn) to ~0.4-2s warm.
+    private func startDetectServer() -> Bool {
+        detectServerLock.lock()
+        defer { detectServerLock.unlock() }
+
+        // Already started
+        if detectServerInitialized, let process = detectServerProcess, process.isRunning {
+            print("[DETECT SERVER] Already running (PID: \(process.processIdentifier))")
+            return true
+        }
+
+        // Don't start (or resurrect) during shutdown.
+        if isShuttingDown {
+            print("[DETECT SERVER] Not starting - app is shutting down")
+            return false
+        }
+
+        print("[DETECT SERVER] Starting persistent detection server...")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonExecutable)
+        process.arguments = ["\(projectPath)/src/detect_server.py"]
+        process.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+
+        // Setup environment (mirror the one-shot detect env which is known to work
+        // with the model stack; configureThreading=true path sets OMP/MKL/OPENBLAS).
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "PYTHONHOME")
+        environment.removeValue(forKey: "PYTHONPATH")
+        environment.removeValue(forKey: "__PYVENV_LAUNCHER__")
+
+        // The detect server loads pose models, so it needs the same threading env the
+        // one-shot detect path used (configureThreading=true). Search server omits this
+        // (no models); detection benefits from it.
+        let (threads, _) = getThreadSettings()
+        environment["OMP_NUM_THREADS"] = "\(threads)"
+        environment["MKL_NUM_THREADS"] = "\(threads)"
+        environment["OPENBLAS_NUM_THREADS"] = "\(threads)"
+        environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+        // Set database profile from UserDefaults (irl/2d/3d)
+        environment["DB_PROFILE"] = getActiveProfile()
+
+        process.environment = environment
+
+        // Setup pipes for communication
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        // Capture stderr for logging
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let message = String(data: data, encoding: .utf8) {
+                print("[DETECT SERVER STDERR] \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        }
+
+        do {
+            try process.run()
+            print("[DETECT SERVER] Process started (PID: \(process.processIdentifier))")
+
+            // Store handles
+            detectServerProcess = process
+            detectServerStdin = stdinPipe.fileHandleForWriting
+            detectServerStdout = stdoutPipe.fileHandleForReading
+
+            // Wait for "ready" signal (with timeout). The detect server loads the full
+            // model stack BEFORE printing ready (it prints ready AFTER bridge build),
+            // so warm this can take a few seconds and cold (page-cache miss) 60-90s.
+            print("[DETECT SERVER] Waiting for ready signal...")
+            var accumulatedData = Data()
+            var foundNewline = false
+            let maxAttempts = 1200  // 120 seconds (1200 * 0.1s) — model load can be slow cold
+
+            for attempt in 1...maxAttempts {
+                if isShuttingDown {
+                    print("[DETECT SERVER] Startup cancelled - app is shutting down")
+                    process.terminate()
+                    return false
+                }
+
+                if let stdout = detectServerStdout {
+                    let data = stdout.availableData
+                    if !data.isEmpty {
+                        accumulatedData.append(data)
+                        if accumulatedData.last == 0x0A {
+                            foundNewline = true
+                            print("[DETECT SERVER] Received ready data after ~\(attempt * 100)ms")
+                            break
+                        }
+                    }
+                }
+
+                if !process.isRunning {
+                    print("[DETECT SERVER] Process terminated unexpectedly during startup")
+                    return false
+                }
+
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+
+            if foundNewline,
+               let readyJson = String(data: accumulatedData, encoding: .utf8),
+               let readyResponse = try? JSONSerialization.jsonObject(with: accumulatedData) as? [String: Any],
+               readyResponse["status"] as? String == "ready" {
+                print("[DETECT SERVER] Initialization complete: \(readyJson.trimmingCharacters(in: .whitespacesAndNewlines))")
+                detectServerInitialized = true
+                return true
+            } else {
+                print("[DETECT SERVER] Failed to receive ready signal (timeout or invalid response)")
+                if !accumulatedData.isEmpty, let readyJson = String(data: accumulatedData, encoding: .utf8) {
+                    print("[DETECT SERVER] Received: \(readyJson)")
+                }
+                process.terminate()
+                return false
+            }
+
+        } catch {
+            print("[DETECT SERVER] Failed to start: \(error)")
+            return false
+        }
+    }
+
+    /// Send a command to the persistent detection server, lazily starting it if needed.
+    /// The detect protocol keys the command on "type" (not "command"); reuses the same
+    /// newline-delimited round-trip reader as the search server.
+    private func sendDetectServerCommand(_ command: [String: Any]) -> [String: Any]? {
+        detectServerLock.lock()
+        defer { detectServerLock.unlock() }
+
+        guard detectServerInitialized,
+              let process = detectServerProcess,
+              process.isRunning,
+              let stdin = detectServerStdin,
+              let stdout = detectServerStdout else {
+            print("[DETECT SERVER] Server not running, attempting to start...")
+            if !startDetectServer() {
+                return nil
+            }
+            guard let stdin = detectServerStdin, let stdout = detectServerStdout else {
+                return nil
+            }
+            return sendCommand(command, stdin: stdin, stdout: stdout, label: "DETECT SERVER", commandKey: "type")
+        }
+
+        return sendCommand(command, stdin: stdin, stdout: stdout, label: "DETECT SERVER", commandKey: "type")
+    }
+
+    /// Send a command to the persistent search server. When `cancelToken` is provided
+    /// (search round trips), the round trip is abandoned if a newer search supersedes it
+    /// via cancelSearch(), so the server lock is not held for the full transfer of a
+    /// stale response (finding 27).
+    private func sendSearchServerCommand(_ command: [String: Any], cancelToken: Int? = nil) -> [String: Any]? {
         searchServerLock.lock()
         defer { searchServerLock.unlock() }
 
@@ -206,34 +404,93 @@ class PythonBridgeSubprocess {
             guard let stdin = searchServerStdin, let stdout = searchServerStdout else {
                 return nil
             }
-            return sendCommand(command, stdin: stdin, stdout: stdout)
+            return sendCommand(command, stdin: stdin, stdout: stdout, label: "SEARCH SERVER", commandKey: "command", cancelToken: cancelToken)
         }
 
-        return sendCommand(command, stdin: stdin, stdout: stdout)
+        return sendCommand(command, stdin: stdin, stdout: stdout, label: "SEARCH SERVER", commandKey: "command", cancelToken: cancelToken)
     }
 
-    private func sendCommand(_ command: [String: Any], stdin: FileHandle, stdout: FileHandle) -> [String: Any]? {
+    /// Round-trip a single newline-delimited JSON command to a persistent server.
+    /// - label: log prefix ("SEARCH SERVER" / "DETECT SERVER").
+    /// - commandKey: the protocol's command field ("command" for search, "type" for detect).
+    /// - cancelToken: when non-nil, the search-cancellation token captured BEFORE the lock
+    ///   was acquired. If cancelSearch() bumps the shared token past this value mid-flight,
+    ///   the read loop abandons the response and returns nil, so a superseded slider/threshold
+    ///   search releases the server lock instead of serializing behind its full round trip.
+    private func sendCommand(
+        _ command: [String: Any],
+        stdin: FileHandle,
+        stdout: FileHandle,
+        label: String = "SEARCH SERVER",
+        commandKey: String = "command",
+        cancelToken: Int? = nil
+    ) -> [String: Any]? {
         do {
+            // Which process owns this pipe (for crash detection); detect uses "type".
+            let isDetect = (commandKey == "type")
+            // Only search commands are cancellable, so only they can leave orphans.
+            let isCancellableSearch = (cancelToken != nil)
+
+            // Finding 27: before issuing a new (cancellable) search, drain any orphaned
+            // response lines left by previously-abandoned searches. The single-threaded
+            // server eventually emits each abandoned search's full response; consuming
+            // them here keeps this command aligned with its own response.
+            if isCancellableSearch {
+                while pendingSearchDrains > 0 {
+                    if isShuttingDown { return nil }
+                    if drainOneOrphanLine(from: stdout, label: label) {
+                        pendingSearchDrains -= 1
+                        print("[\(label)] Drained an orphaned response (\(pendingSearchDrains) remaining)")
+                    } else {
+                        // Couldn't drain (server gone / timeout) — give up the count to
+                        // avoid spinning; a crash check below will catch a dead server.
+                        print("[\(label)] Orphan drain incomplete; clearing drain counter")
+                        pendingSearchDrains = 0
+                        break
+                    }
+                }
+            }
+
             // Serialize command
             let jsonData = try JSONSerialization.data(withJSONObject: command)
             let jsonString = String(data: jsonData, encoding: .utf8)! + "\n"
 
             // Send command
-            print("[SEARCH SERVER] Sending command: \(command["command"] as? String ?? "unknown")")
+            print("[\(label)] Sending command: \(command[commandKey] as? String ?? "unknown")")
             stdin.write(jsonString.data(using: .utf8)!)
 
-            // Read response with timeout (line-buffered for large responses)
-            // First search may take longer (index loading), subsequent searches are fast
-            // Large responses (500 results with thumbnails) can be ~5MB and require multiple reads
-            // Reduced sleep interval (0.01s) prevents pipe buffer deadlock
-            let maxAttempts = 6000  // 60 seconds (6000 * 0.01s) for large result sets
+            // Read response with a 60s WALL-CLOCK budget (line-buffered for large
+            // responses). First search may take longer (index loading); subsequent
+            // searches are fast. Large responses (~10MB) require many reads.
+            //
+            // Finding 26: availableData blocks until at least one byte is ready, so
+            // after a NON-EMPTY read we loop immediately and only sleep when a read
+            // returned zero bytes — eliminating the ~10ms-per-chunk artificial latency
+            // (~1.5s on a multi-MB response) the old unconditional sleep incurred.
+            let deadline = Date().addingTimeInterval(60.0)
             var accumulatedData = Data()
             var foundNewline = false
 
-            for attempt in 1...maxAttempts {
+            while Date() < deadline {
                 // Check if shutdown requested
                 if isShuttingDown {
-                    print("[SEARCH SERVER] Command cancelled - app is shutting down")
+                    print("[\(label)] Command cancelled - app is shutting down")
+                    return nil
+                }
+
+                // Finding 27: if this round trip is a (cancellable) search and a newer
+                // search has superseded it, abandon the response and release the lock so
+                // the replacement query doesn't serialize behind this one's full transfer.
+                // Record the orphan so the next search drains the server's eventual
+                // response before reading its own.
+                if let token = cancelToken, isSearchCancelled(token) {
+                    print("[\(label)] Search superseded (token \(token)) - abandoning response")
+                    if foundNewline == false {
+                        // The server will still finish this search and emit one full line;
+                        // even if we already buffered a partial chunk, exactly one line is
+                        // pending (the rest of this response). Mark it for draining.
+                        pendingSearchDrains += 1
+                    }
                     return nil
                 }
 
@@ -241,49 +498,103 @@ class PythonBridgeSubprocess {
                 if !data.isEmpty {
                     accumulatedData.append(data)
 
-                    // Check if we have a complete line (ends with \n)
-                    // Python server sends one JSON object per line
-                    // Check for newline byte (0x0A) without string conversion for efficiency
+                    // Check if we have a complete line (ends with \n).
+                    // Python server sends one JSON object per line; check the newline
+                    // byte (0x0A) without string conversion for efficiency.
                     if accumulatedData.last == 0x0A {
                         foundNewline = true
-                        print("[SEARCH SERVER] Received complete response after \(attempt * 10)ms (\(accumulatedData.count) bytes)")
+                        print("[\(label)] Received complete response (\(accumulatedData.count) bytes)")
                         break
                     }
+
+                    // Non-empty read: more data is likely already buffered — loop
+                    // immediately without sleeping (finding 26).
+                    continue
                 }
 
-                // Check if server crashed
-                if let serverProc = searchServerProcess, !serverProc.isRunning {
-                    print("[SEARCH SERVER] Process terminated unexpectedly")
+                // Zero-byte read. Check if the owning server crashed.
+                let serverProc = isDetect ? detectServerProcess : searchServerProcess
+                if let serverProc = serverProc, !serverProc.isRunning {
+                    print("[\(label)] Process terminated unexpectedly")
                     return nil
                 }
 
+                // Only sleep when there was nothing to read, to avoid busy-spinning.
                 Thread.sleep(forTimeInterval: 0.01)
             }
 
             guard foundNewline else {
-                print("[SEARCH SERVER] Timeout or incomplete response (received \(accumulatedData.count) bytes)")
+                print("[\(label)] Timeout or incomplete response (received \(accumulatedData.count) bytes)")
                 return nil
             }
 
             let responseData = accumulatedData
 
             let response = try JSONSerialization.jsonObject(with: responseData) as? [String: Any]
-            print("[SEARCH SERVER] Received response: status=\(response?["status"] as? String ?? "unknown")")
+            print("[\(label)] Received response: status=\(response?["status"] as? String ?? "unknown")")
             return response
 
         } catch {
-            print("[SEARCH SERVER] Communication error: \(error)")
+            print("[\(label)] Communication error: \(error)")
             return nil
         }
     }
 
+    // MARK: - Search cancellation token (finding 27)
+    /// Snapshot the current cancel token. Pass this to a search round trip; if
+    /// cancelSearch() later bumps the token past this value, the round trip abandons.
+    private func currentSearchToken() -> Int {
+        searchCancelLock.lock()
+        defer { searchCancelLock.unlock() }
+        return searchCancelToken
+    }
+
+    /// True if a search tagged with `token` has been superseded/cancelled.
+    private func isSearchCancelled(_ token: Int) -> Bool {
+        searchCancelLock.lock()
+        defer { searchCancelLock.unlock() }
+        return searchCancelToken != token
+    }
+
+    /// Read and discard exactly one newline-terminated line from the search server's
+    /// stdout (the orphaned response of a previously-abandoned search). Returns true once
+    /// a full line was consumed, false on timeout / dead server. Caller holds
+    /// searchServerLock. Honors the shutdown flag and the same 60s budget as a normal read.
+    private func drainOneOrphanLine(from stdout: FileHandle, label: String) -> Bool {
+        let deadline = Date().addingTimeInterval(60.0)
+        var sawNewline = false
+        while Date() < deadline {
+            if isShuttingDown { return false }
+            let data = stdout.availableData
+            if !data.isEmpty {
+                if data.last == 0x0A {
+                    sawNewline = true
+                    break
+                }
+                continue
+            }
+            if let proc = searchServerProcess, !proc.isRunning {
+                print("[\(label)] Server gone while draining orphan")
+                return false
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return sawNewline
+    }
+
     // MARK: - Pose Detection
 
-    /// Detect ALL people in image (multi-person detection)
+    /// Detect ALL people in image (multi-person detection).
+    ///
+    /// Finding 22: routed through the persistent detection server (src/detect_server.py)
+    /// instead of spawning a fresh `python3 -c` one-shot per call. The server loads the
+    /// ensemble once per app session, so warm detection drops from ~7s to ~0.4-2s.
+    /// Finding 23: each returned person carries inline geometric features, which we cache
+    /// keyed by image+person so a subsequent extractFeatures() needs no second round trip.
     func detectAllPoses(in image: NSImage) -> [PoseDetectionResult] {
         print("[DEBUG] detectAllPoses called")
 
-        // Save image to temp file
+        // The detect server reads the image from disk, so still materialize a temp file.
         guard let tempImagePath = saveImageToTemp(image) else {
             print("[ERROR] Failed to save image to temp")
             return []
@@ -294,67 +605,31 @@ class PythonBridgeSubprocess {
             try? FileManager.default.removeItem(atPath: tempImagePath)
         }
 
-        // Read detector settings from UserDefaults
-        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
-        let fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
-        let useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
-        let (threads, useGPU) = getThreadSettings()
-        let device = useGPU ? "mps" : "cpu"
+        let command: [String: Any] = [
+            "type": "detect_all",
+            "image_path": tempImagePath
+        ]
 
-        // Convert pose model setting to pose_models parameter
-        let poseModelsParam: String
-        if poseModel == "ensemble" {
-            poseModelsParam = "[\"rtmw-l\", \"rtmw-x\"]"
-        } else {
-            poseModelsParam = "\"\(poseModel)\""
-        }
-
-        print("[DEBUG] Detector config: poseModel=\(poseModel), fusionMethod=\(fusionMethod), useTwoStage=\(useTwoStage), threads=\(threads), device=\(device)")
-
-        // Call Python script for MULTI-PERSON detection
-        let script = """
-        import sys
-        sys.path.insert(0, '\(venvSitePackages)')
-        sys.path.insert(0, '\(projectPath)')
-        from src.swift_bridge import PostureKitBridge
-        import json
-
-        print('DEBUG: Initializing bridge for multi-person detection', file=sys.stderr, flush=True)
-        bridge = PostureKitBridge(
-            pose_models=\(poseModelsParam),
-            fusion_method='\(fusionMethod)',
-            use_two_stage=\(pythonBool(useTwoStage)),
-            num_threads=\(threads),
-            device='\(device)'
-        )
-        print('DEBUG: Calling detect_multi_person_poses_from_file', file=sys.stderr, flush=True)
-        results = bridge.detect_multi_person_poses_from_file('\(tempImagePath)')
-        print(f'DEBUG: Detected {len(results)} people', file=sys.stderr, flush=True)
-        print(json.dumps(results))
-        """
-
-        print("[DEBUG] Calling Python script for multi-person detection...")
-        guard let output = runPythonScript(script, timeout: 120.0) else {
-            print("[ERROR] Python script returned nil")
-            return []
-        }
-        print("[DEBUG] Python output length: \(output.count) chars")
-
-        let cleanOutput = extractJSON(from: output)
-        print("[DEBUG] Clean output: \(cleanOutput)")
-
-        // Parse JSON array of results
-        guard let data = cleanOutput.data(using: .utf8),
-              let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            print("[ERROR] Failed to parse multi-person detection results")
-            print("[ERROR] Raw output: \(output)")
+        print("[DEBUG] Sending detect_all to persistent detection server...")
+        guard let response = sendDetectServerCommand(command) else {
+            print("[ERROR] Detection server returned nil")
             return []
         }
 
-        print("[DEBUG] Successfully parsed JSON array with \(jsonArray.count) people")
+        guard (response["status"] as? String) == "ok",
+              let persons = response["persons"] as? [[String: Any]] else {
+            let err = response["error"] as? String ?? "unknown"
+            print("[ERROR] detect_all failed: \(err)")
+            return []
+        }
+
+        print("[DEBUG] Detection server returned \(persons.count) person(s)")
+
+        // Fold inline features (finding 23): cache them keyed by this image + person.
+        cacheDetectFeatures(persons, imageKey: featureCacheKey(for: image))
 
         // Convert each JSON dict to PoseDetectionResult
-        let results = jsonArray.compactMap { json -> PoseDetectionResult? in
+        let results = persons.compactMap { json -> PoseDetectionResult? in
             return parsePoseResult(from: json)
         }
 
@@ -362,11 +637,13 @@ class PythonBridgeSubprocess {
         return results
     }
 
-    /// Detect single person in image (legacy method, only returns first person)
+    /// Detect single person in image (legacy method, only returns first person).
+    /// Finding 22: routed through the persistent detection server; finding 23: caches
+    /// the returned person's inline features for a subsequent extractFeatures() call.
     func detectPose(in image: NSImage) -> PoseDetectionResult? {
         print("[DEBUG] detectPose called (single-person mode)")
 
-        // Save image to temp file
+        // The detect server reads the image from disk, so still materialize a temp file.
         guard let tempImagePath = saveImageToTemp(image) else {
             print("[ERROR] Failed to save image to temp")
             return nil
@@ -377,144 +654,167 @@ class PythonBridgeSubprocess {
             try? FileManager.default.removeItem(atPath: tempImagePath)
         }
 
-        // Read detector settings from UserDefaults
-        let poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
-        let fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
-        let useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
-        let (threads, useGPU) = getThreadSettings()
-        let device = useGPU ? "mps" : "cpu"
+        let command: [String: Any] = [
+            "type": "detect_pose",
+            "image_path": tempImagePath
+        ]
 
-        // Convert pose model setting to pose_models parameter
-        let poseModelsParam: String
-        if poseModel == "ensemble" {
-            poseModelsParam = "[\"rtmw-l\", \"rtmw-x\"]"
-        } else {
-            poseModelsParam = "\"\(poseModel)\""
-        }
-
-        print("[DEBUG] Detector config: poseModel=\(poseModel), fusionMethod=\(fusionMethod), useTwoStage=\(useTwoStage), threads=\(threads), device=\(device)")
-
-        // Call Python script
-        let script = """
-        import sys
-        sys.path.insert(0, '\(venvSitePackages)')
-        sys.path.insert(0, '\(projectPath)')
-        from src.swift_bridge import PostureKitBridge
-        import json
-
-        print('DEBUG: Initializing bridge with pose_models=\(poseModelsParam), fusion_method=\\'\(fusionMethod)\\', use_two_stage=\(pythonBool(useTwoStage)), num_threads=\(threads), device=\\'\(device)\\'', file=sys.stderr, flush=True)
-        bridge = PostureKitBridge(
-            pose_models=\(poseModelsParam),
-            fusion_method='\(fusionMethod)',
-            use_two_stage=\(pythonBool(useTwoStage)),
-            num_threads=\(threads),
-            device='\(device)'
-        )
-        print('DEBUG: Bridge initialized', file=sys.stderr, flush=True)
-        result = bridge.detect_pose_from_file('\(tempImagePath)')
-        print('DEBUG: Detection complete', file=sys.stderr, flush=True)
-        print(json.dumps(result))
-        """
-
-        print("[DEBUG] Calling Python script...")
-        // First detection with ensemble + two-stage can take 60-90s (model loading + MPS warmup)
-        // Subsequent detections are much faster (~2-3s) as models stay in memory
-        guard let output = runPythonScript(script, timeout: 120.0) else {
-            print("[ERROR] Python script returned nil")
-            return nil
-        }
-        print("[DEBUG] Python output length: \(output.count) chars")
-
-        let cleanOutput = extractJSON(from: output)
-        print("[DEBUG] Clean output: \(cleanOutput)")
-
-        // Parse JSON result
-        guard let data = cleanOutput.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("[ERROR] Failed to parse pose detection result")
-            print("[ERROR] Raw output: \(output)")
+        print("[DEBUG] Sending detect_pose to persistent detection server...")
+        guard let response = sendDetectServerCommand(command) else {
+            print("[ERROR] Detection server returned nil")
             return nil
         }
 
-        print("[DEBUG] Successfully parsed JSON")
-        return parsePoseResult(from: json)
+        guard (response["status"] as? String) == "ok" else {
+            let err = response["error"] as? String ?? "unknown"
+            print("[ERROR] detect_pose failed: \(err)")
+            return nil
+        }
+
+        // person may be null (no person detected) — that's not an error.
+        guard let person = response["person"] as? [String: Any] else {
+            print("[DEBUG] detect_pose: no person detected")
+            return nil
+        }
+
+        // Cache the single person's inline features (finding 23).
+        cacheDetectFeatures([person], imageKey: featureCacheKey(for: image))
+
+        print("[DEBUG] Successfully parsed detect_pose result")
+        return parsePoseResult(from: person)
     }
 
     // MARK: - Feature Extraction
+    /// Finding 23: detect_all already folds each person's geometric (+visual/fused)
+    /// features into the detect response, cached at detect time. extractFeatures now
+    /// returns those already-computed features instead of spawning a second ~2.5s
+    /// one-shot. On a cache miss (e.g. the Browse fallback, or a stale image), it
+    /// re-runs detect_all on the persistent detection server and folds in the matching
+    /// person's features — still NO cold one-shot spawn.
     func extractFeatures(from poseResult: PoseDetectionResult, image: NSImage) -> GeometricFeatures? {
-        print("[DEBUG] extractFeatures called")
+        print("[DEBUG] extractFeatures called (cache-first, finding 23)")
 
-        // Save image to temp file
+        let imageKey = featureCacheKey(for: image)
+
+        // Fast path: features were folded in by the preceding detectAllPoses/detectPose.
+        if let cached = cachedDetectFeatures(imageKey: imageKey, personIndex: poseResult.personIndex) {
+            print("[DEBUG] extractFeatures cache HIT for person \(poseResult.personIndex)")
+            return cached
+        }
+
+        print("[DEBUG] extractFeatures cache MISS - re-detecting via detection server")
+
+        // Cache miss: re-run detect_all (persistent server, no cold spawn) and repopulate
+        // the per-image cache, then look up the requested person.
         guard let tempImagePath = saveImageToTemp(image) else {
             print("[ERROR] Failed to save image to temp")
             return nil
         }
-        print("[DEBUG] Saved image to: \(tempImagePath)")
-
         defer {
             try? FileManager.default.removeItem(atPath: tempImagePath)
         }
 
-        // Convert pose to JSON
-        let poseDict: [String: Any] = [
-            "keypoints": poseResult.keypoints,
-            "visibility": poseResult.visibility,
-            "bbox": poseResult.bbox,
-            "confidence": poseResult.confidence,
-            "person_id": poseResult.personIndex
+        let command: [String: Any] = [
+            "type": "detect_all",
+            "image_path": tempImagePath
         ]
 
-        guard let poseJSON = try? JSONSerialization.data(withJSONObject: poseDict),
-              let poseString = String(data: poseJSON, encoding: .utf8) else {
-            print("[ERROR] Failed to serialize pose dict to JSON")
+        guard let response = sendDetectServerCommand(command),
+              (response["status"] as? String) == "ok",
+              let persons = response["persons"] as? [[String: Any]] else {
+            print("[ERROR] extractFeatures fallback detect_all failed")
             return nil
         }
 
-        let (threads, useGPU) = getThreadSettings()
-        let device = useGPU ? "mps" : "cpu"
+        cacheDetectFeatures(persons, imageKey: imageKey)
 
-        let script = """
-        import sys
-        import cv2
-        sys.path.insert(0, '\(venvSitePackages)')
-        sys.path.insert(0, '\(projectPath)')
-        from src.swift_bridge import PostureKitBridge
-        import json
-
-        print('DEBUG: Extracting features with num_threads=\(threads), device=\\'\(device)\\'', file=sys.stderr, flush=True)
-        bridge = PostureKitBridge(num_threads=\(threads), device='\(device)')
-        pose_data = json.loads('\(poseString)')
-
-        # Load image for visual features
-        image = cv2.imread('\(tempImagePath)')
-        if image is not None:
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            image_rgb = None
-
-        result = bridge.extract_features(pose_data, image_array=image_rgb)
-        print('DEBUG: Feature extraction complete', file=sys.stderr, flush=True)
-        print(json.dumps(result))
-        """
-
-        print("[DEBUG] Calling Python for feature extraction...")
-        // Feature extraction can take longer if models need to load (60-90s first time)
-        guard let output = runPythonScript(script, timeout: 120.0) else {
-            print("[ERROR] Python script returned nil")
-            return nil
+        if let cached = cachedDetectFeatures(imageKey: imageKey, personIndex: poseResult.personIndex) {
+            print("[DEBUG] extractFeatures fallback resolved features for person \(poseResult.personIndex)")
+            return cached
         }
 
-        let cleanOutput = extractJSON(from: output)
+        // Last resort: if the requested person index isn't present (re-detection drift),
+        // ask the server for that person index directly. Returns only the geometric
+        // vector + confidence (no joint angles etc.), which is enough for search.
+        return extractFeaturesViaServer(imagePath: tempImagePath, personIndex: poseResult.personIndex)
+    }
 
-        guard let data = cleanOutput.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("[ERROR] Failed to parse feature extraction output")
-            print("[ERROR] Raw output: \(output)")
+    /// Back-compat fallback: the detect server's extract_features command returns just the
+    /// geometric vector + confidence for the Nth person. Used only when the full features
+    /// dict couldn't be matched from a detect_all (rare). No cold spawn.
+    private func extractFeaturesViaServer(imagePath: String, personIndex: Int) -> GeometricFeatures? {
+        let command: [String: Any] = [
+            "type": "extract_features",
+            "image_path": imagePath,
+            "person_index": personIndex
+        ]
+        guard let response = sendDetectServerCommand(command),
+              (response["status"] as? String) == "ok",
+              let featuresDoubles = response["features"] as? [Double] else {
+            print("[ERROR] extract_features server fallback failed")
             return nil
         }
+        let featureVector = featuresDoubles.map { Float($0) }
+        var featureConfidence: [Float]? = nil
+        if let confDoubles = response["confidence"] as? [Double], !confDoubles.isEmpty {
+            featureConfidence = confDoubles.map { Float($0) }
+        }
+        // Minimal struct: only the search-relevant fields are populated; the dict fields
+        // (joint/limb/body/symmetry) are unused by the search path.
+        return GeometricFeatures(
+            featureVector: featureVector,
+            featureConfidence: featureConfidence,
+            fusedVector: nil,
+            jointAngles: [:],
+            limbRatios: [:],
+            bodyAngles: [:],
+            symmetryScores: [:],
+            occlusionPattern: []
+        )
+    }
 
-        print("[DEBUG] Successfully extracted features")
-        return parseFeatures(from: json)
+    // MARK: - Inline-feature cache (finding 23)
+
+    /// Stable key for an NSImage's pixels, so extractFeatures can match the image that
+    /// was just detected. Hashes the TIFF representation (cheap, deterministic for the
+    /// same bitmap); falls back to a pointer identity if TIFF isn't available.
+    private func featureCacheKey(for image: NSImage) -> String {
+        if let tiff = image.tiffRepresentation {
+            return "tiff:\(tiff.count):\(tiff.hashValue)"
+        }
+        return "ptr:\(ObjectIdentifier(image).hashValue)"
+    }
+
+    /// Replace the per-image feature cache with the features folded into a detect
+    /// response. Keyed by "<imageKey>|<personIndex>". Only the LAST detect's people are
+    /// retained (the cache is cleared on each new image), bounding memory.
+    private func cacheDetectFeatures(_ persons: [[String: Any]], imageKey: String) {
+        detectFeatureCacheLock.lock()
+        defer { detectFeatureCacheLock.unlock() }
+
+        // New image => drop the previous image's features.
+        if imageKey != lastDetectImageKey {
+            lastDetectFeatures.removeAll()
+            lastDetectImageKey = imageKey
+        }
+
+        for person in persons {
+            guard let featuresDict = person["features"] as? [String: Any],
+                  let parsed = parseFeatures(from: featuresDict) else {
+                continue
+            }
+            let personIndex = (person["person_id"] as? Int) ?? 0
+            lastDetectFeatures["\(imageKey)|\(personIndex)"] = parsed
+        }
+        print("[DEBUG] Cached inline features for \(lastDetectFeatures.count) person(s)")
+    }
+
+    /// Look up cached inline features for a given image + person index.
+    private func cachedDetectFeatures(imageKey: String, personIndex: Int) -> GeometricFeatures? {
+        detectFeatureCacheLock.lock()
+        defer { detectFeatureCacheLock.unlock() }
+        guard imageKey == lastDetectImageKey else { return nil }
+        return lastDetectFeatures["\(imageKey)|\(personIndex)"]
     }
 
     // MARK: - Similarity Search
@@ -582,8 +882,12 @@ class PythonBridgeSubprocess {
             "params": params
         ]
 
+        // Capture the cancel token BEFORE the round trip so cancelSearch() (a newer
+        // slider/threshold search) can abandon this one mid-flight (finding 27).
+        let token = currentSearchToken()
+
         // Send command to persistent server
-        guard let response = sendSearchServerCommand(command) else {
+        guard let response = sendSearchServerCommand(command, cancelToken: token) else {
             print("[SEARCH DEBUG] Failed to communicate with search server")
             return []
         }
@@ -656,7 +960,10 @@ class PythonBridgeSubprocess {
             "params": params
         ]
 
-        guard let response = sendSearchServerCommand(command) else {
+        // Cancellable round trip (finding 27): a superseded search abandons here.
+        let token = currentSearchToken()
+
+        guard let response = sendSearchServerCommand(command, cancelToken: token) else {
             print("[SEARCH DEBUG] Failed to communicate with search server")
             return []
         }
@@ -679,6 +986,73 @@ class PythonBridgeSubprocess {
 
         print("[SEARCH DEBUG] Received \(resultsArray.count) results from server")
         return resultsArray.compactMap { parseSearchResult(from: $0) }
+    }
+
+    // MARK: - Deferred result details (finding 25)
+
+    /// The heavy fields a deferred-detail search ROW omits for large result sets
+    /// (>50 results): the thumbnail JPEG, the 133-keypoint overlay array, and the
+    /// detailed NudeNet region breakdown. Fetched on demand for the visible page only.
+    struct ResultDetail {
+        let thumbnailData: Data?
+        let keypoints: [[Double]]
+        let detailedRegions: [[String: Any]]
+    }
+
+    /// Fetch the deferred heavy fields for a set of poses (the visible page) via the
+    /// persistent search server's `fetch_details` command. Returns a map keyed by
+    /// pose_id; missing ids are simply absent. Returns [:] on any failure so the UI can
+    /// degrade gracefully (it falls back to loading thumbnails from disk).
+    func fetchResultDetails(poseIds: [String]) -> [String: ResultDetail] {
+        guard !poseIds.isEmpty else { return [:] }
+
+        let command: [String: Any] = [
+            "command": "fetch_details",
+            "params": ["pose_ids": poseIds]
+        ]
+
+        guard let response = sendSearchServerCommand(command),
+              (response["status"] as? String) == "success",
+              let details = response["details"] as? [[String: Any]] else {
+            print("[DETAILS DEBUG] fetch_details failed for \(poseIds.count) pose(s)")
+            return [:]
+        }
+
+        var result: [String: ResultDetail] = [:]
+        for detail in details {
+            guard let poseId = detail["pose_id"] as? String else { continue }
+
+            // Decode base64 thumbnail if present (may be null).
+            var thumbnailData: Data? = nil
+            if let thumbnailBase64 = detail["thumbnail_base64"] as? String {
+                thumbnailData = Data(base64Encoded: thumbnailBase64)
+            }
+
+            // Keypoints: 133 x [x, y, conf]. Tolerate absence/odd shapes.
+            var keypoints: [[Double]] = []
+            if let keypointsRaw = detail["keypoints"] as? [[Any]] {
+                keypoints = keypointsRaw.compactMap { kp in
+                    guard kp.count == 3,
+                          let x = kp[0] as? Double,
+                          let y = kp[1] as? Double,
+                          let conf = kp[2] as? Double else {
+                        return nil
+                    }
+                    return [x, y, conf]
+                }
+            }
+
+            let detailedRegions = (detail["visible_regions_detailed"] as? [[String: Any]]) ?? []
+
+            result[poseId] = ResultDetail(
+                thumbnailData: thumbnailData,
+                keypoints: keypoints,
+                detailedRegions: detailedRegions
+            )
+        }
+
+        print("[DETAILS DEBUG] fetch_details returned \(result.count)/\(poseIds.count) detail(s)")
+        return result
     }
 
     // MARK: - Update Image Paths (after moving files)
@@ -887,27 +1261,21 @@ class PythonBridgeSubprocess {
     }
 
     // MARK: - Index Statistics
+    /// Findings 24 + 42: answer from the already-running persistent search server's
+    /// `statistics` command (sub-ms server-side) instead of spawning a fresh ~2.6s
+    /// full-bridge one-shot per call. The server auto-starts on demand if not yet up
+    /// (it is normally started eagerly at launch). Returns 0 on any failure.
     func getIndexStatistics() -> Int {
-        let (threads, useGPU) = getThreadSettings()
-        let device = useGPU ? "mps" : "cpu"
+        let command: [String: Any] = [
+            "command": "statistics",
+            "params": [:]
+        ]
 
-        let script = """
-        import sys
-        sys.path.insert(0, '\(venvSitePackages)')
-        sys.path.insert(0, '\(projectPath)')
-        from src.swift_bridge import PostureKitBridge
-        import json
-
-        bridge = PostureKitBridge(num_threads=\(threads), device='\(device)')
-        stats = bridge.similarity_engine.get_statistics()
-        print(json.dumps(stats))
-        """
-
-        // Statistics is lightweight - disable threading to avoid conflicts
-        guard let output = runPythonScript(script, configureThreading: false),
-              let data = output.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let totalPoses = json["total_poses"] as? Int else {
+        guard let response = sendSearchServerCommand(command),
+              (response["status"] as? String) == "success",
+              let statistics = response["statistics"] as? [String: Any],
+              let totalPoses = statistics["total_poses"] as? Int else {
+            print("[INDEX] getIndexStatistics: server statistics unavailable")
             return 0
         }
 
@@ -915,50 +1283,44 @@ class PythonBridgeSubprocess {
     }
 
     // MARK: - Index Preloading
+    /// Finding 41: do NOT spawn a throwaway full-bridge one-shot whose loaded FAISS index
+    /// dies with the process. Instead start the PERSISTENT search server (which lazily
+    /// inits the bridge + loads the index inside the long-lived process) and send one
+    /// `statistics` command to force that init now and read the pose count. The warm
+    /// server then serves the user's first search with no further boot cost.
+    ///
+    /// Returns true if an index with poses exists, false for empty/no index. NOTE: the
+    /// caller (AppDelegate) MUST post .indexPreloaded regardless of this return value —
+    /// an empty index and a server-start failure are both valid "UI may proceed" states.
     func preloadIndex() -> Bool {
-        print("[INDEX] Preloading FAISS index...")
-        let (threads, useGPU) = getThreadSettings()
-        let device = useGPU ? "mps" : "cpu"
+        print("[INDEX] Preloading via persistent search server (finding 41)...")
 
-        let script = """
-        import sys
-        sys.path.insert(0, '\(venvSitePackages)')
-        sys.path.insert(0, '\(projectPath)')
-        from src.swift_bridge import PostureKitBridge
-        import json
-
-        print('INDEX: Initializing bridge...', file=sys.stderr, flush=True)
-        bridge = PostureKitBridge(num_threads=\(threads), device='\(device)')
-
-        print('INDEX: Loading index...', file=sys.stderr, flush=True)
-        # Try to load existing index
-        index_loaded = bridge.similarity_engine.load_index()
-
-        if index_loaded:
-            stats = bridge.similarity_engine.get_statistics()
-            print('INDEX: Loaded successfully', file=sys.stderr, flush=True)
-            print(json.dumps({'success': True, 'total_poses': stats['total_poses']}))
-        else:
-            print('INDEX: No existing index found', file=sys.stderr, flush=True)
-            print(json.dumps({'success': False, 'total_poses': 0}))
-        """
-
-        // Index loading can take 5-10 seconds for large indices
-        guard let output = runPythonScript(script, configureThreading: false, timeout: 30.0),
-              let data = output.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let success = json["success"] as? Bool else {
-            print("[INDEX] Failed to preload index")
+        // Start the resident server eagerly so the first search is warm. If startup
+        // fails (e.g. Postgres down), fall through — the UI contract still requires the
+        // .indexPreloaded post, which the caller handles.
+        if !startSearchServer() {
+            print("[INDEX] Search server failed to start - will retry lazily on first search")
             return false
         }
 
-        if success {
-            if let totalPoses = json["total_poses"] as? Int {
-                print("[INDEX] Preloaded with \(totalPoses) poses")
-            }
+        // Force bridge/index init inside the resident process and read the pose count.
+        let command: [String: Any] = [
+            "command": "statistics",
+            "params": [:]
+        ]
+        guard let response = sendSearchServerCommand(command),
+              (response["status"] as? String) == "success",
+              let statistics = response["statistics"] as? [String: Any] else {
+            print("[INDEX] Statistics unavailable during preload - index will build on first search")
+            return false
+        }
+
+        let totalPoses = statistics["total_poses"] as? Int ?? 0
+        if totalPoses > 0 {
+            print("[INDEX] Preloaded (server warm) with \(totalPoses) poses")
             return true
         } else {
-            print("[INDEX] No existing index found - will build on first search")
+            print("[INDEX] Empty index - will build on first search")
             return false
         }
     }
@@ -1461,11 +1823,25 @@ class PythonBridgeSubprocess {
     }
 
     func cancelSearch() {
+        // Finding 27: searches now run on the persistent search server, not the dead
+        // runCancellableSearch one-shot path. Bump the monotonic cancel token so any
+        // in-flight server search round trip (which captured the previous token) detects
+        // supersession in its read loop, abandons its response, and releases
+        // searchServerLock — instead of the replacement query serializing behind the old
+        // search's full 60s-budget round trip.
+        searchCancelLock.lock()
+        searchCancelToken &+= 1
+        let newToken = searchCancelToken
+        searchCancelLock.unlock()
+        print("[SEARCH DEBUG] Search cancelled (token bumped to \(newToken)) - in-flight server search will abandon")
+
+        // Legacy one-shot search process cleanup (no current search path uses it, but
+        // keep the teardown defensive in case runCancellableSearch is ever reintroduced).
         searchLock.lock()
         defer { searchLock.unlock() }
 
         if let process = currentSearchProcess, process.isRunning {
-            print("[SEARCH DEBUG] User cancelled search (PID: \(process.processIdentifier))")
+            print("[SEARCH DEBUG] User cancelled legacy search process (PID: \(process.processIdentifier))")
             process.terminate()
             // Give it a moment to terminate
             Thread.sleep(forTimeInterval: 0.1)
@@ -1474,8 +1850,6 @@ class PythonBridgeSubprocess {
                 kill(process.processIdentifier, SIGKILL)
             }
             currentSearchProcess = nil
-        } else {
-            print("[SEARCH DEBUG] No search process to cancel")
         }
     }
 
@@ -2116,6 +2490,39 @@ class PythonBridgeSubprocess {
         searchServerProcess = nil
         searchServerInitialized = false
         searchServerLock.unlock()
+
+        // Terminate detection server (finding 22) — mirror the search-server teardown.
+        detectServerLock.lock()
+        if let detectProc = detectServerProcess, detectProc.isRunning {
+            print("[SHUTDOWN] Shutting down detection server (PID: \(detectProc.processIdentifier))...")
+
+            // Graceful shutdown: detect protocol keys on "type".
+            let shutdownCommand: [String: Any] = ["type": "shutdown"]
+            if let stdin = detectServerStdin {
+                do {
+                    let jsonData = try JSONSerialization.data(withJSONObject: shutdownCommand)
+                    let jsonString = String(data: jsonData, encoding: .utf8)! + "\n"
+                    stdin.write(jsonString.data(using: .utf8)!)
+                } catch {
+                    print("[SHUTDOWN] Failed to send detect shutdown command: \(error)")
+                }
+            }
+
+            Thread.sleep(forTimeInterval: 1.5)
+
+            if detectProc.isRunning {
+                print("[SHUTDOWN] Detect server graceful shutdown timed out, force-terminating...")
+                detectProc.terminate()
+                Thread.sleep(forTimeInterval: 1.0)
+                if detectProc.isRunning {
+                    print("[SHUTDOWN] Force-killing detection server")
+                    kill(detectProc.processIdentifier, SIGKILL)
+                }
+            }
+        }
+        detectServerProcess = nil
+        detectServerInitialized = false
+        detectServerLock.unlock()
 
         // Terminate indexing process if running
         if let indexProc = indexingProcess, indexProc.isRunning {

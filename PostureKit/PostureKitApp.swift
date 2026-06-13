@@ -12,21 +12,26 @@ import AppKit
 // MARK: - App Delegate for lifecycle management
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        print("Application launched - preloading FAISS index...")
+        print("Application launched - starting persistent search server + preloading index...")
 
-        // Preload FAISS index in background to avoid blocking UI
+        // Finding 41: preloadIndex() now starts the PERSISTENT search server (which loads
+        // the FAISS index inside the long-lived process) instead of spawning a throwaway
+        // full-bridge one-shot that discards everything. Done off the main thread so the
+        // ~2s server init never blocks the UI; the first user search is then warm.
         DispatchQueue.global(qos: .userInitiated).async {
             let indexLoaded = PythonBridgeSubprocess.shared.preloadIndex()
 
             DispatchQueue.main.async {
                 if indexLoaded {
-                    print("FAISS index preloaded successfully")
+                    print("FAISS index preloaded successfully (search server warm)")
                 } else {
-                    print("No existing FAISS index - will build on first search")
+                    print("No existing FAISS index (or server start failed) - will build/retry on first search")
                 }
-                // Always post notification so status bar leaves the .loading state.
-                // Empty-index case displays as "Index ready - empty"; index will
-                // build automatically on first search (120s timeout).
+                // CRITICAL UI CONTRACT: always post so the status bar leaves the .loading
+                // state — on success, empty index, AND server-start failure. Skipping this
+                // post in any branch hangs the "Loading index..." status bar forever.
+                // Empty-index case displays as "Index ready - empty"; the index builds
+                // automatically on the first search.
                 NotificationCenter.default.post(name: .indexPreloaded, object: nil)
             }
         }

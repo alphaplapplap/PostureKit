@@ -41,6 +41,19 @@ class PostureKitViewModel: ObservableObject {
     var detectedPose: PoseDetectionResult?
     var extractedFeatures: GeometricFeatures?
 
+    // Query-feature extraction cache (finding 28). Extracting query features is a
+    // cold-spawn `python3 -c` call (torch/mmpose import + full-image PNG re-encode,
+    // multiple seconds). Person poses are immutable for the life of a single image
+    // load, so we cache the extracted features keyed by (load identity, selected
+    // person). `queryDetectionId` is a fresh UUID minted every time multi-person
+    // detection completes for a newly loaded image — keying on it instead of the
+    // filename avoids name collisions across different files. Flip is a server-side
+    // toggle that does NOT change the query features, so it is intentionally NOT part
+    // of the key (the dup-search guard already lets a flip-toggle re-run the search).
+    private var queryDetectionId: UUID?
+    private var cachedFeatureDetectionId: UUID?
+    private var cachedFeaturePersonIndex: Int = -1
+
     // Search Parameters — persisted across launches (write-through on change).
     // numberOfResults shares the Settings dialog's "resultsPerPage" key so the
     // "Show:" menu and the Settings picker stay in sync via one source of truth.
@@ -248,29 +261,133 @@ class PostureKitViewModel: ObservableObject {
     }
 
     /// Slice the cached result set (`rawResults`, filtered to the current threshold) into the
-    /// page the grid displays, and publish page bookkeeping. Pure main-thread work — no Python.
+    /// page the grid displays, and publish page bookkeeping. Pure main-thread work — no Python
+    /// on the page-flip path (a large-result-set page may lazily fetch its thumbnails/keypoints
+    /// in the background; see `fetchDetailsForVisiblePageIfNeeded`).
     func applyResultWindow() {
-        // Raises above the fetched floor are honored by re-filtering the cache here.
+        // Raises above the fetched floor are honored here.
         let floorPercent = Int(minSimilarity * 100)
-        let active = rawResults.filter { $0.similarity >= floorPercent }
 
-        totalResultCount = active.count
+        // The active set is the threshold-filtered slice of `rawResults`. In THRESHOLD mode
+        // (lastQueriedThreshold > 0) `rawResults` is sorted best-first (Python sorts by
+        // similarity_score descending and Int(similarity*100) truncation preserves the
+        // non-increasing order), so the survivors are always a PREFIX of the cache:
+        // `rawResults[0..<cutoff]` where cutoff is found by binary search — O(log n) instead of
+        // an O(n) filter + n-element materialization on every page flip (finding 33). In BROWSE /
+        // no-threshold mode the cache is confidence-sorted, not a similarity prefix, so we keep
+        // the linear filter to stay correct; those sets are small (top-k) so the cost is trivial.
+        let activeProvider: (Int) -> SearchResult   // index within active set -> result
+        let activeCount: Int
+        if floorPercent <= 0 {
+            // Floor admits everything regardless of ordering — no scan needed.
+            activeCount = rawResults.count
+            activeProvider = { self.rawResults[$0] }
+        } else if lastQueriedThreshold > 0 {
+            let cutoff = firstIndexBelow(floorPercent, in: rawResults)
+            activeCount = cutoff
+            activeProvider = { self.rawResults[$0] }
+        } else {
+            let filtered = rawResults.filter { $0.similarity >= floorPercent }
+            activeCount = filtered.count
+            activeProvider = { filtered[$0] }
+        }
 
+        totalResultCount = activeCount
+
+        // Compute the [pageStart, pageEnd) index range of the visible page within the active set.
+        let pageStart: Int
+        let pageEnd: Int
         if showAllResults {
             totalPages = 1
             currentPage = 1
-            searchResults = active
-            return
+            pageStart = 0
+            pageEnd = activeCount
+        } else {
+            let pageSize = max(1, numberOfResults)
+            totalPages = max(1, Int(ceil(Double(activeCount) / Double(pageSize))))
+            if currentPage > totalPages { currentPage = totalPages }
+            if currentPage < 1 { currentPage = 1 }
+            pageStart = (currentPage - 1) * pageSize
+            pageEnd = min(activeCount, pageStart + pageSize)
         }
 
-        let pageSize = max(1, numberOfResults)
-        totalPages = max(1, Int(ceil(Double(active.count) / Double(pageSize))))
-        if currentPage > totalPages { currentPage = totalPages }
-        if currentPage < 1 { currentPage = 1 }
+        // Materialize only the page (O(pageSize)), not the whole active set.
+        let page: [SearchResult] = (pageStart < pageEnd)
+            ? (pageStart..<pageEnd).map { activeProvider($0) }
+            : []
+        searchResults = page
 
-        let start = (currentPage - 1) * pageSize
-        let end = min(active.count, start + pageSize)
-        searchResults = (start < end) ? Array(active[start..<end]) : []
+        // Finding 25: for large result sets the bridge defers heavy fields, so page rows arrive
+        // without thumbnails. Backfill the visible page's thumbnails/keypoints off the main thread.
+        fetchDetailsForVisiblePageIfNeeded(page)
+    }
+
+    /// First index in a best-first-sorted result array whose similarity is strictly below
+    /// `floorPercent` (i.e. the count of results at/above the floor). O(log n).
+    private func firstIndexBelow(_ floorPercent: Int, in results: [SearchResult]) -> Int {
+        var lo = 0
+        var hi = results.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if results[mid].similarity >= floorPercent {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return lo
+    }
+
+    /// Finding 25: when the bridge ships a deferred (thumbnail-less) result set, fetch the
+    /// heavy fields for just the rows on screen. Runs the bridge round-trip in the background
+    /// and merges thumbnails/keypoints back on the main thread, gated on the search generation
+    /// so a superseded page's late details never poison the current grid.
+    private func fetchDetailsForVisiblePageIfNeeded(_ page: [SearchResult]) {
+        // A row needs details only if its thumbnail is absent AND we haven't already fetched
+        // details for it (a row with no DB thumbnail stays thumbnail-less after a fetch — don't
+        // re-request it on every page flip). The bridge inlines thumbnails for small sets (<= 50),
+        // so those pages short-circuit here.
+        let missing = page.filter { $0.thumbnailData == nil && !$0.detailsFetched }.map { $0.id }
+        guard !missing.isEmpty else { return }
+
+        let requested = Set(missing)
+        let myGeneration = currentSearchGeneration()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let details = self.pythonBridge.fetchResultDetails(poseIds: missing)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                // Discard if the grid moved on (new search/page) since we requested details.
+                guard self.isCurrentSearchGeneration(myGeneration) else { return }
+                self.mergeResultDetails(details, requestedIds: requested)
+            }
+        }
+    }
+
+    /// Merge fetched thumbnails/keypoints into both the cache (`rawResults`) and the currently
+    /// displayed page (`searchResults`) so re-paging to the same rows is instant and the grid
+    /// re-renders with the loaded thumbnails. Every requested id is marked `detailsFetched`
+    /// (even ones the server returned with a null thumbnail / couldn't return) so it isn't
+    /// re-requested on the next page flip. Main-thread only.
+    private func mergeResultDetails(_ details: [String: PythonBridgeSubprocess.ResultDetail],
+                                    requestedIds: Set<String>) {
+        for index in rawResults.indices where requestedIds.contains(rawResults[index].id) {
+            rawResults[index].detailsFetched = true
+            if let detail = details[rawResults[index].id] {
+                if let thumb = detail.thumbnailData { rawResults[index].thumbnailData = thumb }
+                if !detail.keypoints.isEmpty { rawResults[index].keypoints = detail.keypoints }
+                if !detail.detailedRegions.isEmpty { rawResults[index].visibleRegionsDetailed = detail.detailedRegions }
+            }
+        }
+        // Reassign visible rows so SwiftUI observes the change and the grid re-renders.
+        for index in searchResults.indices where requestedIds.contains(searchResults[index].id) {
+            searchResults[index].detailsFetched = true
+            if let detail = details[searchResults[index].id] {
+                if let thumb = detail.thumbnailData { searchResults[index].thumbnailData = thumb }
+                if !detail.keypoints.isEmpty { searchResults[index].keypoints = detail.keypoints }
+                if !detail.detailedRegions.isEmpty { searchResults[index].visibleRegionsDetailed = detail.detailedRegions }
+            }
+        }
     }
 
     /// "Show:" page-size or "All" toggle changed: jump to page 1 and re-slice the cache. No re-search.
@@ -357,6 +474,11 @@ class PostureKitViewModel: ObservableObject {
         extractedFeatures = nil
         activeQueryPoseId = nil
 
+        // Drop the query-feature extraction cache (finding 28).
+        queryDetectionId = nil
+        cachedFeatureDetectionId = nil
+        cachedFeaturePersonIndex = -1
+
         // Clear multi-person state
         detectedPeople = []
         selectedPersonIndex = 0
@@ -432,6 +554,14 @@ class PostureKitViewModel: ObservableObject {
         searchGenerationLock.lock()
         defer { searchGenerationLock.unlock() }
         return generation == searchGeneration
+    }
+
+    /// The current search generation (snapshot for background work that must be discarded if a
+    /// newer search/page supersedes it before its result lands).
+    private func currentSearchGeneration() -> Int {
+        searchGenerationLock.lock()
+        defer { searchGenerationLock.unlock() }
+        return searchGeneration
     }
 
     func cancelSearch() {
@@ -588,6 +718,12 @@ class PostureKitViewModel: ObservableObject {
                 self.multiPersonDetectionComplete = true
                 self.isDetecting = false
 
+                // New set of (immutable) detected people for this load: mint a fresh
+                // identity and drop any cached query features from a previous image.
+                self.queryDetectionId = UUID()
+                self.cachedFeatureDetectionId = nil
+                self.cachedFeaturePersonIndex = -1
+
                 // Set detection flags for UI display
                 if let firstPerson = detectedPeople.first {
                     self.poseDetected = true
@@ -622,9 +758,30 @@ class PostureKitViewModel: ObservableObject {
             let selectedPerson = detectedPeople[selectedPersonIndex]
             let pose = selectedPerson.poseResult
 
+            // Finding 28: skip the cold-spawn extraction when nothing relevant changed.
+            // Person poses are immutable for this image load, so cached features for the
+            // same (load identity, selected person) are exactly what extraction would
+            // re-produce. Flip is server-side and doesn't affect the query features.
+            if let cached = self.extractedFeatures,
+               let detectionId = self.queryDetectionId,
+               self.cachedFeatureDetectionId == detectionId,
+               self.cachedFeaturePersonIndex == selectedPersonIndex {
+                print("[SEARCH] Reusing cached features for Person \(selectedPersonIndex + 1) (no re-extraction)")
+                self.detectedPose = pose
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    self?.executeSearch(features: cached, selectedPersonPose: pose)
+                }
+                return
+            }
+
             print("[SEARCH] Extracting features for selected person...")
             isDetecting = true
             errorMessage = nil
+
+            // Capture the identity these features will correspond to NOW (main thread), so a
+            // person switch during the slow extraction can't mis-tag the cache (finding 28).
+            let extractedForPersonIndex = selectedPersonIndex
+            let extractedForDetectionId = queryDetectionId
 
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
@@ -647,6 +804,14 @@ class PostureKitViewModel: ObservableObject {
                     self.detectedPose = pose
                     self.extractedFeatures = features
                     self.isDetecting = false
+                    // Record what these cached features correspond to so a repeat
+                    // Search press on the same person/image skips re-extraction. Only tag
+                    // the cache if the load identity is still current (a new image load mints
+                    // a fresh queryDetectionId; tagging a stale one would never hit anyway).
+                    if self.queryDetectionId == extractedForDetectionId {
+                        self.cachedFeatureDetectionId = extractedForDetectionId
+                        self.cachedFeaturePersonIndex = extractedForPersonIndex
+                    }
                 }
 
                 // Perform search with selected person's features
@@ -837,6 +1002,22 @@ class PostureKitViewModel: ObservableObject {
             // Already on searchQueue (serial), direct assignment is thread-safe
             self.searchInProgress = false
 
+            // Finding 30: run the existence + indexed-folders-scope sweep here on the serial
+            // searchQueue (off the main thread) so an O(result-set) stat() syscall walk — which
+            // can block for seconds on an offline external volume — never freezes the UI. Skip
+            // the work entirely if this search was already superseded. Scope prefixes are
+            // precomputed once inside the (now background) filter rather than per result.
+            guard self.isCurrentSearchGeneration(myGeneration) else {
+                print("[SEARCH DEBUG] Ignoring \(results.count) results from a cancelled/superseded search (pre-filter)")
+                return
+            }
+            let scope = IndexViewModel.indexedFoldersScope()
+            let existingFiles = results.filter { result in
+                guard let path = result.imagePath else { return false }
+                return FileManager.default.fileExists(atPath: path)
+                    && self.isWithinIndexedFolders(path, scope: scope)
+            }
+
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
 
@@ -862,15 +1043,6 @@ class PostureKitViewModel: ObservableObject {
                     }
                 }
 
-                // Python already applied the similarity threshold; drop any whose image
-                // file vanished from disk or falls outside the indexed-folders scope,
-                // then cache the full set for pagination.
-                let scope = IndexViewModel.indexedFoldersScope()
-                let existingFiles = results.filter { result in
-                    guard let path = result.imagePath else { return false }
-                    return FileManager.default.fileExists(atPath: path)
-                        && self.isWithinIndexedFolders(path, scope: scope)
-                }
                 print("[SEARCH DEBUG] \(existingFiles.count) results at/above \(Int(queryThreshold * 100))% (of \(results.count) returned)")
 
                 // Cache as the paginated set. queryThreshold is the floor Python used, so the
@@ -920,6 +1092,12 @@ class PostureKitViewModel: ObservableObject {
             detectedPeople = []
             selectedPersonIndex = 0
             multiPersonDetectionComplete = false
+
+            // A pose-id query replaces local extraction; drop the feature cache so a
+            // later manual Search on a re-detected image re-extracts cleanly.
+            queryDetectionId = nil
+            cachedFeatureDetectionId = nil
+            cachedFeaturePersonIndex = -1
 
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let image = NSImage(contentsOfFile: path)
@@ -989,6 +1167,18 @@ class PostureKitViewModel: ObservableObject {
             let elapsed = Date().timeIntervalSince(startTime)
             self.searchInProgress = false
 
+            // Finding 30: existence + scope sweep off the main thread (see executeSearch).
+            guard self.isCurrentSearchGeneration(myGeneration) else {
+                print("[SEARCH DEBUG] Ignoring \(results.count) results from a cancelled/superseded search (pre-filter)")
+                return
+            }
+            let scope = IndexViewModel.indexedFoldersScope()
+            let existingFiles = results.filter { result in
+                guard let path = result.imagePath else { return false }
+                return FileManager.default.fileExists(atPath: path)
+                    && self.isWithinIndexedFolders(path, scope: scope)
+            }
+
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
 
@@ -997,15 +1187,6 @@ class PostureKitViewModel: ObservableObject {
                     return
                 }
 
-                // Python already applied the similarity threshold; drop results whose
-                // image vanished from disk or falls outside the indexed-folders
-                // scope, then cache the set for pagination.
-                let scope = IndexViewModel.indexedFoldersScope()
-                let existingFiles = results.filter { result in
-                    guard let path = result.imagePath else { return false }
-                    return FileManager.default.fileExists(atPath: path)
-                        && self.isWithinIndexedFolders(path, scope: scope)
-                }
                 print("[SEARCH DEBUG] \(existingFiles.count) results at/above \(Int(queryThreshold * 100))% (of \(results.count) returned)")
 
                 self.rawResults = existingFiles
@@ -1534,4 +1715,9 @@ struct SearchResult: Identifiable {
     var bbox: [Double]?  // Bounding box [x_min, y_min, x_max, y_max]
     var personId: Int?  // Person index (0, 1, 2...) for multi-person images
     var isFlipped: Bool = false  // True if this is a horizontally flipped match
+    // Finding 25: large result sets arrive with heavy fields (thumbnail/keypoints/detailed
+    // regions) DEFERRED. This flag records that we already requested details for the row via
+    // the bridge's fetch_details, so a row that legitimately has no DB thumbnail isn't re-fetched
+    // on every page flip. Inlined rows (small sets) and details-fetched rows are both "done".
+    var detailsFetched: Bool = false
 }

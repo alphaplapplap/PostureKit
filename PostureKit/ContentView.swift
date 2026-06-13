@@ -7,6 +7,109 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+import ImageIO
+
+// MARK: - Thumbnail Cache
+// Process-wide, byte-bounded cache for result thumbnails. Keyed by the stable DB
+// pose_id (SearchResult.id), so entries stay valid across page flips, scroll-backs,
+// and file moves (move rewrites imagePath but not the DB thumbnail or the pose_id).
+// Without this, every onAppear re-decodes NSImage(data:) from scratch on the main
+// thread, and the legacy file-fallback path full-decodes a multi-MP image just to
+// produce a 200x200 thumbnail. We have 128 GB RAM, so the limit is generous but
+// bounded by approximate pixel bytes (totalCostLimit) rather than raw count.
+final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        // ~200x200 RGBA ≈ 160 KB/image; 1.5 GB budget ≈ ~9k thumbnails resident.
+        c.totalCostLimit = 1_500 * 1024 * 1024
+        return c
+    }()
+
+    private init() {}
+
+    func image(forKey key: String) -> NSImage? {
+        cache.object(forKey: key as NSString)
+    }
+
+    func set(_ image: NSImage, forKey key: String) {
+        let size = image.size
+        // Approximate resident cost: 4 bytes/pixel of the rendered bitmap.
+        let cost = max(1, Int(size.width * size.height) * 4)
+        cache.setObject(image, forKey: key as NSString, cost: cost)
+    }
+
+    func removeAll() {
+        cache.removeAllObjects()
+    }
+}
+
+// Shared thumbnail loader used by both grid cards and list rows.
+// Returns the cached image synchronously when present (zero allocation on page
+// flip / scroll-back); otherwise decodes — DB-thumbnail bytes inline, the legacy
+// file fallback downsampled off the main thread via ImageIO — caches the result,
+// and hands it back through `completion` on the main thread.
+//
+// `cacheKey` is the stable pose_id; `thumbnailData` is the DB JPEG (may be nil for
+// legacy rows); `imagePath` is the on-disk fallback source.
+func loadResultThumbnail(
+    cacheKey: String,
+    thumbnailData: Data?,
+    imagePath: String?,
+    // When a deferred-detail merge delivers the authoritative DB thumbnail after the
+    // card already cached a file-fallback thumb, skip the cache READ and re-decode the
+    // DB bytes (still caches the result), so the DB thumbnail wins over the fallback.
+    preferFreshDBThumbnail: Bool = false,
+    completion: @escaping (NSImage) -> Void
+) {
+    if !(preferFreshDBThumbnail && thumbnailData != nil),
+       let cached = ThumbnailCache.shared.image(forKey: cacheKey) {
+        completion(cached)
+        return
+    }
+
+    // Preferred path: decode the small DB thumbnail JPEG once, then cache it.
+    if let thumbnailData = thumbnailData,
+       let preloaded = NSImage(data: thumbnailData) {
+        ThumbnailCache.shared.set(preloaded, forKey: cacheKey)
+        completion(preloaded)
+        return
+    }
+
+    // Fallback (legacy rows without a DB thumbnail): downsample from the file off
+    // the main thread. ImageIO decodes at reduced resolution instead of materializing
+    // the full-size bitmap the way NSImage(contentsOfFile:) + lockFocus did.
+    guard let imagePath = imagePath else { return }
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        guard let thumb = downsampledThumbnail(fromFile: imagePath, maxPixelSize: 400) else { return }
+        ThumbnailCache.shared.set(thumb, forKey: cacheKey)
+        DispatchQueue.main.async {
+            completion(thumb)
+        }
+    }
+}
+
+// Decode a downsampled thumbnail straight from an image file without ever
+// materializing the full-resolution bitmap (CGImageSource thumbnail generation).
+func downsampledThumbnail(fromFile path: String, maxPixelSize: Int) -> NSImage? {
+    let url = URL(fileURLWithPath: path)
+    let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions as CFDictionary) else {
+        return nil
+    }
+    let thumbOptions: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,  // honor EXIF orientation
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+    ]
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+        return nil
+    }
+    return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+}
 
 // MARK: - Skeleton Constants
 // COCO-WholeBody skeleton connections (matches Python src/core/models.py:272)
@@ -455,32 +558,64 @@ struct DropZoneView: View {
 
     private func loadImage(from url: URL) {
         print("[UI DEBUG] loadImage called with: \(url.path)")
-        guard let image = NSImage(contentsOf: url) else {
-            print("[UI DEBUG] Failed to load NSImage from URL")
-            return
+        // Decode the bitmap and read pixel dimensions OFF the main thread. The old path
+        // ran NSImage(contentsOf:) + image.pixelSize (which forces a full tiffRepresentation
+        // decode + uncompressed TIFF allocation) on the main thread, beachballing the UI on
+        // large photo drops/opens. CGImageSource reads the pixel dimensions from metadata
+        // without decoding, and the NSImage display decode is deferred to render time.
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let image = NSImage(contentsOf: url) else {
+                print("[UI DEBUG] Failed to load NSImage from URL")
+                return
+            }
+            // Pixel dimensions, EXIF-orientation-corrected so they match what Python (cv2)
+            // sees — the same contract the old pixelSize helper guaranteed via NSBitmapImageRep.
+            // Fall back to the materialized pixelSize only if metadata is unreadable.
+            let ps = imagePixelSize(at: url) ?? image.pixelSize
+            print("[UI DEBUG] NSImage loaded: size=\(image.size) pixelSize=\(ps)")
+
+            DispatchQueue.main.async {
+                // Store image for display
+                self.viewModel.queryImage = image
+                self.viewModel.queryImageName = url.lastPathComponent
+                self.viewModel.queryImageSize = ps
+
+                // Clear previous detection results
+                self.viewModel.poseDetected = false
+                self.viewModel.detectedPose = nil
+                self.viewModel.extractedFeatures = nil
+                self.viewModel.searchResults = []
+                self.viewModel.detectedKeypoints = nil
+                self.viewModel.detectedPeople = []
+                self.viewModel.selectedPersonIndex = 0
+
+                print("[UI DEBUG] Image loaded - starting immediate multi-person detection")
+
+                // Immediately detect all people in the image
+                self.viewModel.detectAllPeopleInQueryImage()
+            }
         }
-        let ps = image.pixelSize
-        print("[UI DEBUG] NSImage loaded: size=\(image.size) pixelSize=\(ps)")
-
-        // Store image for display
-        viewModel.queryImage = image
-        viewModel.queryImageName = url.lastPathComponent
-        viewModel.queryImageSize = ps
-
-        // Clear previous detection results
-        viewModel.poseDetected = false
-        viewModel.detectedPose = nil
-        viewModel.extractedFeatures = nil
-        viewModel.searchResults = []
-        viewModel.detectedKeypoints = nil
-        viewModel.detectedPeople = []
-        viewModel.selectedPersonIndex = 0
-
-        print("[UI DEBUG] Image loaded - starting immediate multi-person detection")
-
-        // Immediately detect all people in the image
-        viewModel.detectAllPeopleInQueryImage()
     }
+}
+
+// Read pixel dimensions from image-file metadata without decoding the bitmap,
+// applying EXIF orientation so the result matches the post-orientation pixel grid
+// that downstream decoders (cv2 in Python, NSBitmapImageRep here) produce. Returns
+// nil if the file's metadata can't be read.
+func imagePixelSize(at url: URL) -> CGSize? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+          let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+        return nil
+    }
+    // EXIF orientations 5-8 rotate by 90 degrees, so the displayed bitmap swaps W/H
+    // relative to the stored pixel grid.
+    let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+    if orientation >= 5 && orientation <= 8 {
+        return CGSize(width: height, height: width)
+    }
+    return CGSize(width: width, height: height)
 }
 
 // MARK: - Query Image Display View
@@ -1740,11 +1875,16 @@ struct ResultsGridView: View {
         if viewModel.viewMode == .grid {
             LazyVGrid(columns: columns, spacing: 24) {
                 ForEach(Array(viewModel.searchResults.enumerated()), id: \.element.id) { index, result in
+                    // Pass per-card state as plain values + .equatable() so a marquee
+                    // drag / slider tick re-renders only cards whose own inputs changed.
                     ResultCardView(
                         result: result,
                         index: index,
+                        isSelected: viewModel.selectedResultIds.contains(result.id),
+                        thumbnailDisplaySize: viewModel.thumbnailSize,
                         viewModel: viewModel
                     )
+                    .equatable()
                     .background(resultFrameReader(for: result.id))
                 }
             }
@@ -1754,8 +1894,11 @@ struct ResultsGridView: View {
                     ResultListItemView(
                         result: result,
                         index: index,
+                        isSelected: viewModel.selectedResultIds.contains(result.id),
+                        thumbnailDisplaySize: min(viewModel.thumbnailSize * 0.6, 80),
                         viewModel: viewModel
                     )
+                    .equatable()
                     .background(resultFrameReader(for: result.id))
                 }
             }
@@ -1933,19 +2076,42 @@ struct ResultContextMenu: View {
 }
 
 // MARK: - Result Card View
-struct ResultCardView: View {
+// `Equatable` + `.equatable()` at the call site is load-bearing: the parent
+// ResultsGridView observes the whole view model, so a marquee drag or thumbnail-size
+// slider tick re-evaluates the ForEach body for every visible card. By taking the
+// per-card state (isSelected, thumbnailSize) as plain VALUES and holding the view
+// model only as a non-observed reference for action callbacks, SwiftUI uses our `==`
+// to skip cards whose own inputs did not change — so rubber-band selection and the
+// size slider re-render O(changed cards), not O(all visible cards + their Canvases).
+struct ResultCardView: View, Equatable {
     let result: SearchResult
     let index: Int
-    @ObservedObject var viewModel: PostureKitViewModel
+    let isSelected: Bool
+    let thumbnailDisplaySize: CGFloat
+    // Non-observed: action callbacks need the view model, but the card must NOT
+    // subscribe to its objectWillChange or every @Published mutation re-renders it.
+    let viewModel: PostureKitViewModel
     @State private var isHovered = false
     @State private var thumbnail: NSImage?
 
-    private var isSelected: Bool {
-        viewModel.selectedResultIds.contains(result.id)
-    }
-
-    private var thumbnailDisplaySize: CGFloat {
-        viewModel.thumbnailSize
+    // Only the inputs that affect this card's rendering participate in equality.
+    // result.id is stable per pose; selection and size are the per-event mutations.
+    // We also compare the in-place-mutable display fields (filename/path on a move,
+    // thumbnail/keypoints/regions on a deferred-detail merge) so those updates still
+    // re-render the card — using cheap presence/count proxies for the heavy fields
+    // (they only ever transition nil/empty -> populated once, so presence suffices).
+    // Marquee drags and slider ticks never touch these fields, so they stay equal and
+    // the card is skipped exactly as intended.
+    static func == (lhs: ResultCardView, rhs: ResultCardView) -> Bool {
+        lhs.result.id == rhs.result.id
+            && lhs.index == rhs.index
+            && lhs.isSelected == rhs.isSelected
+            && lhs.thumbnailDisplaySize == rhs.thumbnailDisplaySize
+            && lhs.result.filename == rhs.result.filename
+            && lhs.result.imagePath == rhs.result.imagePath
+            && (lhs.result.thumbnailData == nil) == (rhs.result.thumbnailData == nil)
+            && lhs.result.keypoints?.count == rhs.result.keypoints?.count
+            && lhs.result.visibleRegionsDetailed?.count == rhs.result.visibleRegionsDetailed?.count
     }
 
     private var matchTier: MatchTier {
@@ -2181,48 +2347,32 @@ struct ResultCardView: View {
         .onAppear {
             loadThumbnail()
         }
+        // Deferred-detail merges populate thumbnailData after first appearance (and a
+        // move rewrites imagePath); onAppear won't re-fire for a reused row, so reload
+        // the thumbnail explicitly when its source changes.
+        .onChange(of: result.thumbnailData) {
+            thumbnail = nil
+            loadThumbnail(preferFreshDBThumbnail: true)
+        }
+        .onChange(of: result.imagePath) {
+            if result.thumbnailData == nil {
+                thumbnail = nil
+                loadThumbnail()
+            }
+        }
     }
 
-    private func loadThumbnail() {
-        // Use pre-loaded thumbnail from database if available
-        if let thumbnailData = result.thumbnailData,
-           let preloadedThumbnail = NSImage(data: thumbnailData) {
-            self.thumbnail = preloadedThumbnail
-            return
-        }
-
-        // Fallback: Load from file if thumbnail not in database (legacy support)
-        guard let imagePath = result.imagePath else { return }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let image = NSImage(contentsOfFile: imagePath) else { return }
-
-            // Create thumbnail
-            let thumbnailSize = NSSize(width: 200, height: 200)
-            let thumb = NSImage(size: thumbnailSize)
-
-            thumb.lockFocus()
-            let aspectRatio = image.size.width / image.size.height
-            let targetRect: NSRect
-
-            if aspectRatio > 1 {
-                let height = thumbnailSize.height
-                let width = height * aspectRatio
-                let x = (thumbnailSize.width - width) / 2
-                targetRect = NSRect(x: x, y: 0, width: width, height: height)
-            } else {
-                let width = thumbnailSize.width
-                let height = width / aspectRatio
-                let y = (thumbnailSize.height - height) / 2
-                targetRect = NSRect(x: 0, y: y, width: width, height: height)
-            }
-
-            image.draw(in: targetRect)
-            thumb.unlockFocus()
-
-            DispatchQueue.main.async {
-                self.thumbnail = thumb
-            }
+    private func loadThumbnail(preferFreshDBThumbnail: Bool = false) {
+        // Shared cache + downsampled fallback; returns instantly on cache hit
+        // (page flips / scroll-back become allocation-free for seen thumbnails).
+        if thumbnail != nil { return }
+        loadResultThumbnail(
+            cacheKey: result.id,
+            thumbnailData: result.thumbnailData,
+            imagePath: result.imagePath,
+            preferFreshDBThumbnail: preferFreshDBThumbnail
+        ) { image in
+            self.thumbnail = image
         }
     }
 
@@ -2249,19 +2399,25 @@ struct ResultCardView: View {
 }
 
 // MARK: - Result List Item View
-struct ResultListItemView: View {
+struct ResultListItemView: View, Equatable {
     let result: SearchResult
     let index: Int
-    @ObservedObject var viewModel: PostureKitViewModel
+    let isSelected: Bool
+    let thumbnailDisplaySize: CGFloat
+    // Non-observed: see ResultCardView for why the card must not subscribe to the
+    // view model's objectWillChange.
+    let viewModel: PostureKitViewModel
     @State private var isHovered = false
     @State private var thumbnail: NSImage?
 
-    private var isSelected: Bool {
-        viewModel.selectedResultIds.contains(result.id)
-    }
-
-    private var thumbnailDisplaySize: CGFloat {
-        min(viewModel.thumbnailSize * 0.6, 80)
+    static func == (lhs: ResultListItemView, rhs: ResultListItemView) -> Bool {
+        lhs.result.id == rhs.result.id
+            && lhs.index == rhs.index
+            && lhs.isSelected == rhs.isSelected
+            && lhs.thumbnailDisplaySize == rhs.thumbnailDisplaySize
+            && lhs.result.filename == rhs.result.filename
+            && lhs.result.imagePath == rhs.result.imagePath
+            && (lhs.result.thumbnailData == nil) == (rhs.result.thumbnailData == nil)
     }
 
     var body: some View {
@@ -2379,47 +2535,27 @@ struct ResultListItemView: View {
         .onAppear {
             loadThumbnail()
         }
+        .onChange(of: result.thumbnailData) {
+            thumbnail = nil
+            loadThumbnail(preferFreshDBThumbnail: true)
+        }
+        .onChange(of: result.imagePath) {
+            if result.thumbnailData == nil {
+                thumbnail = nil
+                loadThumbnail()
+            }
+        }
     }
 
-    private func loadThumbnail() {
-        // Use pre-loaded thumbnail from database if available
-        if let thumbnailData = result.thumbnailData,
-           let preloadedThumbnail = NSImage(data: thumbnailData) {
-            self.thumbnail = preloadedThumbnail
-            return
-        }
-
-        // Fallback: Load from file if thumbnail not in database (legacy support)
-        guard let imagePath = result.imagePath else { return }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let image = NSImage(contentsOfFile: imagePath) else { return }
-
-            let thumbnailSize = NSSize(width: 200, height: 200)
-            let thumb = NSImage(size: thumbnailSize)
-
-            thumb.lockFocus()
-            let aspectRatio = image.size.width / image.size.height
-            let targetRect: NSRect
-
-            if aspectRatio > 1 {
-                let height = thumbnailSize.height
-                let width = height * aspectRatio
-                let x = (thumbnailSize.width - width) / 2
-                targetRect = NSRect(x: x, y: 0, width: width, height: height)
-            } else {
-                let width = thumbnailSize.width
-                let height = width / aspectRatio
-                let y = (thumbnailSize.height - height) / 2
-                targetRect = NSRect(x: 0, y: y, width: width, height: height)
-            }
-
-            image.draw(in: targetRect)
-            thumb.unlockFocus()
-
-            DispatchQueue.main.async {
-                self.thumbnail = thumb
-            }
+    private func loadThumbnail(preferFreshDBThumbnail: Bool = false) {
+        if thumbnail != nil { return }
+        loadResultThumbnail(
+            cacheKey: result.id,
+            thumbnailData: result.thumbnailData,
+            imagePath: result.imagePath,
+            preferFreshDBThumbnail: preferFreshDBThumbnail
+        ) { image in
+            self.thumbnail = image
         }
     }
 

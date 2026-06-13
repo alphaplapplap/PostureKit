@@ -26,6 +26,38 @@ class DimensionMismatchError(Exception):
     pass
 
 
+# COCO keypoint sigmas (κ values) for the 17 body joints, based on COCO annotation
+# uncertainty statistics; indexed by RTMW keypoint positions (first 17 match COCO).
+# Hoisted to module level (finding 3) so the vectorized OKS re-rank no longer rebuilds
+# this 133-element array on every per-candidate call.
+_COCO_SIGMAS = np.array([
+    0.026,  # 0: nose
+    0.025,  # 1: left_eye
+    0.025,  # 2: right_eye
+    0.035,  # 3: left_ear
+    0.035,  # 4: right_ear
+    0.079,  # 5: left_shoulder
+    0.079,  # 6: right_shoulder
+    0.072,  # 7: left_elbow
+    0.072,  # 8: right_elbow
+    0.062,  # 9: left_wrist
+    0.062,  # 10: right_wrist
+    0.107,  # 11: left_hip
+    0.107,  # 12: right_hip
+    0.087,  # 13: left_knee
+    0.087,  # 14: right_knee
+    0.089,  # 15: left_ankle
+    0.089,  # 16: right_ankle
+], dtype=np.float32)
+
+# Extend sigmas for remaining RTMW keypoints (17-132): moderate value for
+# hand/face/foot keypoints. Full (133,) sigma vector reused across all OKS calls.
+_EXTENDED_SIGMAS = np.concatenate([
+    _COCO_SIGMAS,
+    np.full(116, 0.05, dtype=np.float32),
+])
+
+
 class SimilarityEngine:
     """FAISS-powered similarity search for pose features."""
 
@@ -828,14 +860,91 @@ class SimilarityEngine:
                 self._evict_cache_entry(cache_key)
                 logger.debug(f"Search cache expired ({cache_age:.1f}s)")
 
+        # Phase 1: FAISS scan + confidence/OKS re-rank + base-similarity shortlist (no DB
+        # hydration). Extracted so search_with_flip can score each leg cheaply and merge
+        # before a single hydration pass (finding 5).
+        candidates, valid_dimensions_map, oks_similarity_map = self._score_candidates(
+            feature_vector,
+            query_confidence=query_confidence,
+            k=k,
+            min_feature_confidence=min_feature_confidence,
+            min_valid_overlap=min_valid_overlap,
+            required_regions=required_regions,
+            min_similarity=min_similarity,
+            query_keypoints=query_keypoints,
+            query_bbox=query_bbox,
+        )
+
+        # Phase 2/3: hydrate the shortlist once (shared with search_with_flip — finding 5).
+        results = self._hydrate_candidates(
+            candidates,
+            k=k,
+            min_confidence=min_confidence,
+            deduplicate_images=deduplicate_images,
+            required_regions=required_regions,
+            min_region_confidence=min_region_confidence,
+            min_similarity=min_similarity,
+            exclude_pose_id=exclude_pose_id,
+            valid_dimensions_map=valid_dimensions_map,
+            oks_similarity_map=oks_similarity_map,
+        )
+
+        # Thread-safe cache store and eviction (count- AND byte-bounded — finding 4)
+        with self._cache_lock:
+            if cache_key in self._search_cache:
+                # Overwrite: drop the old entry's byte contribution first.
+                self._evict_cache_entry(cache_key)
+            approx_bytes = self._estimate_results_bytes(results)
+            self._search_cache[cache_key] = (results, time.time(), approx_bytes)
+            self._search_cache_bytes += approx_bytes
+
+            # Evict oldest entries until BOTH the count and byte budgets are satisfied. A single
+            # large threshold-mode result set (thumbnails for thousands of poses) could otherwise
+            # pin gigabytes; the byte bound caps total cache footprint regardless of query count.
+            while self._search_cache and (
+                len(self._search_cache) > self._search_cache_max_size
+                or self._search_cache_bytes > self._search_cache_max_bytes
+            ):
+                oldest_key = next(iter(self._search_cache))
+                if oldest_key == cache_key:
+                    break  # never evict the entry we just inserted
+                self._evict_cache_entry(oldest_key)
+                logger.debug("Evicted oldest search cache entry (count/byte budget)")
+
+        return results
+
+    def _score_candidates(
+        self,
+        feature_vector: np.ndarray,
+        query_confidence: Optional[np.ndarray],
+        k: int,
+        min_feature_confidence: float,
+        min_valid_overlap: int,
+        required_regions: Optional[List[str]],
+        min_similarity: float,
+        query_keypoints: Optional[np.ndarray],
+        query_bbox: Optional[np.ndarray],
+    ) -> Tuple[List[tuple], Dict, Dict]:
+        """Phase 1: FAISS scan + confidence-aware/OKS re-rank + base-similarity shortlist.
+
+        Returns (candidates, valid_dimensions_map, oks_similarity_map) WITHOUT touching the
+        result cache or hydrating metadata/thumbnails. Extracted from search_by_feature so a
+        flip search can score the direct and flipped legs cheaply, merge by pose, then hydrate
+        once (finding 5).
+
+        candidates is the ordered shortlist of (faiss_idx, distance, pose_id(UUID),
+        base_similarity), sorted nearest-first. Returns an empty list for an absent/empty index
+        or when the confidence re-rank yields nothing (caller then produces []); raises
+        DimensionMismatchError on a dimension mismatch, exactly as before.
+        """
         with self._index_lock:  # Thread-safe search
             if self.index is None:
                 logger.error("Index not built. Call build_index() first.")
-                return []
+                return [], {}, {}
 
             if self.index.ntotal == 0:
                 logger.warning("Index is empty")
-                return []
+                return [], {}, {}
 
             # Ensure feature vector is correct shape and type
             query = np.array(feature_vector, dtype=np.float32).reshape(1, -1)
@@ -884,7 +993,7 @@ class SimilarityEngine:
                     min_valid_overlap,
                 )
             if faiss_idx_array.size == 0:
-                return []
+                return [], {}, {}
             indices = faiss_idx_array.reshape(1, -1)
             distances = distances_array.reshape(1, -1)
 
@@ -978,20 +1087,14 @@ class SimilarityEngine:
                 oks_similarity_map = {c['pose_id']: c['oks_similarity'] for c in oks_reranked}
                 oks_active = True
 
-        # Build results with database metadata.
+        # Build the candidate shortlist.
         #
-        # Two-phase to avoid one DB round-trip per candidate (the old hot loop issued a query
-        # per pose, which is what made large / "All" searches take ~90s):
-        #   Phase 1: trim candidates cheaply by base similarity (derived from distance, no DB).
-        #   Phase 2: bulk-fetch poses/images/features and body parts for the survivors in a
-        #            couple of chunked queries, then iterate in memory applying the same
-        #            filters plus the min_similarity floor.
-        from src.config.settings import settings
-
-        # A candidate can only reach final_similarity >= min_similarity if its base similarity
-        # (pre-plausibility) is >= min_similarity / max_boost. plausibility_score <= 1.0, so the
-        # boost is bounded; use that bound to stop scanning once distances grow too large
-        # (candidates are already sorted nearest-first by L2 / masked / OKS distance).
+        # Phase 1 trims candidates cheaply by base similarity (derived from distance, no DB);
+        # the caller's Phase 2/3 then bulk-fetches survivors. A candidate can only reach
+        # final_similarity >= min_similarity if its base similarity (pre-plausibility) is
+        # >= min_similarity / max_boost. plausibility_score <= 1.0, so the boost is bounded; use
+        # that bound to stop scanning once distances grow too large (candidates are already
+        # sorted nearest-first by L2 / masked / OKS distance).
         if settings.ENABLE_PLAUSIBILITY_SCORING:
             max_boost = 0.8 + 0.2 * settings.PLAUSIBILITY_WEIGHT
         else:
@@ -1003,8 +1106,6 @@ class SimilarityEngine:
         # dropouts. In threshold mode the base-similarity early-stop bounds the shortlist instead.
         result_fetch_cap = None if min_similarity > 0.0 else max(k * 2, 200)
 
-        # Phase 1: ordered candidate shortlist (faiss_idx, distance, pose_id, base_similarity)
-        #
         # The floor early-stop assumes candidates are sorted similarity-descending. That holds
         # for the OKS / confidence-masked / plain paths (all distance-ascending). It does NOT
         # hold when finding-39 fallback candidates are present: they are demoted to a second
@@ -1044,7 +1145,41 @@ class SimilarityEngine:
             if result_fetch_cap is not None and len(candidates) >= result_fetch_cap:
                 break
 
-        results = []
+        return candidates, valid_dimensions_map, oks_similarity_map
+
+    def _hydrate_candidates(
+        self,
+        candidates: List[tuple],
+        k: int,
+        min_confidence: float,
+        deduplicate_images: bool,
+        required_regions: Optional[List[str]],
+        min_region_confidence: float,
+        min_similarity: float,
+        exclude_pose_id: Optional[str],
+        valid_dimensions_map: Dict,
+        oks_similarity_map: Dict,
+        flip_flags: Optional[Dict[str, bool]] = None,
+    ) -> List[Dict]:
+        """Phase 2/3: bulk-fetch metadata + thumbnails for a candidate shortlist, filter,
+        score, dedupe-by-image, and rank.
+
+        Extracted from search_by_feature so search_with_flip can hydrate the MERGED
+        direct+flipped shortlist exactly ONCE instead of running two full Phase 2/3 passes
+        (two full thumbnail fetches) and discarding the overlap (finding 5).
+
+        Args:
+            candidates: ordered shortlist of (faiss_idx, distance, pose_id(UUID), base_similarity),
+                sorted nearest-first. The k-cap during iteration assumes this ordering.
+            flip_flags: optional {pose_id_str: is_flipped} — when provided, each result dict
+                gets an 'is_flipped_match' key (flip-search merge semantics). Poses absent from
+                the map default to False.
+
+        Returns the ranked result list (best-first), identical in shape to search_by_feature's.
+        """
+        from src.config.settings import settings
+
+        results: List[Dict] = []
 
         # Excluded folders filter (already-indexed images vanish from results without a
         # re-index). MUST be loaded before the Phase 2 session opens: get_excluded_folders
@@ -1215,6 +1350,10 @@ class SimilarityEngine:
                     if pose_id in oks_similarity_map:
                         result_dict['oks_similarity'] = oks_similarity_map[pose_id]
 
+                    # Flip-search: mark which orientation won this pose (finding 5).
+                    if flip_flags is not None:
+                        result_dict['is_flipped_match'] = bool(flip_flags.get(str(pose_id), False))
+
                     results.append(result_dict)
 
                     # Stop once we have enough results (k is large in threshold mode)
@@ -1229,28 +1368,6 @@ class SimilarityEngine:
         results.sort(key=lambda r: r['similarity_score'], reverse=True)
         for rank, result_dict in enumerate(results, 1):
             result_dict['rank'] = rank
-
-        # Thread-safe cache store and eviction (count- AND byte-bounded — finding 4)
-        with self._cache_lock:
-            if cache_key in self._search_cache:
-                # Overwrite: drop the old entry's byte contribution first.
-                self._evict_cache_entry(cache_key)
-            approx_bytes = self._estimate_results_bytes(results)
-            self._search_cache[cache_key] = (results, time.time(), approx_bytes)
-            self._search_cache_bytes += approx_bytes
-
-            # Evict oldest entries until BOTH the count and byte budgets are satisfied. A single
-            # large threshold-mode result set (thumbnails for thousands of poses) could otherwise
-            # pin gigabytes; the byte bound caps total cache footprint regardless of query count.
-            while self._search_cache and (
-                len(self._search_cache) > self._search_cache_max_size
-                or self._search_cache_bytes > self._search_cache_max_bytes
-            ):
-                oldest_key = next(iter(self._search_cache))
-                if oldest_key == cache_key:
-                    break  # never evict the entry we just inserted
-                self._evict_cache_entry(oldest_key)
-                logger.debug("Evicted oldest search cache entry (count/byte budget)")
 
         return results
 
@@ -1799,35 +1916,8 @@ class SimilarityEngine:
             # Fall back to standard L2 distance
             return (float('inf'), 0.0)
 
-        # COCO keypoint sigmas (κ values) for major joints
-        # Based on COCO annotation uncertainty statistics
-        # Indexed by RTMW keypoint positions (first 17 match COCO)
-        COCO_SIGMAS = np.array([
-            0.026,  # 0: nose
-            0.025,  # 1: left_eye
-            0.025,  # 2: right_eye
-            0.035,  # 3: left_ear
-            0.035,  # 4: right_ear
-            0.079,  # 5: left_shoulder
-            0.079,  # 6: right_shoulder
-            0.072,  # 7: left_elbow
-            0.072,  # 8: right_elbow
-            0.062,  # 9: left_wrist
-            0.062,  # 10: right_wrist
-            0.107,  # 11: left_hip
-            0.107,  # 12: right_hip
-            0.087,  # 13: left_knee
-            0.087,  # 14: right_knee
-            0.089,  # 15: left_ankle
-            0.089,  # 16: right_ankle
-        ], dtype=np.float32)
-
-        # Extend sigmas for remaining RTMW keypoints (17-132)
-        # Use moderate values for hand/face/foot keypoints
-        extended_sigmas = np.concatenate([
-            COCO_SIGMAS,  # First 17 (COCO body keypoints)
-            np.full(116, 0.05, dtype=np.float32)  # Remaining 116 keypoints (hands, face, feet)
-        ])
+        # Module-level sigma vectors (hoisted, finding 3): no per-call rebuild.
+        extended_sigmas = _EXTENDED_SIGMAS
 
         # Canonicalize both poses into their own bbox frames (translate by bbox origin,
         # scale by own sqrt(area)). COCO's OKS compares detections within ONE image, where
@@ -1842,35 +1932,35 @@ class SimilarityEngine:
         query_scale = float(np.sqrt(query_area))
         candidate_scale = float(np.sqrt(candidate_area))
 
-        # Compute OKS
-        oks_sum = 0.0
-        valid_count = 0
+        # Vectorized OKS (finding 3): the old scalar 'for i in range(...)' loop over up to
+        # 133 keypoints (with per-keypoint np.exp) is replaced by one masked array pass.
+        # Numerically identical to the scalar version to ~1e-8 (only float summation order
+        # differs); ranking and the inf/zero-valid fallbacks are preserved exactly.
+        n = min(len(query_keypoints), len(candidate_keypoints), len(extended_sigmas))
+        q = np.asarray(query_keypoints[:n], dtype=np.float32)
+        c = np.asarray(candidate_keypoints[:n], dtype=np.float32)
+        sig = extended_sigmas[:n]
 
-        for i in range(min(len(query_keypoints), len(candidate_keypoints), len(extended_sigmas))):
-            # Check if both keypoints are valid
-            query_conf = query_keypoints[i, 2]
-            cand_conf = candidate_keypoints[i, 2]
-
-            if query_conf >= min_confidence and cand_conf >= min_confidence:
-                # Euclidean distance in canonical (bbox-relative, scale-normalized) space
-                qx = (query_keypoints[i, 0] - query_bbox[0]) / query_scale
-                qy = (query_keypoints[i, 1] - query_bbox[1]) / query_scale
-                cx = (candidate_keypoints[i, 0] - candidate_bbox[0]) / candidate_scale
-                cy = (candidate_keypoints[i, 1] - candidate_bbox[1]) / candidate_scale
-                dx = qx - cx
-                dy = qy - cy
-                d_squared = dx * dx + dy * dy
-
-                # OKS contribution: exp(-d²/(2κ²)) — s = 1 in canonical space
-                sigma = extended_sigmas[i]
-                denominator = 2.0 * sigma * sigma
-                oks_contribution = np.exp(-d_squared / denominator)
-
-                oks_sum += oks_contribution
-                valid_count += 1
+        valid_mask = (q[:, 2] >= min_confidence) & (c[:, 2] >= min_confidence)
+        valid_count = int(np.count_nonzero(valid_mask))
 
         if valid_count == 0:
             return (float('inf'), 0.0)
+
+        # Distances in canonical (bbox-relative, scale-normalized) space.
+        qx = (q[:, 0] - query_bbox[0]) / query_scale
+        qy = (q[:, 1] - query_bbox[1]) / query_scale
+        cx = (c[:, 0] - candidate_bbox[0]) / candidate_scale
+        cy = (c[:, 1] - candidate_bbox[1]) / candidate_scale
+        dx = qx - cx
+        dy = qy - cy
+        d_squared = dx * dx + dy * dy
+
+        # OKS contribution: exp(-d²/(2κ²)) — s = 1 in canonical space. Only valid keypoints
+        # contribute; masking the contributions to 0 reproduces the scalar loop's running sum.
+        denominator = 2.0 * sig * sig
+        oks_contributions = np.exp(-d_squared / denominator) * valid_mask
+        oks_sum = float(oks_contributions.sum())
 
         # Average OKS across valid keypoints
         oks_similarity = float(oks_sum / valid_count)
@@ -1973,15 +2063,35 @@ class SimilarityEngine:
         search_kwargs = {kw: v for kw, v in search_kwargs.items()
                          if kw not in ('query_keypoints', 'query_bbox')}
 
-        # Search with normal orientation.
+        # Each leg is SCORED (cheap Phase 1: FAISS scan + re-rank + base-similarity shortlist)
+        # but NOT hydrated. The direct and flipped shortlists are merged by pose, then a SINGLE
+        # Phase 2/3 pass fetches metadata + thumbnails for the merged survivors — instead of the
+        # old design that ran the full pipeline (two full thumbnail fetches) twice and discarded
+        # the heavy overlap (finding 5).
+        #
         # In threshold mode (min_similarity > 0) the caller wants every match above the floor,
-        # so each sub-search must use the full k rather than the fixed merge-top-k.
-        k_per_search = k if search_kwargs.get('min_similarity', 0.0) > 0.0 else settings.FLIP_SEARCH_MERGE_TOP_K
-        normal_results = self.search_by_feature(
+        # so each leg must score with the full k rather than the fixed merge-top-k.
+        threshold_mode = search_kwargs.get('min_similarity', 0.0) > 0.0
+        k_per_search = k if threshold_mode else settings.FLIP_SEARCH_MERGE_TOP_K
+
+        # Args that _score_candidates accepts (Phase-1 only; hydration-time filters like
+        # deduplicate_images / min_confidence / required-region presence are applied once in the
+        # shared hydration pass, exactly as the unified search_by_feature path does).
+        score_kwargs = dict(
+            min_feature_confidence=search_kwargs.get('min_feature_confidence', 0.35),
+            min_valid_overlap=search_kwargs.get('min_valid_overlap', 12),
+            required_regions=search_kwargs.get('required_regions'),
+            min_similarity=search_kwargs.get('min_similarity', 0.0),
+            query_keypoints=None,  # OKS already stripped above
+            query_bbox=None,
+        )
+
+        # Score the direct (normal) leg.
+        direct_cands, direct_vdm, _direct_oks = self._score_candidates(
             feature_vector,
             query_confidence=query_confidence,
             k=k_per_search,
-            **search_kwargs
+            **score_kwargs
         )
 
         # Flip keypoints and re-extract features
@@ -1993,8 +2103,21 @@ class SimilarityEngine:
         from src.core.geometric_feature_extractor import GeometricFeatureExtractor
         from src.core.pose_detector import PoseResult
 
-        flipped_vis = np.where(flipped_keypoints[:, 2] >= 0.3, 2, 0).astype(np.int64)
-        confident = flipped_keypoints[flipped_keypoints[:, 2] >= 0.3]
+        # Visibility MUST be derived with the SAME confidence→COCO mapping the direct/stored
+        # path uses (pose_detector.py: conf>=0.5 → 2 visible, 0.1<=conf<0.5 → 1 occluded,
+        # conf<0.1 → 0 missing). The old np.where(conf>=0.3, 2, 0) forced every confident
+        # keypoint to visible=2, giving it full trust in the extractor's linear vis-trust
+        # curve (vis_trust = (vis/2)**1.0) and bypassing the halving that occluded (vis=1)
+        # keypoints get on the direct/stored side — which skewed flipped vs direct scores
+        # for occluded queries (finding 20). Mirroring the detector's mapping makes the
+        # flipped pose's feature_confidence comparable to stored candidates'.
+        flipped_conf = flipped_keypoints[:, 2]
+        flipped_vis = np.zeros(len(flipped_keypoints), dtype=np.int64)
+        flipped_vis[(flipped_conf >= 0.1) & (flipped_conf < 0.5)] = 1  # occluded
+        flipped_vis[flipped_conf >= 0.5] = 2  # visible
+        # Bbox is still derived from keypoints the extractor will actually use (vis >= 1.0,
+        # i.e. confidence >= 0.1, matching the extractor's use_occluded_keypoints policy).
+        confident = flipped_keypoints[flipped_conf >= 0.1]
         if confident.shape[0] >= 2:
             x_min, y_min = confident[:, 0].min(), confident[:, 1].min()
             flipped_bbox = np.array([
@@ -2018,53 +2141,74 @@ class SimilarityEngine:
         )
         flipped_features = extractor.extract(flipped_pose)
 
-        # Search with flipped orientation. The confidence vector must be the
-        # flipped pose's own — the extractor just computed it from the mirrored
-        # keypoints, so its left/right dims are already swapped to match the
-        # flipped feature vector. Reusing the unflipped query_confidence masked
-        # exactly the wrong side for asymmetrically occluded queries.
-        flipped_results = self.search_by_feature(
+        # Score the flipped leg. The confidence vector must be the flipped pose's own — the
+        # extractor just computed it from the mirrored keypoints, so its left/right dims are
+        # already swapped to match the flipped feature vector. Reusing the unflipped
+        # query_confidence masked exactly the wrong side for asymmetrically occluded queries.
+        flip_cands, flip_vdm, _flip_oks = self._score_candidates(
             flipped_features.feature_vector,
             query_confidence=(
                 flipped_features.feature_confidence
                 if query_confidence is not None else None
             ),
             k=k_per_search,
-            **search_kwargs
+            **score_kwargs
         )
 
-        # Merge results and mark flipped matches
-        # Use pose_id to deduplicate (a pose can appear in both searches)
-        merged = {}
+        # Merge the two shortlists by pose, keeping the better (smaller distance) orientation.
+        # OKS is stripped for flip search, so both legs score on the same L2 / masked-L2 scale,
+        # and the plausibility boost is per-pose and orientation-independent — so keeping the
+        # smaller distance reproduces the old "keep the higher final similarity_score" merge
+        # exactly, without hydrating both legs first.
+        #
+        # merged: pose_id_str -> (faiss_idx, distance, pose_id(UUID), base_similarity)
+        merged: Dict[str, tuple] = {}
+        flip_flags: Dict[str, bool] = {}
+        merged_vdm: Dict[Any, int] = {}
 
-        for result in normal_results:
-            pose_id = result['pose_id']
-            result['is_flipped_match'] = False
-            merged[pose_id] = result
+        for cand in direct_cands:
+            pid_str = str(cand[2])
+            merged[pid_str] = cand
+            flip_flags[pid_str] = False
+            if cand[2] in direct_vdm:
+                merged_vdm[cand[2]] = direct_vdm[cand[2]]
 
-        for result in flipped_results:
-            pose_id = result['pose_id']
-            if pose_id not in merged:
-                result['is_flipped_match'] = True
-                merged[pose_id] = result
-            else:
-                # Pose appears in both → keep better match. Compare final similarity, not
-                # distance — the plausibility boost makes score non-monotonic in distance.
-                if result['similarity_score'] > merged[pose_id]['similarity_score']:
-                    result['is_flipped_match'] = True
-                    merged[pose_id] = result
+        for cand in flip_cands:
+            pid_str = str(cand[2])
+            existing = merged.get(pid_str)
+            # Smaller distance (cand[1]) wins. Strict '<' so a tie keeps the direct leg,
+            # matching the old strict '>' on similarity (direct inserted first, only replaced
+            # when the flipped score was strictly greater).
+            if existing is None or cand[1] < existing[1]:
+                merged[pid_str] = cand
+                flip_flags[pid_str] = True
+                if cand[2] in flip_vdm:
+                    merged_vdm[cand[2]] = flip_vdm[cand[2]]
+                elif cand[2] in merged_vdm:
+                    del merged_vdm[cand[2]]
 
-        # Sort by final similarity score (descending) and return top k
-        final_results = sorted(
-            merged.values(),
-            key=lambda x: x['similarity_score'],
-            reverse=True
-        )[:k]
+        # Hydrate the merged shortlist ONCE, nearest-first so the top-k cap (non-threshold mode)
+        # keeps the best across both orientations. The fallback-tier offset is baked into the
+        # distances, so distance-ascending sorts sufficient-overlap candidates ahead of fallbacks.
+        merged_candidates = sorted(merged.values(), key=lambda c: c[1])
 
-        # Re-assign ranks
-        for rank, result in enumerate(final_results, 1):
-            result['rank'] = rank
+        final_results = self._hydrate_candidates(
+            merged_candidates,
+            k=k,
+            min_confidence=search_kwargs.get('min_confidence', 0.0),
+            deduplicate_images=search_kwargs.get('deduplicate_images', True),
+            required_regions=search_kwargs.get('required_regions'),
+            min_region_confidence=search_kwargs.get('min_region_confidence', 0.3),
+            min_similarity=search_kwargs.get('min_similarity', 0.0),
+            exclude_pose_id=search_kwargs.get('exclude_pose_id'),
+            valid_dimensions_map=merged_vdm,
+            oks_similarity_map={},
+            flip_flags=flip_flags,
+        )
 
-        logger.info(f"Flip search: {len(normal_results)} normal + {len(flipped_results)} flipped → {len(final_results)} unique")
+        logger.info(
+            f"Flip search: {len(direct_cands)} direct + {len(flip_cands)} flipped candidates "
+            f"→ {len(merged_candidates)} merged → {len(final_results)} hydrated"
+        )
 
         return final_results
