@@ -961,13 +961,13 @@ struct SearchParametersView: View {
                                 .font(.system(size: 13))
                                 .foregroundColor(.gray)
                             Spacer()
-                            Text("\(Int(viewModel.minValidOverlap))/52")
+                            Text("\(Int(viewModel.minValidOverlap))/66")
                                 .font(.system(size: 13, weight: .semibold))
                                 .foregroundColor(.blue)
                                 .fontDesign(.monospaced)
                         }
-                        Slider(value: $viewModel.minValidOverlap, in: 0...52, step: 1)
-                        Text("Higher = more pose features must match. 12/52 (23%) default. Increase to reduce false positives.")
+                        Slider(value: $viewModel.minValidOverlap, in: 0...66, step: 1)
+                        Text("Higher = more pose features must match. 15/66 (23%) default. Increase to reduce false positives.")
                             .font(.system(size: 11))
                             .foregroundColor(.gray.opacity(0.7))
                     }

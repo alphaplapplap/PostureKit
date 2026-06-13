@@ -135,7 +135,7 @@ class PostureKitViewModel: ObservableObject {
     @Published var minFeatureConfidence: Double = UserDefaults.standard.object(forKey: "search.minFeatureConfidence") as? Double ?? 0.35 {
         didSet { UserDefaults.standard.set(minFeatureConfidence, forKey: "search.minFeatureConfidence") }
     }
-    @Published var minValidOverlap: Double = UserDefaults.standard.object(forKey: "search.minValidOverlap") as? Double ?? 12.0 {
+    @Published var minValidOverlap: Double = UserDefaults.standard.object(forKey: "search.minValidOverlap") as? Double ?? 15.0 {
         didSet { UserDefaults.standard.set(minValidOverlap, forKey: "search.minValidOverlap") }
     }
     @Published var showMultiplePeoplePerImage: Bool = UserDefaults.standard.bool(forKey: "search.showMultiplePeoplePerImage") {
@@ -958,7 +958,7 @@ class PostureKitViewModel: ObservableObject {
                 print("[SEARCH DEBUG] Query features:")
                 print("  - Total features: \(confidence.count)")
                 print("  - Mean confidence: \(String(format: "%.2f", meanConfidence))")
-                print("  - Valid features (≥\(Int(self.minFeatureConfidence * 100))%): \(validFeatures)/52")
+                print("  - Valid features (≥\(Int(self.minFeatureConfidence * 100))%): \(validFeatures)/66")
                 print("  - Meets overlap threshold: \(validOverlapMet ? "YES" : "NO (need \(Int(self.minValidOverlap)), have \(validFeatures))")")
             } else {
                 validFeatures = 0
