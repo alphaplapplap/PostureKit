@@ -256,12 +256,24 @@ class Settings:
     # Visual-feature rerank (two-stage geometric → visual blend)
     # ========================================================================
     # OPTIONAL second-stage rerank: after the geometric pass, bulk-fetch stored 576-dim
-    # MobileNetV3 visual embeddings for the top candidates and blend calibrated geometric +
-    # cosine-visual scores: final = (1 - w)·geo + w·cos_vis. Default OFF (w forced to 0 below)
-    # so behavior is unchanged until Wave 4 backfills visual features and tunes the weight.
-    # When a candidate has no stored visual embedding it falls back to its geometric score.
+    # MobileNetV3 visual embeddings for the top VISUAL_RERANK_CANDIDATES and blend with the
+    # geometric score: final = (1 - w)·geo + w·(cos+1)/2. Candidates with no stored embedding
+    # keep their geometric score. Currently active only on the search_by_pose_id path (it
+    # auto-supplies the query pose's own embedding); the query-image path needs the Swift side
+    # to pass the query embedding to engage it.
+    #
+    # DEFAULT OFF — deliberately. The weight-sweep (scripts/sweep_visual_rerank.py, irl K=12,
+    # full visual coverage) showed a clean, monotonic, zero-regression gain on OCCLUDED
+    # self-retrieval (recall@10 0.125→0.167 at w=0.3, recall@1 0.042→0.083 and MRR 0.073→0.122
+    # at w=0.5). BUT that benchmark is self-retrieval: the occluded query is the SAME image/scene
+    # as the target, so it rewards appearance matching. The app's primary use is the opposite —
+    # the SAME pose across DIFFERENT people/scenes, where a good match has similar geometry but
+    # different appearance. High visual weight would demote those. So the sweep validates visual
+    # rerank for occlusion robustness, NOT for cross-photo pose similarity. Enable it (set
+    # ENABLE_VISUAL_RERANK=true) only if you specifically want appearance-aware/occlusion-robust
+    # ranking; 0.3 keeps geometry dominant (70/30), 0.5 was strongest on the benchmark.
     ENABLE_VISUAL_RERANK: bool = os.getenv('ENABLE_VISUAL_RERANK', 'false').lower() == 'true'
-    VISUAL_RERANK_WEIGHT: float = float(os.getenv('VISUAL_RERANK_WEIGHT', '0.0'))  # blend w in [0, 1]
+    VISUAL_RERANK_WEIGHT: float = float(os.getenv('VISUAL_RERANK_WEIGHT', '0.3'))  # blend w in [0,1]; used only when enabled
     VISUAL_RERANK_CANDIDATES: int = int(os.getenv('VISUAL_RERANK_CANDIDATES', '300'))  # top-N to rerank
 
     def validate(self) -> list[str]:
