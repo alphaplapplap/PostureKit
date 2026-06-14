@@ -612,6 +612,12 @@ struct MaintenanceSection: View {
     @State private var showConfirm = false
     @State private var hasPartialRun = false
 
+    // Scan-for-moved/missing state
+    @State private var isScanning = false
+    @State private var scanStatus: String?
+    @State private var showPruneConfirm = false
+    @State private var pendingMissingCount = 0
+
     private let pythonBridge = PythonBridgeSubprocess.shared
 
     /// Per-profile epoch of an in-flight (possibly interrupted) re-detection
@@ -657,12 +663,44 @@ struct MaintenanceSection: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+
+            Divider().padding(.vertical, 4)
+
+            HStack {
+                Text("Moved / Missing Files")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if isScanning {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Scan for Moved/Missing Files...") { startScan() }
+                        .font(.system(size: 12))
+                }
+            }
+
+            Text("Finds photos you moved or renamed in Finder and repoints them by content — no re-detection — then offers to remove index entries for photos that are gone. Relocating is automatic and safe; removals are confirmed first.")
+                .font(.system(size: 11))
+                .foregroundColor(.gray)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let scanStatus = scanStatus {
+                Text(scanStatus)
+                    .font(.system(size: 11))
+                    .foregroundColor(.gray)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(16)
         .background(Color.gray.opacity(0.05))
         .cornerRadius(8)
         .onAppear {
             hasPartialRun = UserDefaults.standard.string(forKey: runEpochKey) != nil
+        }
+        .alert("Remove missing photos?", isPresented: $showPruneConfirm) {
+            Button("Remove \(pendingMissingCount)", role: .destructive) { runPrune() }
+            Button("Keep", role: .cancel) {}
+        } message: {
+            Text("\(pendingMissingCount) indexed photo(s) are no longer on disk (deleted, or moved outside your indexed folders). Remove them from the search index? Their poses are deleted; re-add the folder later to re-index if they come back.")
         }
         .alert(hasPartialRun ? "Resume re-detection?" : "Re-detect entire library?", isPresented: $showConfirm) {
             Button(hasPartialRun ? "Resume" : "Re-detect", role: .destructive) { startRedetection() }
@@ -705,6 +743,47 @@ struct MaintenanceSection: View {
                     hasPartialRun = true
                     statusText = "Re-detection stopped — press Resume to continue where it left off."
                 }
+            }
+        }
+    }
+
+    /// Phase 1: relocate files moved in Finder (safe, automatic), then — if any are genuinely
+    /// gone — surface a confirmation before removing them. Runs in a torch-free skip_models bridge.
+    private func startScan() {
+        isScanning = true
+        scanStatus = "Scanning indexed folders for moved/missing photos..."
+        let folders = IndexViewModel.indexedFoldersScope()
+        let recursive = UserDefaults.standard.object(forKey: "IndexDirectoryView.includeSubdirectories") as? Bool ?? true
+        pythonBridge.scanForMovedAndMissing(folders: folders, recursive: recursive, prune: false) { result in
+            isScanning = false
+            guard let r = result else {
+                scanStatus = "Scan failed — see logs."
+                return
+            }
+            var msg = r.relocated > 0
+                ? "Relocated \(r.relocated) moved photo(s)."
+                : "No moved photos found."
+            if r.stillMissing > 0 {
+                scanStatus = msg + " \(r.stillMissing) entr\(r.stillMissing == 1 ? "y is" : "ies are") missing from disk."
+                pendingMissingCount = r.stillMissing
+                showPruneConfirm = true
+            } else {
+                scanStatus = msg + " Nothing missing."
+            }
+        }
+    }
+
+    /// Phase 2 (confirmed): prune the genuinely-missing entries. folders=[] => pure prune, no
+    /// content-hash walk (relocations were already applied in phase 1).
+    private func runPrune() {
+        isScanning = true
+        scanStatus = "Removing \(pendingMissingCount) missing entr\(pendingMissingCount == 1 ? "y" : "ies")..."
+        pythonBridge.scanForMovedAndMissing(folders: [], recursive: false, prune: true) { result in
+            isScanning = false
+            if let r = result {
+                scanStatus = "Removed \(r.pruned) missing entr\(r.pruned == 1 ? "y" : "ies"). Search index rebuilt."
+            } else {
+                scanStatus = "Removal failed — see logs."
             }
         }
     }

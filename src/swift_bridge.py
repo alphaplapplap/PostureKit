@@ -1535,6 +1535,123 @@ class PostureKitBridge:
             ]
         return len(image_files)
 
+    def scan_for_moved_and_missing(self, folders, recursive: bool = True,
+                                   prune_missing: bool = False) -> dict:
+        """Reconcile the index with the filesystem WITHOUT re-detecting (torch-free).
+
+        For each stored image whose path is gone from disk, look for the same file by SHA-256
+        content hash under `folders` (the user's indexed folders) and repoint the stored row to
+        its new location — self-healing files moved/renamed in Finder (always done; it's safe).
+        Entries still missing afterward are pruned (image + poses + cascaded body parts) ONLY when
+        prune_missing=True (a destructive opt-in); otherwise they're just counted and left in place.
+        The FAISS index is rebuilt only if something changed, so the resident search server reloads
+        it and drops the moved/stale entries. Pass folders=[] with prune_missing=True for a pure
+        prune (no content-hash walk).
+
+        No pose detection runs, so this never imports torch — safe in the faiss-only search server
+        or a skip_models bridge (single OpenMP runtime, no dual-libomp conflict). Fast when nothing
+        is missing (a pure path-existence scan; the content-hash walk only runs when there ARE
+        missing rows to relocate).
+
+        Returns dict: relocated, pruned, pruned_poses, scanned_files, missing_before, still_present.
+        """
+        import sys
+        import hashlib
+        from pathlib import Path
+        from src.storage.models import PoseDetection as PoseDetectionModel
+
+        with self.storage_manager.session_scope() as session:
+            rows = [(i, p, h) for (i, p, h) in
+                    session.query(Image.id, Image.file_path, Image.content_hash).all()]
+        present = [r for r in rows if Path(r[1]).exists()]
+        missing = [r for r in rows if not Path(r[1]).exists()]
+        missing_before = len(missing)
+        logger.info(f"scan_for_moved_and_missing: {missing_before} of {len(rows)} stored images "
+                    f"are gone from disk; scanning {len(folders)} folder(s) for relocations")
+
+        relocations: Dict[Any, str] = {}   # image_id -> new path
+        scanned_files = 0
+
+        # Content-hash relocation pass — only when there's something missing to find.
+        if missing:
+            missing_by_hash: Dict[str, Any] = {}
+            for (image_id, _path, content_hash) in missing:
+                if content_hash:
+                    missing_by_hash.setdefault(content_hash, image_id)
+            known_paths = {p for (_i, p, _h) in rows}
+
+            if missing_by_hash:
+                for folder in folders:
+                    if not missing_by_hash:
+                        break
+                    fpath = Path(folder)
+                    if not fpath.exists():
+                        continue
+                    image_files, _hidden, _errs = self._enumerate_image_files(fpath, recursive)
+                    for candidate in image_files:
+                        if not missing_by_hash:
+                            break
+                        cstr = str(candidate)
+                        if cstr in known_paths:
+                            continue  # already mapped to a stored row by path
+                        try:
+                            with open(candidate, 'rb') as fh:
+                                chash = hashlib.sha256(fh.read()).hexdigest()
+                        except OSError:
+                            continue
+                        scanned_files += 1
+                        image_id = missing_by_hash.pop(chash, None)
+                        if image_id is not None:
+                            relocations[image_id] = cstr
+
+            if relocations:
+                with self.storage_manager.session_scope() as session:
+                    for image_id, new_path in relocations.items():
+                        img = session.get(Image, image_id)
+                        if img is not None:
+                            old = img.file_path
+                            img.file_path = new_path
+                            print(f"PATH HEAL: {old} -> {new_path}", file=sys.stderr, flush=True)
+
+        # Still-missing entries (gone, not relocated). Pruned only on explicit opt-in.
+        relocated_ids = set(relocations.keys())
+        still_missing = [r for r in missing if r[0] not in relocated_ids]
+        deleted_images = 0
+        deleted_poses = 0
+        if prune_missing:
+            # Same delete path as cleanup_missing_images.
+            for (image_id, file_path, _h) in still_missing:
+                with self.storage_manager.session_scope() as session:
+                    pose_ids = [pid for (pid,) in session.query(PoseDetectionModel.id).filter(
+                        PoseDetectionModel.image_id == image_id).all()]
+                for pid in pose_ids:
+                    if self.storage_manager.delete_pose(pid):
+                        deleted_poses += 1
+                with self.storage_manager.session_scope() as session:
+                    image_row = session.get(Image, image_id)
+                    if image_row is not None:
+                        session.delete(image_row)  # cascades poses/body parts/features
+                        deleted_images += 1
+                print(f"CLEANUP: removed missing {file_path}", file=sys.stderr, flush=True)
+
+        # Rebuild the index if anything changed. Relocations don't alter vectors, but rewriting the
+        # index file bumps its mtime so the resident search server's reload_if_stale picks up the
+        # repointed paths (and clears its result cache); prunes additionally drop dead pose ids.
+        if relocations or deleted_images:
+            self.similarity_engine.build_index(force_rebuild=True)
+
+        result = {
+            'relocated': len(relocations),
+            'still_missing': len(still_missing),   # gone, NOT pruned (unless prune_missing was set)
+            'pruned': deleted_images,
+            'pruned_poses': deleted_poses,
+            'scanned_files': scanned_files,
+            'missing_before': missing_before,
+            'still_present': len(present),
+        }
+        logger.info(f"scan_for_moved_and_missing done: {result}")
+        return result
+
     @staticmethod
     def _bbox_iou_xywh(a, b) -> float:
         """IoU of two [x, y, w, h] boxes."""

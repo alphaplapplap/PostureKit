@@ -1412,6 +1412,49 @@ class PythonBridgeSubprocess {
         return count
     }
 
+    struct MovedMissingScanResult {
+        let relocated: Int      // files found at a new path (by content hash) and repointed
+        let stillMissing: Int   // stored entries whose file is gone (not relocated)
+        let pruned: Int         // entries actually removed from the index (only when prune=true)
+    }
+
+    /// Reconcile the index with disk WITHOUT re-detecting. Relocates files moved/renamed in Finder
+    /// by SHA-256 content hash; prunes genuinely-missing entries only when `prune` is true. Runs in
+    /// a skip_models (faiss-only, torch-FREE) bridge, so it can't hit the faiss+torch libomp
+    /// conflict. The rebuilt index is auto-reloaded by the resident search server.
+    func scanForMovedAndMissing(folders: [String], recursive: Bool, prune: Bool,
+                                completion: @escaping (MovedMissingScanResult?) -> Void) {
+        let foldersJSON: String = (try? JSONSerialization.data(withJSONObject: folders))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let script = """
+        import sys, json
+        sys.path.insert(0, '\(venvSitePackages)')
+        sys.path.insert(0, '\(projectPath)')
+        from src.swift_bridge import PostureKitBridge
+        bridge = PostureKitBridge(skip_models=True)   # torch-free: faiss + storage only
+        folders = json.loads('''\(foldersJSON)''')
+        res = bridge.scan_for_moved_and_missing(folders, recursive=\(pythonBool(recursive)), prune_missing=\(pythonBool(prune)))
+        print(json.dumps(res))
+        """
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { DispatchQueue.main.async { completion(nil) }; return }
+            let output = self.runPythonScript(script, configureThreading: false, timeout: 600.0)
+            var result: MovedMissingScanResult? = nil
+            if let out = output,
+               let lastLine = out.split(separator: "\n").last(where: { $0.contains("\"relocated\"") }) ?? out.split(separator: "\n").last,
+               let data = String(lastLine).data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let relocated = obj["relocated"] as? Int {
+                result = MovedMissingScanResult(
+                    relocated: relocated,
+                    stillMissing: obj["still_missing"] as? Int ?? 0,
+                    pruned: obj["pruned"] as? Int ?? 0
+                )
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
     func backfillThumbnails(progressCallback: @escaping (ThumbnailProgress) -> Void) {
         print("[THUMBNAIL BACKFILL] Starting thumbnail generation for existing images...")
 
