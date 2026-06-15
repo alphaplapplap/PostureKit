@@ -251,6 +251,7 @@ class PythonBridge {
                         posesIndexed: posesIndexed,
                         failedImages: failedImages,
                         skippedImages: 0,
+                        photosRemoved: Int(result["deleted_images"]) ?? 0,
                         progress: 1.0
                     ))
                 }
@@ -491,6 +492,7 @@ struct IndexProgress {
     let posesIndexed: Int
     let failedImages: Int
     let skippedImages: Int
+    let photosRemoved: Int
     let progress: Double
 }
 

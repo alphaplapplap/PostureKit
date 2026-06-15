@@ -166,8 +166,8 @@ struct IndexDirectoryView: View {
                     // operations.
                     MaintenanceSection()
                     
-                    // Progress
-                    if indexViewModel.isIndexing {
+                    // Progress (stays up after completion as a result summary)
+                    if indexViewModel.isIndexing || indexViewModel.indexingComplete {
                         IndexProgressView(indexViewModel: indexViewModel)
                     }
                     
@@ -243,9 +243,9 @@ struct IndexProgressView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(indexViewModel.isPaused ? "Paused..." : "Updating...")
+                Text(!indexViewModel.isIndexing ? "Complete" : (indexViewModel.isPaused ? "Paused..." : "Updating..."))
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(indexViewModel.isPaused ? .orange : .primary)
+                    .foregroundColor(!indexViewModel.isIndexing ? .green : (indexViewModel.isPaused ? .orange : .primary))
 
                 Spacer()
 
@@ -271,7 +271,7 @@ struct IndexProgressView: View {
             .frame(height: 6)
             
             VStack(alignment: .leading, spacing: 4) {
-                if !indexViewModel.currentFile.isEmpty {
+                if indexViewModel.isIndexing && !indexViewModel.currentFile.isEmpty {
                     Text("Current: \(indexViewModel.currentFile)")
                         .font(.system(size: 12))
                         .foregroundColor(.blue)
@@ -300,6 +300,12 @@ struct IndexProgressView: View {
 
                 if indexViewModel.skippedImages > 0 {
                     Text("Skipped (already in library): \(indexViewModel.skippedImages)")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+                }
+
+                if indexViewModel.photosRemoved > 0 {
+                    Text("Photos removed (missing from disk): \(indexViewModel.photosRemoved)")
                         .font(.system(size: 12))
                         .foregroundColor(.orange)
                 }
@@ -369,6 +375,10 @@ class IndexViewModel: ObservableObject {
 
     @Published var isIndexing: Bool = false
     @Published var isPaused: Bool = false
+    // Keeps the progress panel on screen as a result summary after a run ends —
+    // the photos-removed count only arrives on the final tick (post-scan cleanup),
+    // i.e. the same moment isIndexing flips false, so it would otherwise never render.
+    @Published var indexingComplete: Bool = false
     @Published var progress: Double = 0.0
     @Published var currentFile: String = ""
     @Published var posesIndexed: Int = 0
@@ -376,6 +386,7 @@ class IndexViewModel: ObservableObject {
     @Published var totalImages: Int = 0
     @Published var failedImages: Int = 0
     @Published var skippedImages: Int = 0
+    @Published var photosRemoved: Int = 0
     @Published var timeElapsed: String = "00:00:00"
     @Published var timeRemaining: String = "00:00:00"
 
@@ -422,11 +433,13 @@ class IndexViewModel: ObservableObject {
         print("[INDEX DEBUG] Starting index of \(selectedDirectories.count) directories: \(selectedDirectories)")
         isIndexing = true
         isPaused = false
+        indexingComplete = false
         progress = 0.0
         posesIndexed = 0
         imagesProcessed = 0
         failedImages = 0
         skippedImages = 0
+        photosRemoved = 0
         startTime = Date()
 
         // Call Python directly for indexing with low confidence threshold (0.2)
@@ -448,6 +461,7 @@ class IndexViewModel: ObservableObject {
             self.posesIndexed = indexProgress.posesIndexed
             self.failedImages = indexProgress.failedImages
             self.skippedImages = indexProgress.skippedImages
+            self.photosRemoved = indexProgress.photosRemoved
             self.progress = indexProgress.progress
 
             // Calculate time estimates
@@ -466,6 +480,7 @@ class IndexViewModel: ObservableObject {
             if self.progress >= 1.0 {
                 print("[INDEX DEBUG] Indexing complete!")
                 self.isIndexing = false
+                self.indexingComplete = true
                 // Reload index statistics to update pose count in UI
                 self.mainViewModel?.loadIndexStatistics()
             }
@@ -499,6 +514,7 @@ class IndexViewModel: ObservableObject {
             pythonBridge.cancelIndexing()
             isIndexing = false
             isPaused = false
+            indexingComplete = false
             print("[INDEX DEBUG] Indexing canceled")
         }
     }

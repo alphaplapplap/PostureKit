@@ -1805,7 +1805,10 @@ class PythonBridgeSubprocess {
                     'skipped_images': result.get('skipped_images', 0),
                 })
 
-            # Emit a final 100% progress tick so the UI completes cleanly
+            # Emit a final 100% progress tick so the UI completes cleanly.
+            # deleted_images only becomes non-zero in the post-scan cleanup that
+            # runs after the last directory, so the streamed per-image PROGRESS
+            # lines never carry it — surface the cumulative total here.
             final_progress = {
                 'type': 'progress',
                 'current_file': 'Complete',
@@ -1814,6 +1817,7 @@ class PythonBridgeSubprocess {
                 'poses_indexed': cum_poses,
                 'failed_images': cum_failed,
                 'skipped_images': cum_skipped,
+                'deleted_images': aggregated['deleted_images'],
                 'progress': 1.0,
             }
             print(f'PROGRESS:{json.dumps(final_progress)}', flush=True)
@@ -2233,6 +2237,7 @@ class PythonBridgeSubprocess {
                                         posesIndexed: progressData["poses_indexed"] as? Int ?? 0,
                                         failedImages: progressData["failed_images"] as? Int ?? 0,
                                         skippedImages: progressData["skipped_images"] as? Int ?? 0,
+                                        photosRemoved: progressData["deleted_images"] as? Int ?? 0,
                                         progress: progressData["progress"] as? Double ?? 0.0
                                     )
 
@@ -2288,6 +2293,7 @@ class PythonBridgeSubprocess {
                                 posesIndexed: progressData["poses_indexed"] as? Int ?? 0,
                                 failedImages: progressData["failed_images"] as? Int ?? 0,
                                 skippedImages: progressData["skipped_images"] as? Int ?? 0,
+                                photosRemoved: progressData["deleted_images"] as? Int ?? 0,
                                 progress: progressData["progress"] as? Double ?? 0.0
                             )
 
