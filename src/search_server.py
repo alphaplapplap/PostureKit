@@ -5,6 +5,7 @@ Keeps the PostureKitBridge loaded to avoid re-initialization overhead.
 Accepts JSON commands via stdin, returns JSON responses via stdout.
 """
 import sys
+import os
 import json
 import logging
 import traceback
@@ -36,13 +37,23 @@ except ImportError as e:
     logger.error(f"sys.path: {sys.path}")
     sys.exit(1)
 
-# CRITICAL: Disable FAISS multithreading to prevent OpenMP pthread_mutex conflicts
-# When running as subprocess alongside main app, OpenMP runtimes conflict
-# Single searches don't benefit from parallelism anyway (I/O bound)
+# FAISS OpenMP thread count. Default 1. The old "dual-libomp" worry doesn't apply
+# here: this server runs faiss-ONLY (bridge built with skip_models=True; verified
+# torch never enters sys.modules in this process), so there is a single OpenMP
+# runtime and raising the count would be SAFE. It is just not WORTH it: measured on
+# the 74,907-pose `irl` profile, the IndexFlatL2 scan is ~34 ms (~0.5% of a ~7 s
+# uncached threshold search; the rest is DB hydration + the confidence/OKS rerank).
+# N=8 gave only ~1.16x on the scan and ~1.0x end-to-end — within noise. The real
+# bottleneck is hydration + per-search O(N) Python overhead, not the scan. The
+# FAISS_SEARCH_THREADS knob is kept ONLY as an escape hatch for a future, much
+# larger corpus where the flat scan could come to dominate; raising it at today's
+# scale buys nothing. IndexFlatL2 output is thread-count-deterministic (verified
+# bit-identical), so N>1 changes speed, not results.
 try:
     import faiss
-    faiss.omp_set_num_threads(1)
-    logger.info("FAISS threading disabled (num_threads=1) to prevent OpenMP conflicts")
+    _faiss_threads = max(1, int(os.getenv('FAISS_SEARCH_THREADS', '1')))
+    faiss.omp_set_num_threads(_faiss_threads)
+    logger.info(f"FAISS threads set to {_faiss_threads} (env FAISS_SEARCH_THREADS, default 1)")
 except Exception as e:
     logger.warning(f"Failed to configure FAISS threading (non-fatal): {e}")
 
@@ -451,6 +462,11 @@ def main():
                     bridge.similarity_engine.reload_if_stale()
                     bridge.similarity_engine._ensure_corpus_cache()
                     logger.info("✓ Corpus cache warmed (background)")
+                    # Plausibility cache (search-speed): static per pose, ~15s for a large index.
+                    # Kicking it here (it spawns its own daemon builder and returns immediately)
+                    # means dense threshold searches hit the fast lightweight-hydration path soon
+                    # after boot; until it's ready, searches fall back to exact inline recompute.
+                    bridge.similarity_engine._ensure_plausibility_cache()
                 except Exception as warm_err:
                     logger.warning(f"Corpus cache warm skipped: {warm_err}")
             threading.Thread(target=_warm_corpus_cache, name="corpus-warm", daemon=True).start()

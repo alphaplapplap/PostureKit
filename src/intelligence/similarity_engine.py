@@ -116,6 +116,26 @@ class SimilarityEngine:
         self._corpus_row_of_faiss_id: Dict[int, int] = {}    # faiss id → row index
         self._corpus_lock = threading.Lock()
 
+        # --- Plausibility cache (search-speed) ---
+        # ENABLE_PLAUSIBILITY_SCORING recomputes a QUERY-INDEPENDENT anatomical score from each
+        # candidate's raw keypoints on every search. That forces the ranking hydrate to load
+        # pose.keypoints (399 floats) + GeometricFeatures for thousands of threshold-mode
+        # candidates — the measured dominant search cost (a dense 0.3-floor search was ~10s,
+        # ~98% in that hydrate). The score is static per pose, so precompute it ONCE in a
+        # BACKGROUND thread (never block the {"status":"ready"} handshake) keyed by pose_id.
+        # When ready, _hydrate_candidates ranks from a lightweight columns-only query (no
+        # keypoints/features/thumbnail) and looks the score up. Until ready — or for any pose
+        # not yet in the map — it falls back to the original full-load recompute path, so
+        # results are bit-identical either way. Invalidated with the corpus cache on any index
+        # mutation (new/corrected poses repopulate on rebuild).
+        self._plausibility: Optional[Dict[str, float]] = None  # pose_id(str) -> score; None until built
+        self._plausibility_lock = threading.Lock()
+        self._plausibility_building = False
+        # Candidate-count threshold above which a search defers heavy display fields
+        # (thumbnail/keypoints/detailed-regions) to the per-page fetch_details path and ranks
+        # from the lightweight query. Mirrors swift_bridge's DETAIL_INLINE_CAP.
+        self._hydrate_defer_cap = 50
+
         # --- Batched checkpoint persistence (finding 1) ---
         # Per-pose add/remove no longer writes the full index to disk; callers persist via
         # checkpoint_index() every N mutations / T seconds and flush_index() once at the end.
@@ -372,6 +392,10 @@ class SimilarityEngine:
             self._corpus_conf = None
             self._corpus_faiss_ids = None
             self._corpus_row_of_faiss_id = {}
+        # Plausibility is static per pose, but new/corrected poses must repopulate it — drop it
+        # so the next search rebuilds it (and meanwhile falls back to the exact recompute path).
+        with self._plausibility_lock:
+            self._plausibility = None
 
     def _ensure_corpus_cache(self) -> bool:
         """Build the contiguous geometric corpus matrices once, keyed to the current index.
@@ -439,6 +463,59 @@ class SimilarityEngine:
             logger.info(f"Built confidence-aware corpus cache: {row} poses x {dim} dims "
                         f"(~{(feat.nbytes + conf.nbytes) // (1024 * 1024)} MB)")
             return row > 0
+
+    def _ensure_plausibility_cache(self) -> Optional[Dict[str, float]]:
+        """Return the pose_id→plausibility map if built; else kick off a one-time BACKGROUND
+        build and return None so callers fall back to the exact per-candidate recompute path.
+
+        The score is static per pose and computed with the SAME _compute_plausibility_score used
+        inline, so the cached fast path is bit-identical to recompute. Built off-thread to never
+        delay the search server's {"status":"ready"} handshake. Returns None when plausibility
+        scoring is disabled (callers then take the neutral score path)."""
+        from src.config.settings import settings
+        if not settings.ENABLE_PLAUSIBILITY_SCORING:
+            return None
+        cached = self._plausibility
+        if cached is not None:
+            return cached
+        with self._plausibility_lock:
+            if self._plausibility is not None:
+                return self._plausibility
+            if self._plausibility_building:
+                return None
+            self._plausibility_building = True
+        threading.Thread(target=self._build_plausibility_cache,
+                         name="plausibility-cache", daemon=True).start()
+        return None
+
+    def _build_plausibility_cache(self) -> None:
+        """Background worker: compute plausibility for every indexed pose once, publish atomically."""
+        from src.storage.models import PoseDetection, GeometricFeatures
+        try:
+            with self._index_lock:
+                uuids = list(self.pose_id_map.values())
+            scores: Dict[str, float] = {}
+            t0 = _time.monotonic()
+            with self.storage.session_scope() as session:
+                for cstart in range(0, len(uuids), 1000):
+                    chunk = [UUID(u) for u in uuids[cstart:cstart + 1000]]
+                    rows = (session.query(PoseDetection, GeometricFeatures)
+                            .join(GeometricFeatures, PoseDetection.id == GeometricFeatures.pose_id)
+                            .filter(PoseDetection.id.in_(chunk)).all())
+                    for pose, features in rows:
+                        try:
+                            scores[str(pose.id)] = self._compute_plausibility_score(pose, features)
+                        except Exception:
+                            scores[str(pose.id)] = 1.0  # neutral on malformed keypoints
+            with self._plausibility_lock:
+                self._plausibility = scores
+                self._plausibility_building = False
+            logger.info(f"Built plausibility cache: {len(scores)} poses in "
+                        f"{_time.monotonic() - t0:.1f}s")
+        except Exception as e:
+            logger.warning(f"Plausibility cache build failed (search will recompute inline): {e}")
+            with self._plausibility_lock:
+                self._plausibility_building = False
 
     # Tier-1 (low-overlap) candidates are demoted by this fixed additive distance so that
     # EVERY sufficient-overlap candidate outranks EVERY fallback candidate (finding 39). The
@@ -1271,25 +1348,57 @@ class SimilarityEngine:
 
             from src.storage.models import BodyPart
             from collections import defaultdict
+            from sqlalchemy.orm import load_only, Load
+            from src.config.settings import settings as _hydrate_settings
+
+            # Plausibility is query-independent: prefer the precomputed cache so ranking needs
+            # neither keypoints nor GeometricFeatures. When it isn't built yet (or plausibility is
+            # disabled) keep the original full-load + recompute path so scores stay bit-identical.
+            # We may only SKIP loading keypoints/features when we won't have to recompute from them
+            # this query (cache ready, or plausibility disabled — in which case the score is 1.0).
+            plausibility_cache = self._ensure_plausibility_cache()  # dict if ready, else None
+            plausibility_enabled = _hydrate_settings.ENABLE_PLAUSIBILITY_SCORING
+            can_skip_keypoints = (not plausibility_enabled) or (plausibility_cache is not None)
+            # Large sets defer the heavy DISPLAY fields (thumbnail BYTEA, 399-float keypoints,
+            # detailed regions) to the per-page fetch_details path (finding 25). Combined with
+            # can_skip_keypoints this lets the ranking query drop the three biggest per-row payloads.
+            defer_heavy = can_skip_keypoints and len(candidate_pose_ids) > self._hydrate_defer_cap
 
             with self.storage.session_scope() as session:
-                # Phase 2a: bulk-load pose/image/feature rows (chunked to keep IN lists sane)
+                # Phase 2a: bulk-load pose/image(/feature) rows (chunked to keep IN lists sane).
+                # defer_heavy ranks from a lightweight columns-only query — no keypoints, no
+                # thumbnail, no GeometricFeatures join — the dominant hydration cost at scale.
                 record_map = {}
                 for chunk_start in range(0, len(candidate_pose_ids), 1000):
                     chunk = candidate_pose_ids[chunk_start:chunk_start + 1000]
-                    rows = session.query(
-                        PoseDetection,
-                        Image,
-                        GeometricFeatures
-                    ).join(
-                        Image, PoseDetection.image_id == Image.id
-                    ).join(
-                        GeometricFeatures, PoseDetection.id == GeometricFeatures.pose_id
-                    ).filter(
-                        PoseDetection.id.in_(chunk)
-                    ).all()
-                    for pose, image, features in rows:
-                        record_map[pose.id] = (pose, image, features)
+                    if defer_heavy:
+                        rows = session.query(PoseDetection, Image).join(
+                            Image, PoseDetection.image_id == Image.id
+                        ).options(
+                            Load(PoseDetection).load_only(
+                                PoseDetection.overall_confidence, PoseDetection.is_corrected,
+                                PoseDetection.person_id, PoseDetection.bbox, PoseDetection.image_id,
+                            ),
+                            Load(Image).load_only(
+                                Image.file_path, Image.width, Image.height, Image.file_size_bytes,
+                            ),
+                        ).filter(PoseDetection.id.in_(chunk)).all()
+                        for pose, image in rows:
+                            record_map[pose.id] = (pose, image, None)
+                    else:
+                        rows = session.query(
+                            PoseDetection,
+                            Image,
+                            GeometricFeatures
+                        ).join(
+                            Image, PoseDetection.image_id == Image.id
+                        ).join(
+                            GeometricFeatures, PoseDetection.id == GeometricFeatures.pose_id
+                        ).filter(
+                            PoseDetection.id.in_(chunk)
+                        ).all()
+                        for pose, image, features in rows:
+                            record_map[pose.id] = (pose, image, features)
 
                 # Phase 2b: bulk-load body parts for all involved images, grouped by
                 # (image_id, person_index) — matches the old per-pose filter.
@@ -1341,16 +1450,20 @@ class SimilarityEngine:
                     # Get set of visible canonical regions
                     visible_regions = list(set(bp.canonical_region for bp in body_parts))
 
-                    # Get detailed breakdown of body parts (18 NudeNet classes)
-                    visible_regions_detailed = [
-                        {
-                            'part_name': bp.part_name,
-                            'canonical_region': bp.canonical_region,
-                            'confidence': float(bp.confidence),
-                            'is_exposed': bp.is_exposed
-                        }
-                        for bp in body_parts
-                    ]
+                    # Get detailed breakdown of body parts (18 NudeNet classes). Heavy display
+                    # field — skip building it when deferring; Swift re-fetches per page.
+                    if defer_heavy:
+                        visible_regions_detailed = []
+                    else:
+                        visible_regions_detailed = [
+                            {
+                                'part_name': bp.part_name,
+                                'canonical_region': bp.canonical_region,
+                                'confidence': float(bp.confidence),
+                                'is_exposed': bp.is_exposed
+                            }
+                            for bp in body_parts
+                        ]
 
                     # Filter by required body regions/classes (if specified)
                     if required_regions:
@@ -1366,7 +1479,7 @@ class SimilarityEngine:
                     # Thumbnails FIT WITHIN a 200x200 canvas (letterbox/pillarbox), matching
                     # thumbnail_generator.py.
                     keypoints_normalized = []
-                    if pose.keypoints and len(pose.keypoints) == 399:  # 133 keypoints × 3
+                    if not defer_heavy and pose.keypoints and len(pose.keypoints) == 399:  # 133 keypoints × 3
                         width = image.width
                         height = image.height
                         scale = min(200.0 / width, 200.0 / height)
@@ -1383,8 +1496,14 @@ class SimilarityEngine:
                     # Base similarity already computed from distance in Phase 1
                     base_similarity = base_sim
 
-                    # Compute plausibility score (anatomical validity)
-                    plausibility_score = self._compute_plausibility_score(pose, features)
+                    # Plausibility (anatomical validity): cached when available (identical value,
+                    # computed once from the same function), else recompute from the full-loaded
+                    # pose/features. When plausibility is disabled this returns 1.0 without
+                    # touching keypoints, so it's safe even on the lightweight (no-keypoint) load.
+                    if plausibility_cache is not None:
+                        plausibility_score = plausibility_cache.get(str(pose_id), 1.0)
+                    else:
+                        plausibility_score = self._compute_plausibility_score(pose, features)
 
                     # Apply plausibility boost if enabled
                     if settings.ENABLE_PLAUSIBILITY_SCORING:
@@ -1414,7 +1533,7 @@ class SimilarityEngine:
                         'image_width': image.width,
                         'image_height': image.height,
                         'file_size': image.file_size_bytes,
-                        'thumbnail': image.thumbnail,  # Pre-generated JPEG thumbnail bytes
+                        'thumbnail': (None if defer_heavy else image.thumbnail),  # deferred → fetch_details per page
                         'visible_regions': visible_regions,  # Canonical regions (7 categories)
                         'visible_regions_detailed': visible_regions_detailed,  # Full NudeNet classes (18 categories)
                         'keypoints': keypoints_normalized  # Normalized to 200x200 for skeleton overlay
