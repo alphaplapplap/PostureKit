@@ -6,3 +6,8 @@ numpy==1.24.3
 faiss-cpu==1.7.4
 sqlalchemy==2.0.23
 alembic==1.12.1
+
+# High-heel feasibility eval (scripts/eval_heel_detection.py): zero-shot fashion CLIP
+open_clip_torch>=2.24.0
+transformers>=4.40.0                          # marqo-fashionSigLIP text tower (SigLIP tokenizer)
+clip @ git+https://github.com/ultralytics/CLIP.git  # YOLO-World set_classes() text embeddings

@@ -1017,7 +1017,7 @@ struct SearchParametersView: View {
                 DisclosureGroup {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("18 specific classes")
+                        Text("19 specific classes")
                             .font(.system(size: 11))
                             .foregroundColor(.gray.opacity(0.7))
                         Spacer()
@@ -1062,13 +1062,16 @@ struct SearchParametersView: View {
                             }
                         }
 
-                        // Feet (2 classes)
+                        // Feet (3 classes)
                         BodyPartSection(title: "Feet") {
                             BodyPartToggle(label: "Exposed", region: "FEET_EXPOSED", isSelected: viewModel.requiredBodyParts.contains("FEET_EXPOSED")) {
                                 toggleRegion("FEET_EXPOSED", in: $viewModel.requiredBodyParts)
                             }
                             BodyPartToggle(label: "Covered", region: "FEET_COVERED", isSelected: viewModel.requiredBodyParts.contains("FEET_COVERED")) {
                                 toggleRegion("FEET_COVERED", in: $viewModel.requiredBodyParts)
+                            }
+                            BodyPartToggle(label: "High Heels", region: "HEELS_HIGH", isSelected: viewModel.requiredBodyParts.contains("HEELS_HIGH")) {
+                                toggleRegion("HEELS_HIGH", in: $viewModel.requiredBodyParts)
                             }
                         }
 

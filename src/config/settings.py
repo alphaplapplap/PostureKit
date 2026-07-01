@@ -179,6 +179,15 @@ class Settings:
     # Layer 3: Visual Features (Appearance)
     VISUAL_MODEL: str = os.getenv('VISUAL_MODEL', 'mobilenet_v3_small')  # mobilenet_v3_small, disabled
 
+    # Layer 3b: Heel Detection (zero-shot fashion-CLIP on pose-localized foot crops)
+    # Opt-in: OFF by default (adds an open_clip model load to indexing). Backfill the
+    # corpus with scripts/backfill_heels.py; tag surfaces via the HEELS_HIGH body-part
+    # filter (browse_by_body_parts). See project_heel_detection memory for measured P/R.
+    HEEL_DETECTION_ENABLED: bool = os.getenv('HEEL_DETECTION_ENABLED', 'false').lower() == 'true'
+    HEEL_MODEL: str = os.getenv('HEEL_MODEL', 'marqo-fashionclip')  # marqo-fashionclip, marqo-fashionsiglip, disabled
+    HEEL_THRESHOLD: float = float(os.getenv('HEEL_THRESHOLD', '0.7'))  # per-person max heel score to tag (P≈0.91)
+    HEEL_MIN_FOOT_CONF: float = float(os.getenv('HEEL_MIN_FOOT_CONF', '0.3'))  # foot-keypoint gate
+
     # Layer 4: Search Features
     SEARCH_FEATURE_MODE: str = os.getenv('SEARCH_FEATURE_MODE', 'geometric')  # geometric, fused
 

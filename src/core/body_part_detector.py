@@ -112,7 +112,7 @@ class BodyPartDetector:
         'torso': ['BELLY_EXPOSED', 'BELLY_COVERED',
                   'FEMALE_BREAST_EXPOSED', 'FEMALE_BREAST_COVERED',
                   'MALE_BREAST_EXPOSED'],
-        'feet': ['FEET_EXPOSED', 'FEET_COVERED'],
+        'feet': ['FEET_EXPOSED', 'FEET_COVERED', 'HEELS_HIGH'],
         'armpits': ['ARMPITS_EXPOSED', 'ARMPITS_COVERED'],
         'buttocks': ['BUTTOCKS_EXPOSED', 'BUTTOCKS_COVERED'],
         'genitalia': ['FEMALE_GENITALIA_EXPOSED', 'FEMALE_GENITALIA_COVERED',
@@ -137,6 +137,7 @@ class BodyPartDetector:
         'BELLY_COVERED': 0.15,
         'FEET_EXPOSED': 0.25,
         'FEET_COVERED': 0.25,
+        'HEELS_HIGH': 0.70,  # not from NudeNet; produced by HeelDetector (fashion-CLIP)
         'ARMPITS_EXPOSED': 0.15,
         'ARMPITS_COVERED': 0.15,
         'FEMALE_BREAST_EXPOSED': 0.35,

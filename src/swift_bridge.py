@@ -2214,6 +2214,27 @@ class PostureKitBridge:
         else:
             logger.debug(f"Body part detection disabled")
 
+        # Heel detection: fashion-CLIP on pose-localized foot crops -> one synthetic
+        # HEELS_HIGH body-part per person (max score over feet). Opt-in + gated. Appended
+        # AFTER the NudeNet dual-pass so it bypasses that block's overlap dedup.
+        from src.config.settings import settings as _settings
+        if getattr(_settings, 'HEEL_DETECTION_ENABLED', False):
+            try:
+                if getattr(self, '_heel_detector', None) is None:
+                    from src.core.heel_detector import HeelDetector
+                    self._heel_detector = HeelDetector(device=self._device)
+                heel_score, heel_box = self._heel_detector.detect(image_rgb, pose.keypoints)
+                if heel_box is not None and heel_score >= self._heel_detector.threshold:
+                    from src.core.body_part_detector import BodyPartDetection
+                    body_part_detections.append(BodyPartDetection(
+                        part_name="HEELS_HIGH",
+                        confidence=float(max(0.0, min(1.0, heel_score))),
+                        bbox=heel_box.astype(float),
+                        is_exposed=False,
+                        canonical_region="feet",
+                    ))
+            except Exception as e:
+                print(f"WARNING [Heel Detection]: {image_name}: {e}", file=sys.stderr, flush=True)
 
         return (features, visual_features, fused_features, body_part_detections)
 
