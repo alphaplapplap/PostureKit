@@ -44,19 +44,32 @@ def _to_pil(img):
     return img
 
 
+def _stroke_scale(im):
+    """Strokes are drawn at source resolution but displayed at ~680px wide —
+    scale widths so overlays stay legible after downscale."""
+    return max(1.0, im.width / 680.0)
+
+
 def draw_boxes(image_rgb, boxes, color=(80, 220, 120), width=4, labels=None):
     """boxes: iterable of [x1,y1,x2,y2]; labels: optional per-box strings."""
     from PIL import ImageDraw, ImageFont
     im = _to_pil(image_rgb).convert("RGB").copy()
     d = ImageDraw.Draw(im)
+    k = _stroke_scale(im)
+    width = max(2, int(width * k))
+    fh = int(18 * k)
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", int(14 * k))
+    except Exception:
+        font = None
     for i, b in enumerate(boxes):
         x1, y1, x2, y2 = [float(v) for v in b]
         d.rectangle([x1, y1, x2, y2], outline=color, width=width)
         if labels and i < len(labels) and labels[i]:
             txt = str(labels[i])
-            ty = max(0, y1 - 18)
-            d.rectangle([x1, ty, x1 + 8 + 8 * len(txt), ty + 18], fill=color)
-            d.text((x1 + 4, ty + 2), txt, fill=(0, 0, 0))
+            ty = max(0, y1 - fh)
+            d.rectangle([x1, ty, x1 + fh * 0.55 * (len(txt) + 1), ty + fh], fill=color)
+            d.text((x1 + 3 * k, ty + 2 * k), txt, fill=(0, 0, 0), font=font)
     return im
 
 
@@ -67,18 +80,23 @@ def draw_keypoints(image_rgb, keypoints, min_conf=0.3, radius=4,
     im = _to_pil(image_rgb).convert("RGB").copy()
     d = ImageDraw.Draw(im)
     kp = np.asarray(keypoints, dtype=float).reshape(-1, 3)
+    k = _stroke_scale(im)
 
     def ok(i):
         return kp[i, 2] >= min_conf and not (kp[i, 0] == 0 and kp[i, 1] == 0)
 
-    for links, color, w in ((_BODY_LINKS, body_color, 3), (_FOOT_LINKS, foot_color, 4)):
+    for links, color, w in ((_BODY_LINKS, body_color, 3), (_FOOT_LINKS, foot_color, 5)):
+        w = max(2, int(w * k))
         for a, b in links:
             if a < len(kp) and b < len(kp) and ok(a) and ok(b):
+                # dark underlay line for contrast on bright imagery
+                d.line([kp[a, 0], kp[a, 1], kp[b, 0], kp[b, 1]], fill=(0, 0, 0), width=w + max(2, int(2 * k)))
                 d.line([kp[a, 0], kp[a, 1], kp[b, 0], kp[b, 1]], fill=color, width=w)
     for i in range(min(23, len(kp))):  # body + feet points only (hands/face too dense)
         if ok(i):
-            r = radius + (2 if 17 <= i <= 22 else 0)
+            r = (radius + (3 if 17 <= i <= 22 else 0)) * k
             c = foot_color if 17 <= i <= 22 else body_color
+            d.ellipse([kp[i, 0] - r - k, kp[i, 1] - r - k, kp[i, 0] + r + k, kp[i, 1] + r + k], fill=(0, 0, 0))
             d.ellipse([kp[i, 0] - r, kp[i, 1] - r, kp[i, 0] + r, kp[i, 1] + r], fill=c)
     return im
 
@@ -111,9 +129,13 @@ class ABReport:
         self.summary = []   # list of dicts (columns free-form, rendered as table)
         self.verdict = ""
 
-    def add_row(self, image_path, img_a, img_b, metrics_a=None, metrics_b=None, note=""):
+    def add_row(self, image_path, img_a, img_b, metrics_a=None, metrics_b=None, note="",
+                label_a=None, label_b=None, section=None):
+        """label_a/label_b override the report-level pane labels for this row;
+        section renders a heading above the row (for mixed-type sampler reports)."""
         self.rows.append(dict(path=str(image_path), a=_b64(img_a), b=_b64(img_b),
-                              ma=metrics_a or {}, mb=metrics_b or {}, note=note))
+                              ma=metrics_a or {}, mb=metrics_b or {}, note=note,
+                              la=label_a, lb=label_b, section=section))
 
     def add_summary(self, row: dict):
         self.summary.append(row)
@@ -139,13 +161,17 @@ class ABReport:
         for r in self.rows:
             fname = html.escape(Path(r["path"]).name)
             note = f"<div class=note>{html.escape(r['note'])}</div>" if r["note"] else ""
+            la = html.escape(r.get("la") or self.label_a)
+            lb = html.escape(r.get("lb") or self.label_b)
+            if r.get("section"):
+                tiles.append(f"<h2 class=sec>{html.escape(r['section'])}</h2>")
             tiles.append(f"""
 <div class=row>
   <div class=fn title="{html.escape(r['path'])}">{fname}</div>
   <div class=panes>
-    <div class=pane><div class=pl>{html.escape(self.label_a)}</div>
+    <div class=pane><div class=pl>{la}</div>
       <img src="{r['a']}" loading=lazy>{_metric_strip(r['ma'])}</div>
-    <div class=pane><div class=pl pb>{html.escape(self.label_b)}</div>
+    <div class=pane><div class=pl pb>{lb}</div>
       <img src="{r['b']}" loading=lazy>{_metric_strip(r['mb'])}</div>
   </div>{note}
 </div>""")
@@ -170,6 +196,7 @@ class ABReport:
  .ms{{margin-top:6px}} .m{{display:inline-block;background:#22222a;border-radius:5px;padding:2px 8px;margin:2px 4px 0 0;font-size:11px}}
  .m b{{color:#7fd}}
  .note{{margin-top:8px;color:#c9b458;font-size:12px}}
+ h2.sec{{font-size:14px;color:#8ec7ff;border-bottom:1px solid #2a2a33;padding-bottom:6px;margin:28px 0 4px}}
 </style>
 <h1>Before / After — {html.escape(self.title)}</h1>
 <div class=sub>{len(self.rows)} comparison(s) · pane A = {html.escape(self.label_a)} · pane B = {html.escape(self.label_b)} · local file, nothing uploaded</div>
