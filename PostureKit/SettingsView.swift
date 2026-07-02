@@ -658,6 +658,11 @@ struct MaintenanceSection: View {
     @State private var showPruneConfirm = false
     @State private var pendingMissingCount = 0
 
+    // Heel-backfill state
+    @State private var isTaggingHeels = false
+    @State private var heelProgress: Double = 0
+    @State private var heelStatus: String?
+
     private let pythonBridge = PythonBridgeSubprocess.shared
 
     /// Per-profile epoch of an in-flight (possibly interrupted) re-detection
@@ -729,6 +734,42 @@ struct MaintenanceSection: View {
                     .foregroundColor(.gray)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Divider().padding(.vertical, 4)
+
+            HStack {
+                Text("High-Heel Tagging")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if isTaggingHeels {
+                    Button("Stop") {
+                        pythonBridge.cancelHeelBackfill()
+                        isTaggingHeels = false
+                        heelStatus = "Stopped — already-tagged photos are kept; run again to resume where it left off."
+                    }
+                    .font(.system(size: 12))
+                } else {
+                    Button("Tag Heels in Existing Photos...") { startHeelBackfill() }
+                        .font(.system(size: 12))
+                }
+            }
+
+            Text("Scans every already-indexed photo for high heels (fashion-CLIP on each person's feet) and tags matches for the Browse → Feet → High Heels filter. Uses the tagging threshold from Detection settings. Already-tagged photos are skipped, so it is safe to stop anytime and resumes where it left off. Photos not downloaded from iCloud are counted as unreadable and skipped.")
+                .font(.system(size: 11))
+                .foregroundColor(.gray)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if isTaggingHeels {
+                ProgressView(value: heelProgress)
+            }
+
+            if let heelStatus = heelStatus {
+                Text(heelStatus)
+                    .font(.system(size: 11))
+                    .foregroundColor(.gray)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
         }
         .padding(16)
         .background(Color.gray.opacity(0.05))
@@ -789,6 +830,34 @@ struct MaintenanceSection: View {
 
     /// Phase 1: relocate files moved in Finder (safe, automatic), then — if any are genuinely
     /// gone — surface a confirmation before removing them. Runs in a torch-free skip_models bridge.
+    private func startHeelBackfill() {
+        isTaggingHeels = true
+        heelProgress = 0
+        heelStatus = "Starting (loading fashion-CLIP model)..."
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Progress callbacks are dispatched to the main queue by the bridge
+            pythonBridge.backfillHeels { p in
+                heelProgress = p.progress
+                let extras = p.unreadable > 0 ? " · \(p.unreadable) unreadable" : ""
+                heelStatus = "\(p.seen)/\(p.total) scanned · \(p.tagged) newly tagged · \(p.skippedExisting) already tagged\(extras)"
+                if p.done {
+                    isTaggingHeels = false
+                    heelStatus = "Done: \(p.tagged) newly tagged (\(p.seen)/\(p.total) scanned, \(p.skippedExisting) already tagged\(extras))."
+                }
+            }
+            // Process exited (completed, stopped, or failed) — never leave the UI running
+            DispatchQueue.main.async {
+                if isTaggingHeels {
+                    isTaggingHeels = false
+                    if heelProgress < 1.0, heelStatus?.hasPrefix("Done") != true {
+                        heelStatus = (heelStatus ?? "") + "  (run ended early — run again to resume)"
+                    }
+                }
+            }
+        }
+    }
+
     private func startScan() {
         isScanning = true
         scanStatus = "Scanning indexed folders for moved/missing photos..."

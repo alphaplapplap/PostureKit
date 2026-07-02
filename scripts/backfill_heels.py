@@ -24,6 +24,7 @@ Usage:
     # smoke test: add --limit 500 ; re-tag from scratch: add --force
 """
 import argparse
+import json
 import os
 import sys
 import uuid
@@ -154,6 +155,9 @@ def main(argv=None):
                     help="curation-prior mode: no pixels/classifier — for every scoped image with NO "
                          "HEELS_HIGH row, tag its highest-confidence pose at exactly CONF (e.g. 0.70). "
                          "Use when the folder itself is the label. Requires --path-contains.")
+    ap.add_argument("--progress", action="store_true",
+                    help="emit machine-readable JSON progress lines to stdout (for the GUI wrapper); "
+                         "final stdout line is a JSON summary with done=true")
     args = ap.parse_args(argv)
 
     profile = os.environ.get("DB_PROFILE", settings.DB_PROFILE)
@@ -185,6 +189,21 @@ def main(argv=None):
     stats = dict(seen=0, tagged=0, skipped_existing=0, no_foot=0, below_thr=0,
                  unreadable=0, errors=0)
     last_id = None
+
+    _last_emit = [0]
+
+    def emit_progress(current_file="", force=False, done=False):
+        """JSON progress lines to stdout for the GUI wrapper (--progress only).
+        Emitted every 25 poses; the final line carries done=true."""
+        if not args.progress:
+            return
+        if not force and stats["seen"] - _last_emit[0] < 25:
+            return
+        _last_emit[0] = stats["seen"]
+        print(json.dumps({**stats, "total": total, "current_file": current_file,
+                          "done": done}), flush=True)
+
+    emit_progress(force=True)  # initial 0/total so the GUI bar appears immediately
 
     while True:
         if args.limit is not None and stats["seen"] >= args.limit:
@@ -245,6 +264,7 @@ def main(argv=None):
             if box is None:
                 stats["no_foot"] += 1
                 continue
+            emit_progress(current_file=os.path.basename(r["file_path"]))
             if score < args.threshold:
                 stats["below_thr"] += 1
                 continue
@@ -275,10 +295,12 @@ def main(argv=None):
         log(f"[{profile}] seen={stats['seen']}/{total} tagged={stats['tagged']} "
             f"skip_existing={stats['skipped_existing']} no_foot={stats['no_foot']} "
             f"below_thr={stats['below_thr']} unreadable={stats['unreadable']} err={stats['errors']}")
+        emit_progress(force=True)  # page boundary: keeps the bar moving through skip-heavy stretches
 
     print(f"RESULT {profile}: tagged={stats['tagged']} seen={stats['seen']} "
           f"skip_existing={stats['skipped_existing']} no_foot={stats['no_foot']} "
           f"below_thr={stats['below_thr']} unreadable={stats['unreadable']} errors={stats['errors']}")
+    emit_progress(force=True, done=True)  # must be the LAST stdout line (GUI parses it as the summary)
     return 0
 
 
