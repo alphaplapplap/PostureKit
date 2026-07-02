@@ -2822,6 +2822,9 @@ class PostureKitBridge:
                         'bbox': pose.bbox if pose.bbox else [],  # FIX: Was missing!
                         'rank': idx + 1,
                         'quality_score': quality_score,  # Composite quality (0-1, body parts + pose + completeness)
+                        # Swift's parseSearchResult() hard-requires similarity_score and silently
+                        # drops results without it — browse results were never rendered before this.
+                        'similarity_score': quality_score,
                         'body_part_confidence': float(avg_conf),  # Average body part confidence
                         'image_width': image.width,
                         'image_height': image.height,
