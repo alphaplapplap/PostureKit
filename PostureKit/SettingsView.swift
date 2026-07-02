@@ -485,6 +485,46 @@ struct DetectionSection: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
                 }
+
+                // Heel detection (fashion-CLIP HEELS_HIGH tagger)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Toggle("Tag high heels during indexing (fashion-CLIP)", isOn: $viewModel.heelDetectionEnabled)
+                            .font(.system(size: 13))
+
+                        Spacer()
+
+                        // Status indicator showing current active state
+                        if let envValue = ProcessInfo.processInfo.environment["HEEL_DETECTION_ENABLED"],
+                           envValue.lowercased() == "true" {
+                            Text("✓ Active")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.green)
+                        } else {
+                            Text("✗ Inactive")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.red)
+                        }
+                    }
+
+                    Text("Newly indexed photos are tagged when a heeled shoe is recognized on a detected person's feet. Find them via Browse Database → Feet → High Heels.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack {
+                        Text("Tagging threshold: \(String(format: "%.2f", viewModel.heelThreshold))")
+                            .font(.system(size: 12))
+                        Slider(value: $viewModel.heelThreshold, in: 0.5...0.95, step: 0.05)
+                            .frame(width: 180)
+                    }
+                    .padding(.top, 4)
+
+                    Text("Higher = fewer, surer tags (0.70 ≈ 91% precision measured). Applies to future indexing runs only — already-tagged photos keep their tags; untagged ones need a re-index or scripts/backfill_heels.py.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(16)
@@ -618,6 +658,11 @@ struct MaintenanceSection: View {
     @State private var showPruneConfirm = false
     @State private var pendingMissingCount = 0
 
+    // Heel-backfill state
+    @State private var isTaggingHeels = false
+    @State private var heelProgress: Double = 0
+    @State private var heelStatus: String?
+
     private let pythonBridge = PythonBridgeSubprocess.shared
 
     /// Per-profile epoch of an in-flight (possibly interrupted) re-detection
@@ -689,6 +734,42 @@ struct MaintenanceSection: View {
                     .foregroundColor(.gray)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Divider().padding(.vertical, 4)
+
+            HStack {
+                Text("High-Heel Tagging")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if isTaggingHeels {
+                    Button("Stop") {
+                        pythonBridge.cancelHeelBackfill()
+                        isTaggingHeels = false
+                        heelStatus = "Stopped — already-tagged photos are kept; run again to resume where it left off."
+                    }
+                    .font(.system(size: 12))
+                } else {
+                    Button("Tag Heels in Existing Photos...") { startHeelBackfill() }
+                        .font(.system(size: 12))
+                }
+            }
+
+            Text("Scans every already-indexed photo for high heels (fashion-CLIP on each person's feet) and tags matches for the Browse → Feet → High Heels filter. Uses the tagging threshold from Detection settings. Already-tagged photos are skipped, so it is safe to stop anytime and resumes where it left off. Photos not downloaded from iCloud are counted as unreadable and skipped.")
+                .font(.system(size: 11))
+                .foregroundColor(.gray)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if isTaggingHeels {
+                ProgressView(value: heelProgress)
+            }
+
+            if let heelStatus = heelStatus {
+                Text(heelStatus)
+                    .font(.system(size: 11))
+                    .foregroundColor(.gray)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
         }
         .padding(16)
         .background(Color.gray.opacity(0.05))
@@ -749,6 +830,34 @@ struct MaintenanceSection: View {
 
     /// Phase 1: relocate files moved in Finder (safe, automatic), then — if any are genuinely
     /// gone — surface a confirmation before removing them. Runs in a torch-free skip_models bridge.
+    private func startHeelBackfill() {
+        isTaggingHeels = true
+        heelProgress = 0
+        heelStatus = "Starting (loading fashion-CLIP model)..."
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Progress callbacks are dispatched to the main queue by the bridge
+            pythonBridge.backfillHeels { p in
+                heelProgress = p.progress
+                let extras = p.unreadable > 0 ? " · \(p.unreadable) unreadable" : ""
+                heelStatus = "\(p.seen)/\(p.total) scanned · \(p.tagged) newly tagged · \(p.skippedExisting) already tagged\(extras)"
+                if p.done {
+                    isTaggingHeels = false
+                    heelStatus = "Done: \(p.tagged) newly tagged (\(p.seen)/\(p.total) scanned, \(p.skippedExisting) already tagged\(extras))."
+                }
+            }
+            // Process exited (completed, stopped, or failed) — never leave the UI running
+            DispatchQueue.main.async {
+                if isTaggingHeels {
+                    isTaggingHeels = false
+                    if heelProgress < 1.0, heelStatus?.hasPrefix("Done") != true {
+                        heelStatus = (heelStatus ?? "") + "  (run ended early — run again to resume)"
+                    }
+                }
+            }
+        }
+    }
+
     private func startScan() {
         isScanning = true
         scanStatus = "Scanning indexed folders for moved/missing photos..."
@@ -760,7 +869,7 @@ struct MaintenanceSection: View {
                 scanStatus = "Scan failed — see logs."
                 return
             }
-            var msg = r.relocated > 0
+            let msg = r.relocated > 0
                 ? "Relocated \(r.relocated) moved photo(s)."
                 : "No moved photos found."
             if r.stillMissing > 0 {
@@ -961,6 +1070,18 @@ class SettingsViewModel: ObservableObject {
             setenv("USE_TWO_STAGE_DETECTION", useTwoStage ? "true" : "false", 1)
         }
     }
+    @Published var heelDetectionEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(heelDetectionEnabled, forKey: "heelDetectionEnabled")
+            setenv("HEEL_DETECTION_ENABLED", heelDetectionEnabled ? "true" : "false", 1)
+        }
+    }
+    @Published var heelThreshold: Double = 0.70 {
+        didSet {
+            UserDefaults.standard.set(heelThreshold, forKey: "heelThreshold")
+            setenv("HEEL_THRESHOLD", String(format: "%.2f", heelThreshold), 1)
+        }
+    }
 
     // Performance settings
     @Published var detectionThreads: Int = 16 {
@@ -1019,6 +1140,13 @@ class SettingsViewModel: ObservableObject {
         setenv("USE_TWO_STAGE_DETECTION", useTwoStage ? "true" : "false", 1)
         print("[SETTINGS] Updated USE_TWO_STAGE_DETECTION=\(useTwoStage ? "true" : "false")")
 
+        // Save heel-detection settings (spawned Python inherits via setenv)
+        UserDefaults.standard.set(heelDetectionEnabled, forKey: "heelDetectionEnabled")
+        UserDefaults.standard.set(heelThreshold, forKey: "heelThreshold")
+        setenv("HEEL_DETECTION_ENABLED", heelDetectionEnabled ? "true" : "false", 1)
+        setenv("HEEL_THRESHOLD", String(format: "%.2f", heelThreshold), 1)
+        print("[SETTINGS] Updated HEEL_DETECTION_ENABLED=\(heelDetectionEnabled) HEEL_THRESHOLD=\(heelThreshold)")
+
         // Save performance settings
         UserDefaults.standard.set(detectionThreads, forKey: "detectionThreads")
         UserDefaults.standard.set(useGPU, forKey: "useGPU")
@@ -1036,6 +1164,11 @@ class SettingsViewModel: ObservableObject {
         poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
         fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
         useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
+
+        // Load heel-detection settings (registered defaults: true / 0.70)
+        heelDetectionEnabled = UserDefaults.standard.bool(forKey: "heelDetectionEnabled")
+        let heelThr = UserDefaults.standard.double(forKey: "heelThreshold")
+        heelThreshold = heelThr > 0 ? heelThr : 0.70
 
         // Load performance settings
         let threads = UserDefaults.standard.integer(forKey: "detectionThreads")

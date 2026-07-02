@@ -11,6 +11,7 @@ class PythonBridgeSubprocess {
     let venvSitePackages: String  // Internal for script generation
     private var indexingProcess: Process?
     private var thumbnailProcess: Process?
+    private var heelBackfillProcess: Process?
     private var currentSearchProcess: Process?
     private let searchLock = NSLock()
 
@@ -1594,6 +1595,110 @@ class PythonBridgeSubprocess {
             print("[THUMBNAIL BACKFILL ERROR] \(error)")
             self.thumbnailProcess = nil
         }
+    }
+
+    // MARK: - Heel Backfill (tag existing photos)
+
+    struct HeelBackfillProgress {
+        let seen: Int
+        let total: Int
+        let tagged: Int
+        let skippedExisting: Int
+        let unreadable: Int
+        let errors: Int
+        let currentFile: String
+        let done: Bool
+        var progress: Double { total > 0 ? Double(seen) / Double(total) : 0.0 }
+    }
+
+    /// Runs scripts/backfill_heels.py --progress over the active profile's stored
+    /// poses, tagging HEELS_HIGH via fashion-CLIP. Blocking — call off the main
+    /// thread. The script is idempotent (skips already-tagged persons), so
+    /// cancelling is safe and a rerun resumes where it left off. Threshold comes
+    /// from the inherited HEEL_THRESHOLD env (the Settings slider).
+    func backfillHeels(progressCallback: @escaping (HeelBackfillProgress) -> Void) {
+        print("[HEEL BACKFILL] Starting heel tagging for existing images...")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonExecutable)
+        process.arguments = ["-u", "scripts/backfill_heels.py", "--progress"]
+        process.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+        process.terminationHandler = { _ in }
+
+        // Clear Python environment variables to prevent venv pollution
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "PYTHONHOME")
+        environment.removeValue(forKey: "PYTHONPATH")
+        environment.removeValue(forKey: "__PYVENV_LAUNCHER__")
+        environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+        // Set database profile from UserDefaults (irl/2d/3d)
+        environment["DB_PROFILE"] = getActiveProfile()
+
+        process.environment = environment
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            if let output = String(data: data, encoding: .utf8) {
+                print("[HEEL BACKFILL STDERR] \(output.trimmingCharacters(in: .newlines))")
+            }
+        }
+
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            guard let output = String(data: data, encoding: .utf8) else { return }
+            for line in output.split(separator: "\n") {
+                // Non-JSON lines (e.g. the human RESULT summary) simply fail to parse
+                guard let jsonData = line.data(using: .utf8),
+                      let p = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                      let seen = p["seen"] as? Int,
+                      let total = p["total"] as? Int else { continue }
+
+                let progress = HeelBackfillProgress(
+                    seen: seen,
+                    total: total,
+                    tagged: p["tagged"] as? Int ?? 0,
+                    skippedExisting: p["skipped_existing"] as? Int ?? 0,
+                    unreadable: p["unreadable"] as? Int ?? 0,
+                    errors: p["errors"] as? Int ?? 0,
+                    currentFile: p["current_file"] as? String ?? "",
+                    done: p["done"] as? Bool ?? false
+                )
+                DispatchQueue.main.async {
+                    progressCallback(progress)
+                }
+            }
+        }
+
+        do {
+            self.heelBackfillProcess = process
+            try process.run()
+            process.waitUntilExit()
+            self.heelBackfillProcess = nil
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            print("[HEEL BACKFILL] Process exited with status \(process.terminationStatus)")
+        } catch {
+            print("[HEEL BACKFILL ERROR] \(error)")
+            self.heelBackfillProcess = nil
+        }
+    }
+
+    func cancelHeelBackfill() {
+        guard let process = heelBackfillProcess else {
+            print("[HEEL BACKFILL] No heel backfill process to cancel")
+            return
+        }
+        print("[HEEL BACKFILL] Canceling heel backfill process...")
+        process.terminate()
+        heelBackfillProcess = nil
     }
 
     // MARK: - Directory Indexing

@@ -89,7 +89,7 @@ class PostureKitViewModel: ObservableObject {
         let defaults: [String: Double] = [
             "FACE_MALE": 0.20, "FACE_FEMALE": 0.20,
             "BELLY_EXPOSED": 0.15, "BELLY_COVERED": 0.15,
-            "FEET_EXPOSED": 0.25, "FEET_COVERED": 0.25,
+            "FEET_EXPOSED": 0.25, "FEET_COVERED": 0.25, "HEELS_HIGH": 0.70,
             "ARMPITS_EXPOSED": 0.15, "ARMPITS_COVERED": 0.15,
             "FEMALE_BREAST_EXPOSED": 0.35, "FEMALE_BREAST_COVERED": 0.35,
             "MALE_BREAST_EXPOSED": 0.25,
@@ -118,7 +118,7 @@ class PostureKitViewModel: ObservableObject {
         ("Face", ["FACE_MALE", "FACE_FEMALE"]),
         ("Torso", ["BELLY_EXPOSED", "BELLY_COVERED", "FEMALE_BREAST_EXPOSED",
                    "FEMALE_BREAST_COVERED", "MALE_BREAST_EXPOSED"]),
-        ("Feet", ["FEET_EXPOSED", "FEET_COVERED"]),
+        ("Feet", ["FEET_EXPOSED", "FEET_COVERED", "HEELS_HIGH"]),
         ("Armpits", ["ARMPITS_EXPOSED", "ARMPITS_COVERED"]),
         ("Buttocks", ["BUTTOCKS_EXPOSED", "BUTTOCKS_COVERED"]),
         ("Genitalia", ["FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED",
@@ -1283,7 +1283,7 @@ class PostureKitViewModel: ObservableObject {
         categoryThresholds = [
             "FACE_MALE": 0.20, "FACE_FEMALE": 0.20,
             "BELLY_EXPOSED": 0.15, "BELLY_COVERED": 0.15,
-            "FEET_EXPOSED": 0.25, "FEET_COVERED": 0.25,
+            "FEET_EXPOSED": 0.25, "FEET_COVERED": 0.25, "HEELS_HIGH": 0.70,
             "ARMPITS_EXPOSED": 0.15, "ARMPITS_COVERED": 0.15,
             "FEMALE_BREAST_EXPOSED": 0.35, "FEMALE_BREAST_COVERED": 0.35,
             "MALE_BREAST_EXPOSED": 0.25,

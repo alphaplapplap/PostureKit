@@ -41,6 +41,9 @@ temp/
 data/checkpoints/
 data/test_images/
 
+# Eval/report artifacts (foot crops, HTML review sheets, metrics)
+data/reports/
+
 # Local photo libraries (never publish)
 test-photos/
 
