@@ -78,6 +78,68 @@ def load_rgb(path):
         return np.asarray(im.convert("RGB"))
 
 
+def folder_prior_pass(profile, args):
+    """Curation-prior tagging: the folder membership is the label (user-curated).
+
+    For each image in scope with no HEELS_HIGH row, insert ONE row on its
+    highest-confidence pose at exactly args.folder_prior. Pure DB pass — no
+    image loading, no classifier. Prior rows are distinguishable from
+    classifier rows by their exact confidence value; the browse sensitivity
+    slider at > prior shows visually-confirmed tags only. Idempotent: images
+    with any existing HEELS_HIGH row are skipped.
+    """
+    conf = float(args.folder_prior)
+    if not (0.0 < conf <= 1.0):
+        log(f"--folder-prior must be in (0,1], got {conf}")
+        return 1
+    storage = StorageManager(database_profile=profile)
+    stats = dict(images=0, tagged=0, already=0, no_pose_bbox=0)
+    with storage.session_scope() as s:
+        scoped = (s.query(Image.id)
+                  .filter(Image.file_path.like(f"%{args.path_contains}%")).subquery())
+        tagged_imgs = set(r[0] for r in s.query(BodyPart.image_id)
+                          .filter(BodyPart.part_name == "HEELS_HIGH",
+                                  BodyPart.image_id.in_(scoped.select())).all())
+        rows = (s.query(PoseDetection)
+                .filter(PoseDetection.image_id.in_(scoped.select()))
+                .order_by(PoseDetection.image_id,
+                          PoseDetection.overall_confidence.desc()).all())
+        best_per_image = {}
+        for pose in rows:  # first per image = highest confidence (ordered desc)
+            best_per_image.setdefault(pose.image_id, pose)
+        stats["images"] = len(best_per_image)
+        for image_id, pose in best_per_image.items():
+            if args.limit is not None and stats["tagged"] >= args.limit:
+                break
+            if image_id in tagged_imgs:
+                stats["already"] += 1
+                continue
+            # bbox: pose box [x,y,w,h] -> [x1,y1,x2,y2]; fall back to confident keypoints
+            bbox = None
+            if pose.bbox is not None and len(pose.bbox) == 4 and pose.bbox[2] > 0 and pose.bbox[3] > 0:
+                x, y, w, h = pose.bbox
+                bbox = [float(x), float(y), float(x + w), float(y + h)]
+            else:
+                kp = np.array(pose.keypoints, dtype=np.float32).reshape(133, 3)
+                pts = kp[kp[:, 2] >= 0.3]
+                if pts.shape[0] >= 2:
+                    bbox = [float(pts[:, 0].min()), float(pts[:, 1].min()),
+                            float(pts[:, 0].max() + 1), float(pts[:, 1].max() + 1)]
+            if bbox is None:
+                stats["no_pose_bbox"] += 1
+                continue
+            s.add(BodyPart(
+                id=uuid.uuid4(), image_id=image_id, person_index=int(pose.person_id),
+                part_name="HEELS_HIGH", canonical_region="feet",
+                confidence=conf, bbox=bbox, is_exposed=False,
+            ))
+            stats["tagged"] += 1
+    log(f"[{profile}] folder-prior pass: {stats}")
+    print(f"RESULT {profile}: prior_tagged={stats['tagged']} images={stats['images']} "
+          f"already={stats['already']} no_pose_bbox={stats['no_pose_bbox']} conf={conf}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Backfill HEELS_HIGH body-part tags per DB_PROFILE")
     ap.add_argument("--threshold", type=float, default=settings.HEEL_THRESHOLD)
@@ -88,6 +150,10 @@ def main(argv=None):
     ap.add_argument("--remap", action="append", default=None, help="stale-path fix 'OLD=>NEW' (repeatable)")
     ap.add_argument("--path-contains", default=None,
                     help="only process poses whose image path contains this substring (subset backfill)")
+    ap.add_argument("--folder-prior", type=float, default=None, metavar="CONF",
+                    help="curation-prior mode: no pixels/classifier — for every scoped image with NO "
+                         "HEELS_HIGH row, tag its highest-confidence pose at exactly CONF (e.g. 0.70). "
+                         "Use when the folder itself is the label. Requires --path-contains.")
     args = ap.parse_args(argv)
 
     profile = os.environ.get("DB_PROFILE", settings.DB_PROFILE)
@@ -96,6 +162,12 @@ def main(argv=None):
         if "=>" in r:
             a, b = r.split("=>", 1)
             remaps.append((a, b))
+
+    if args.folder_prior is not None:
+        if not args.path_contains:
+            log("--folder-prior requires --path-contains (refusing to prior-tag the whole DB)")
+            return 1
+        return folder_prior_pass(profile, args)
 
     storage = StorageManager(database_profile=profile)
     detector = HeelDetector(device=settings.DEVICE, model=args.model,
