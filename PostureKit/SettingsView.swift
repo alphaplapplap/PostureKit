@@ -485,6 +485,46 @@ struct DetectionSection: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
                 }
+
+                // Heel detection (fashion-CLIP HEELS_HIGH tagger)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Toggle("Tag high heels during indexing (fashion-CLIP)", isOn: $viewModel.heelDetectionEnabled)
+                            .font(.system(size: 13))
+
+                        Spacer()
+
+                        // Status indicator showing current active state
+                        if let envValue = ProcessInfo.processInfo.environment["HEEL_DETECTION_ENABLED"],
+                           envValue.lowercased() == "true" {
+                            Text("✓ Active")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.green)
+                        } else {
+                            Text("✗ Inactive")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.red)
+                        }
+                    }
+
+                    Text("Newly indexed photos are tagged when a heeled shoe is recognized on a detected person's feet. Find them via Browse Database → Feet → High Heels.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack {
+                        Text("Tagging threshold: \(String(format: "%.2f", viewModel.heelThreshold))")
+                            .font(.system(size: 12))
+                        Slider(value: $viewModel.heelThreshold, in: 0.5...0.95, step: 0.05)
+                            .frame(width: 180)
+                    }
+                    .padding(.top, 4)
+
+                    Text("Higher = fewer, surer tags (0.70 ≈ 91% precision measured). Applies to future indexing runs only — already-tagged photos keep their tags; untagged ones need a re-index or scripts/backfill_heels.py.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(16)
@@ -961,6 +1001,18 @@ class SettingsViewModel: ObservableObject {
             setenv("USE_TWO_STAGE_DETECTION", useTwoStage ? "true" : "false", 1)
         }
     }
+    @Published var heelDetectionEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(heelDetectionEnabled, forKey: "heelDetectionEnabled")
+            setenv("HEEL_DETECTION_ENABLED", heelDetectionEnabled ? "true" : "false", 1)
+        }
+    }
+    @Published var heelThreshold: Double = 0.70 {
+        didSet {
+            UserDefaults.standard.set(heelThreshold, forKey: "heelThreshold")
+            setenv("HEEL_THRESHOLD", String(format: "%.2f", heelThreshold), 1)
+        }
+    }
 
     // Performance settings
     @Published var detectionThreads: Int = 16 {
@@ -1019,6 +1071,13 @@ class SettingsViewModel: ObservableObject {
         setenv("USE_TWO_STAGE_DETECTION", useTwoStage ? "true" : "false", 1)
         print("[SETTINGS] Updated USE_TWO_STAGE_DETECTION=\(useTwoStage ? "true" : "false")")
 
+        // Save heel-detection settings (spawned Python inherits via setenv)
+        UserDefaults.standard.set(heelDetectionEnabled, forKey: "heelDetectionEnabled")
+        UserDefaults.standard.set(heelThreshold, forKey: "heelThreshold")
+        setenv("HEEL_DETECTION_ENABLED", heelDetectionEnabled ? "true" : "false", 1)
+        setenv("HEEL_THRESHOLD", String(format: "%.2f", heelThreshold), 1)
+        print("[SETTINGS] Updated HEEL_DETECTION_ENABLED=\(heelDetectionEnabled) HEEL_THRESHOLD=\(heelThreshold)")
+
         // Save performance settings
         UserDefaults.standard.set(detectionThreads, forKey: "detectionThreads")
         UserDefaults.standard.set(useGPU, forKey: "useGPU")
@@ -1036,6 +1095,11 @@ class SettingsViewModel: ObservableObject {
         poseModel = UserDefaults.standard.string(forKey: "poseModel") ?? "ensemble"
         fusionMethod = UserDefaults.standard.string(forKey: "fusionMethod") ?? "confidence_weighted"
         useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
+
+        // Load heel-detection settings (registered defaults: true / 0.70)
+        heelDetectionEnabled = UserDefaults.standard.bool(forKey: "heelDetectionEnabled")
+        let heelThr = UserDefaults.standard.double(forKey: "heelThreshold")
+        heelThreshold = heelThr > 0 ? heelThr : 0.70
 
         // Load performance settings
         let threads = UserDefaults.standard.integer(forKey: "detectionThreads")

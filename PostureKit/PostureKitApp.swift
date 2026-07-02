@@ -97,6 +97,8 @@ struct PostureKitApp: App {
             "poseModel": "ensemble",     // RTMW-L + RTMW-X for best accuracy
             "fusionMethod": "confidence_weighted",
             "useTwoStage": true,         // YOLO → RTMPose for +5–10% accuracy
+            "heelDetectionEnabled": true, // fashion-CLIP HEELS_HIGH tagging during indexing
+            "heelThreshold": 0.70,        // tagging floor (P≈0.91 measured)
             "theme": "auto",
             "resultsPerPage": 20
         ])
@@ -105,6 +107,15 @@ struct PostureKitApp: App {
         let useTwoStage = UserDefaults.standard.bool(forKey: "useTwoStage")
         setenv("USE_TWO_STAGE_DETECTION", useTwoStage ? "true" : "false", 1)
         print("[APP INIT] Set USE_TWO_STAGE_DETECTION=\(useTwoStage ? "true" : "false")")
+
+        // Heel detection: spawned Python reads these; setenv here beats .env (load_dotenv
+        // never overrides an existing process env var), making the GUI authoritative.
+        let heelEnabled = UserDefaults.standard.bool(forKey: "heelDetectionEnabled")
+        let heelThresholdRaw = UserDefaults.standard.double(forKey: "heelThreshold")
+        let heelThreshold = heelThresholdRaw > 0 ? heelThresholdRaw : 0.70
+        setenv("HEEL_DETECTION_ENABLED", heelEnabled ? "true" : "false", 1)
+        setenv("HEEL_THRESHOLD", String(format: "%.2f", heelThreshold), 1)
+        print("[APP INIT] Set HEEL_DETECTION_ENABLED=\(heelEnabled) HEEL_THRESHOLD=\(heelThreshold)")
     }
 
     var body: some Scene {
