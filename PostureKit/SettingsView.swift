@@ -760,7 +760,7 @@ struct MaintenanceSection: View {
                 scanStatus = "Scan failed — see logs."
                 return
             }
-            var msg = r.relocated > 0
+            let msg = r.relocated > 0
                 ? "Relocated \(r.relocated) moved photo(s)."
                 : "No moved photos found."
             if r.stillMissing > 0 {
